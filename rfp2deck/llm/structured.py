@@ -77,10 +77,11 @@ def response_as_schema(
     prompt: str,
     schema: Type[T],
     model: str | None = None,
-    reasoning_effort: str = "high",
+    reasoning_effort: str = "medium",
+    timeout_seconds: float = 120.0,
 ) -> T:
     """Call OpenAI Responses API using STRICT JSON Schema structured output."""
-    client = get_client()
+    client = get_client(timeout=timeout_seconds, max_retries=2)
     model = model or settings.model_reasoning
 
     raw_schema: Dict[str, Any] = schema.model_json_schema()

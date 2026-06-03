@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+from functools import lru_cache
 from openai import OpenAI
 
 from rfp2deck.core.config import settings
 
 
-def get_client() -> OpenAI:
-    if not settings.openai_api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set. Copy .env.example to .env and set it.")
+@lru_cache(maxsize=8)
+def _cached_client(timeout: float, max_retries: int) -> OpenAI:
     return OpenAI(
         api_key=settings.openai_api_key,
-        timeout=settings.openai_timeout_s,
+        timeout=timeout,
+        max_retries=max_retries,
     )
+
+
+def get_client(timeout: float = 120.0, max_retries: int = 2) -> OpenAI:
+    return _cached_client(timeout, max_retries)

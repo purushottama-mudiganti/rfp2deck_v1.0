@@ -13,8 +13,9 @@ def generate_diagram_png(
     model: str = "gpt-image-1",
     size: str = "auto",
     quality: str = "auto",
+    timeout_seconds: float = 120.0,
 ) -> bytes:
-    client = get_client()
+    client = get_client(timeout=timeout_seconds, max_retries=2)
     resp = client.images.generate(
         model=model,
         prompt=prompt,
