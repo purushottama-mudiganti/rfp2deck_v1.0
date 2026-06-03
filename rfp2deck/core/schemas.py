@@ -22,6 +22,10 @@ class RFPUnderstanding(BaseModel):
     requirements: List[Requirement] = Field(default_factory=list)
     assumptions: List[str] = Field(default_factory=list)
     risks: List[str] = Field(default_factory=list)
+    # Named technologies/platforms/tools explicitly mentioned in the RFP
+    # (e.g., "AKS", "PostgreSQL", "Kafka"). Used to ground diagram prompts so
+    # generated visuals reference real systems rather than generic placeholders.
+    key_technologies: List[str] = Field(default_factory=list)
 
 
 SlideArchetype = Literal[

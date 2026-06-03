@@ -23,6 +23,13 @@ ANALYSIS LENSES (reflect these in the JSON fields of the schema):
   - Functional requirements and use cases.
   - Non-functional requirements (performance, security, compliance, availability, etc.).
   - Integration, data, and reporting/analytics expectations.
+- Key technologies:
+  - Capture every **named** technology, platform, framework, datastore, messaging
+    system, cloud, or tool explicitly mentioned in the RFP (e.g., "AKS", "PostgreSQL",
+    "Kafka", "Redis", "Datadog", "Elasticsearch").
+  - Populate the `key_technologies` field with these verbatim names. Do **not**
+    invent technologies that are not named in the RFP; if none are named, return an
+    empty list.
 - Delivery constraints:
   - Timelines, milestones, SLAs, support windows, transition constraints.
   - Budget or commercial expectations (if stated).
@@ -121,7 +128,8 @@ DIAGRAMS:
 
 CONSTRAINTS:
 - Ensure at least one **Commercials** slide and at least one **Team** slide exist.
-- Total slides MUST be between **14 and 18** (inclusive).
+- Right-size the slide count to what the RFP requires; do not pad and do not split
+  one idea across near-duplicate slides. Every slide must earn its place.
 - Each slide must map logically back to the SectionPlan.
 - Use **only** template layouts from `TEMPLATE LAYOUTS (names)` and respect
   the placeholder structure from the placeholder map where relevant.
@@ -283,11 +291,23 @@ Each slide MUST include (in the JSON schema fields):
 - rfp_section (or requirement reference) – where in the RFP this slide is responding
 - milestone (if applicable) – which RFP milestone or timeline element it supports
 
+EXECUTIVE SUMMARY (CRITICAL):
+- The Executive Summary slide must present the **win thesis**, structured as:
+  1. The client's situation / what is at stake.
+  2. Our differentiating approach (how we will win).
+  3. The business outcome we commit to.
+- Draw these from the narrative spine's value proposition and strategic outcomes.
+- **NEVER** use proposal logistics as Executive Summary bullets — no submission
+  deadlines, question-due dates, "proposal due", RFP reference numbers, or any
+  process metadata. Those belong (if anywhere) on a logistics/next-steps slide.
+
 TITLE STYLE (consulting standard):
 - Use *assertion headlines*: the slide title states the message.
   Bad: "Architecture"
   Good: "Target architecture enables secure, scalable delivery"
-  
+- Keep titles to a single line where possible (≤ ~8 words); long titles wrap and
+  crowd the slide.
+
 BULLET STYLE:
 - Max 5 bullets per slide.
 - Max 12 words per bullet.
@@ -303,7 +323,14 @@ DIAGRAMS (VERY IMPORTANT):
   Provide a `diagram` object with:
   - kind (architecture/timeline/org/data_model)
   - prompt (clear, renderable, consulting style)
-- The diagram prompt must describe:
+- The diagram prompt MUST be **grounded in this specific RFP**:
+  - Name the actual technologies, platforms, datastores, and tools from the RFP
+    understanding's `key_technologies` (e.g., the named cloud, Kubernetes flavour,
+    database, messaging, and observability tools) — never generic placeholders
+    like "Application / Database / Integration".
+  - Name the actual roles for team/org diagrams.
+  - Reference the client by name where natural.
+- The diagram prompt must also describe:
   - major boxes/entities
   - the flows/arrows
   - labeling guidance
@@ -315,6 +342,14 @@ ALIGNMENT & COVERAGE:
 - Ensure Team and Commercials content is present (can be multiple slides if needed).
 - Avoid redundant slides that do not add clear narrative value.
 - Do not add filler slides; every slide must map to RFP needs and narrative.
+
+SLIDE COUNT (RIGHT-SIZE TO THE PROPOSAL):
+- There is no fixed number of slides. Decide the count from what the RFP and
+  narrative actually require — a focused opportunity may need fewer slides; a
+  complex, multi-workstream program may need more.
+- Optimize for a senior-executive audience: every slide must earn its place.
+- Do NOT pad to hit a number, and do NOT split one idea across multiple
+  near-duplicate slides — merge thin or overlapping topics instead.
 
 CONSTRAINTS:
 - Use only layout names from `Template layouts available`.
@@ -394,7 +429,8 @@ probability and aligns tightly with the RFP’s objectives, milestones, and
 evaluation criteria.
 
 HARD CONSTRAINTS:
-- Total slides MUST be between **14 and 18** (inclusive).
+- Right-size the number of sections/slides to the RFP and narrative; do not pad to
+  hit a number and do not split one idea across near-duplicate slides.
 - ALWAYS include dedicated sections for:
   - **Team**
   - **Commercials** (pricing / commercials / assumptions).
