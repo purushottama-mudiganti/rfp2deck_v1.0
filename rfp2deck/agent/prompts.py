@@ -89,121 +89,6 @@ REUSABLE CONTEXT (optional):
 {rag_context}
 """
 
-DECK_PLAN_PROMPT = """
-You are a senior consulting proposal deck designer.
-
-TASK:
-Create a **professional, consulting-ready, slide-by-slide DeckPlan** that responds
-directly to the RFP, respects the SectionPlan, and fits the given PowerPoint
-template constraints.
-
-SOURCES YOU MAY USE:
-- SECTION PLAN
-- RFP UNDERSTANDING
-- REUSABLE CONTEXT
-Do **not** use any other assumed knowledge. If something is not present,
-treat it as unknown and avoid inventing specific details.
-
-QUALITY BAR (APPLIES TO EVERY SLIDE):
-- Slide titles:
-  - Must be **outcome-oriented headlines**, not generic topics.
-  - Example style: “Accelerate time-to-market with automated deployment pipeline”.
-- Bullets:
-  - Max **5 bullets per slide**.
-  - Max **12–14 words per bullet**.
-  - Written in **crisp, executive language**, avoiding jargon and filler.
-- Storyline:
-  - Follow a clear flow:
-    **Problem → Approach → Architecture → Delivery → Risk & Governance
-    → Commercials → Team → Next steps**.
-  - Explicitly address RFP priorities and evaluation criteria where possible.
-
-DIAGRAMS:
-- For any slide whose archetype is Architecture, Timeline, Roadmap, Operating Model
-  or similar:
-  - Propose a diagram specification including:
-    - `diagram_type` (e.g., layered architecture, swimlane timeline, Gantt, value stream).
-    - `diagram_prompt` (one or two sentences describing what to render).
-  - Ensure the diagram spec is specific enough for a design tool or image model.
-
-CONSTRAINTS:
-- Ensure at least one **Commercials** slide and at least one **Team** slide exist.
-- Right-size the slide count to what the RFP requires; do not pad and do not split
-  one idea across near-duplicate slides. Every slide must earn its place.
-- Each slide must map logically back to the SectionPlan.
-- Use **only** template layouts from `TEMPLATE LAYOUTS (names)` and respect
-  the placeholder structure from the placeholder map where relevant.
-
-OUTPUT CONTENT EXPECTATIONS:
-For each slide (according to your DeckPlan schema), define at minimum:
-- slide_id
-- title
-- layout_name (from TEMPLATE LAYOUTS)
-- archetype (e.g., problem, approach, architecture, roadmap, commercials, team, next_steps)
-- bullets
-- optional table definition (if helpful and supported by the schema)
-- optional diagram spec (where appropriate)
-- reference to relevant RFP section or requirement IDs (if the schema has such fields)
-
-OUTPUT FORMAT:
-Return strictly valid JSON matching the DeckPlan schema.
-No free-text explanation outside the JSON.
-
-TEMPLATE LAYOUTS (names):
-{layout_names}
-
-PLACEHOLDER MAP (truncated):
-{placeholder_map}
-
-SECTION PLAN (JSON):
-{section_plan_json}
-
-RFP UNDERSTANDING (JSON):
-{understanding_json}
-
-REUSABLE CONTEXT (optional):
-{rag_context}
-"""
-
-TRACEABILITY_PROMPT = """
-You are a proposal compliance and traceability specialist.
-
-TASK:
-Create a **traceability map** between the DeckPlan slides and the RFP’s
-requirements, sections, and milestones.
-
-GOALS:
-- Show for each slide which RFP requirements, sections, and milestones it addresses.
-- Identify any **RFP requirements or milestones that are not covered** by any slide
-  (gaps).
-- Identify any slides that have **weak or no traceable linkage** to the RFP
-  (potentially redundant or low-value).
-
-INPUTS (assumed to be available via the calling system/schema):
-- RFP understanding JSON (with requirement IDs / sections / milestones where possible).
-- DeckPlan JSON (with slide_id, title, and any rfp_section / milestone fields).
-
-OUTPUT EXPECTATIONS:
-- Return a single JSON object that follows the provided **Traceability schema**, e.g.:
-  - `slide_mappings`: array of objects with:
-    - slide_id
-    - slide_title
-    - mapped_rfp_requirements (IDs or section references)
-    - mapped_milestones (if applicable)
-    - coverage_strength (e.g., "primary", "partial", "supporting" if schema allows)
-  - `uncovered_requirements`: array of RFP requirement IDs/sections not mapped to any slide.
-  - `uncovered_milestones`: array of milestones not mapped to any slide (if applicable).
-
-GUARDRAILS:
-- Use only requirement IDs/sections that are present in the RFP understanding JSON.
-- If the RFP does not define explicit IDs, use the best available section or heading references.
-- Do not fabricate requirement IDs or milestones.
-
-OUTPUT FORMAT:
-- Return **strictly valid JSON** matching the provided traceability schema.
-- Do not include any explanation or text outside the JSON.
-"""
-
 EXEC_NARRATIVE_PROMPT = """
 You are a Tier-1 strategy and technology consulting proposal lead.
 
@@ -286,10 +171,30 @@ Each slide MUST include (in the JSON schema fields):
 - title (headline-style, outcome-oriented)
 - archetype (e.g., context, problem, approach, architecture, roadmap, commercials, team, risk, next_steps)
 - bullets (0–5 bullets, max 12 words each, executive tone, no boilerplate)
+- detailed_points (use INSTEAD of bullets for context/narrative-heavy slides — see below)
 - optional table (when a tabular view adds clarity)
 - optional diagram (for visual content as defined above)
 - rfp_section (or requirement reference) – where in the RFP this slide is responding
 - milestone (if applicable) – which RFP milestone or timeline element it supports
+
+DETAILED POINTS (sub-bullets) — REQUIRED FOR CONTEXT-HEAVY SLIDES:
+- A bare headline like "Current environment and constraints" or "Stakeholder
+  needs and pain points" is NOT acceptable on its own — it carries no meaning.
+- For slides such as **Customer Context / Current State**, **Requirements**,
+  **Risks**, and **Solution approach**, populate `detailed_points` instead of
+  (or in addition to) `bullets`. Each detailed point has:
+    - `text`: the headline idea (short, ≤ ~8 words).
+    - `sub_points`: 2–4 concrete supporting statements GROUNDED in the RFP
+      (name the actual systems, constraints, stakeholders, requirements, or
+      risks). Each sub-point ≤ ~14 words.
+- Leave `bullets` empty when you use `detailed_points` for that slide.
+- Example for a Current State slide:
+    {{"text": "Legacy estate constrains delivery",
+      "sub_points": ["On-prem monolith blocks independent scaling",
+                     "Manual releases delay time-to-market",
+                     "Limited observability slows incident response"]}}
+- Do not invent specifics not supported by the RFP understanding; if a theme has
+  no grounded detail, omit it rather than padding with generic filler.
 
 EXECUTIVE SUMMARY (CRITICAL):
 - The Executive Summary slide must present the **win thesis**, structured as:
@@ -299,7 +204,18 @@ EXECUTIVE SUMMARY (CRITICAL):
 - Draw these from the narrative spine's value proposition and strategic outcomes.
 - **NEVER** use proposal logistics as Executive Summary bullets — no submission
   deadlines, question-due dates, "proposal due", RFP reference numbers, or any
-  process metadata. Those belong (if anywhere) on a logistics/next-steps slide.
+  process metadata.
+
+NEXT STEPS (CRITICAL):
+- The Next Steps slide states what **WE, the supplier, recommend the customer do
+  next** to move the engagement forward — it is a set of forward-looking calls
+  to action, phrased as actions (start with a verb).
+  Good: "Schedule a solution deep-dive workshop", "Confirm Phase 1 priority use
+  cases", "Agree commercial model and begin mobilization".
+- **NEVER** put on Next Steps: proposal submission/question deadlines, RFP
+  reference numbers, bid logistics, or a restatement of what the customer wants
+  or asked for. Those are not next steps.
+- Keep to 3–5 crisp action bullets.
 
 TITLE STYLE (consulting standard):
 - Use *assertion headlines*: the slide title states the message.
@@ -402,6 +318,7 @@ SCOPE OF CHANGES:
 - Only modify the `bullets` field(s) in the DeckPlan JSON.
 - Do not alter:
   - slide_id
+  - `detailed_points` (headline + sub_points) — preserve these exactly as given
   - mappings to RFP sections / milestones
   - diagram or table definitions
   - titles or archetypes (unless the schema explicitly instructs otherwise).
@@ -419,57 +336,42 @@ Input deck plan JSON:
 {deck_plan_json}
 """
 
-SECTION_PLAN_PROMPT = """
-You are a senior proposal strategist and deck architect designing a **1-hour bid
-defense** presentation.
+SPEAKER_NOTES_PROMPT = """
+You are a senior consulting presenter coaching a colleague who must DELIVER this
+proposal deck to a client executive audience.
 
-GOAL:
-Create a **SectionPlan** that structures the story in a way that maximizes win
-probability and aligns tightly with the RFP’s objectives, milestones, and
-evaluation criteria.
+TASK:
+For EVERY slide in the DeckPlan, write **speaker notes** that let a human
+presenter confidently explain the slide — even if they did not build it. The
+notes must unpack the thinking behind the points, not just repeat them.
 
-HARD CONSTRAINTS:
-- Right-size the number of sections/slides to the RFP and narrative; do not pad to
-  hit a number and do not split one idea across near-duplicate slides.
-- ALWAYS include dedicated sections for:
-  - **Team**
-  - **Commercials** (pricing / commercials / assumptions).
-- Use concise, executive slide titles (≤ 8–10 words each) that:
-  - Express an outcome or key message (not just a topic).
-  - Are client-centric and benefit-focused.
-- Prefer **visual-first** sections where appropriate:
-  - Architecture, roadmap, operating model, delivery model, transition plan.
-- Avoid:
-  - Repeating the same idea across many slides.
-  - Vendor-centric bragging without clear client value.
-  - Generic boilerplate that does not map to the RFP.
+WHAT EACH SLIDE'S NOTES MUST DO:
+- Explain, in plain language, WHAT the slide is saying and WHY it matters to THIS
+  client (tie back to their context, drivers, and priorities).
+- Give the presenter 2–4 concrete **talking points** that expand each bullet /
+  sub-point with the reasoning a human would otherwise have to guess.
+- Where useful, suggest a natural **transition** into the next idea.
+- Anticipate one likely **question or objection** and how to respond, when relevant.
 
-STRUCTURING GUIDANCE (reflect in the SectionPlan JSON):
-- Think in narrative flow: **Context → Problem → Approach → Architecture → Delivery
-  → Risk & Governance → Commercials → Team → Next steps**.
-- For each section, clearly indicate:
-  - Section name and objective (what the client should take away).
-  - Estimated number of slides.
-  - Brief description of the content and visual style (visual-first vs. text).
-- Ensure the plan:
-  - Covers all major RFP requirements and key evaluation dimensions.
-  - Highlights where key RFP milestones, deadlines, or decision points will appear.
-  - Leaves room for Q&A (if the schema supports time allocation).
+STYLE:
+- Conversational but professional, first-person plural ("we", "our approach").
+- 60–130 words per slide. Full sentences, not bullet fragments.
+- Speak to the presenter (e.g., "Open by reminding them that…", "Emphasise…").
+- Do NOT invent facts, metrics, names, or commitments not present in the inputs.
+  If something is unknown, coach the presenter to speak to it at a high level.
 
-GUARDRAILS:
-- Use only the RFP UNDERSTANDING and REUSABLE CONTEXT as sources.
-- If something is unknown (e.g., evaluation criteria not stated), call this out
-  explicitly in the plan using the fields in the schema.
-- Do not introduce new commitments (e.g., SLAs, features) that are not grounded
-  in the RFP or reasonable best practices.
+OUTPUT FORMAT:
+- Return a single JSON object matching the DeckNotes schema: a `notes` array of
+  objects, each with `slide_id` (exactly matching the input) and `notes` (the
+  speaker notes text). Include an entry for every slide_id in the DeckPlan.
+- No text outside the JSON.
 
-OUTPUT:
-Return **strictly valid JSON** matching the provided SectionPlan schema.
-No additional commentary or text outside the JSON.
+DECK PLAN (JSON — slide_id, title, archetype, bullets, detailed_points):
+{deck_plan_json}
 
-RFP UNDERSTANDING (JSON):
-{understanding_json}
+EXECUTIVE NARRATIVE SPINE (JSON, for rationale/context):
+{narrative_json}
 
-REUSABLE CONTEXT (optional):
-{rag_context}
+RFP UNDERSTANDING SUMMARY (for grounding):
+{understanding_summary}
 """

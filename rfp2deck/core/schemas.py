@@ -121,6 +121,19 @@ class DiagramSpec(BaseModel):
     image_path: Optional[str] = None  # filled by diagram generator
 
 
+class BulletPoint(BaseModel):
+    """A headline bullet with optional supporting sub-points.
+
+    Used for narrative/context-heavy slides where a top-level point needs
+    concrete substantiation (e.g. "Legacy estate constrains delivery" with
+    sub-points naming the specific systems and pain points). The renderer
+    prefers `detailed_points` over flat `bullets` when present.
+    """
+
+    text: str
+    sub_points: List[str] = Field(default_factory=list)
+
+
 class SlideSpec(BaseModel):
     slide_id: str
     title: str
@@ -128,6 +141,9 @@ class SlideSpec(BaseModel):
     rfp_section: Optional[str] = None
     milestone: Optional[str] = None
     bullets: List[str] = Field(default_factory=list)
+    # Optional two-level bullets; when non-empty the renderer uses these instead
+    # of `bullets` so headline points carry concrete supporting detail.
+    detailed_points: List[BulletPoint] = Field(default_factory=list)
     table: Optional[Dict[str, Any]] = None  # {headers:[], rows:[[]]}
     notes: Optional[str] = None
     rfps: List[str] = Field(default_factory=list)  # refs for traceability
@@ -139,6 +155,17 @@ class SlideSpec(BaseModel):
 class DeckPlan(BaseModel):
     deck_title: str
     slides: List[SlideSpec]
+
+
+class SlideNote(BaseModel):
+    slide_id: str
+    notes: str
+
+
+class DeckNotes(BaseModel):
+    """Speaker notes for the deck, keyed by slide_id."""
+
+    notes: List[SlideNote] = Field(default_factory=list)
 
 
 class TraceabilityItem(BaseModel):

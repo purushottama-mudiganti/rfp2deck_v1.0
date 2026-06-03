@@ -1,17 +1,24 @@
 from __future__ import annotations
 
+import functools
 import re
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Callable, Dict, List, Optional
 
+from rfp2deck.core.logging import get_logger
 from rfp2deck.agent.prompts import (
     DECK_PLAN_V2_PROMPT,
     EXEC_NARRATIVE_PROMPT,
     RFP_UNDERSTAND_PROMPT,
     SECTION_TAXONOMY_PROMPT,
     SLIDE_COMPRESSION_PROMPT,
+    SPEAKER_NOTES_PROMPT,
 )
 from rfp2deck.agent.state import AgentState
+from rfp2deck.core.config import settings
 from rfp2deck.core.schemas import (
+    BulletPoint,
+    DeckNotes,
     DeckPlan,
     DiagramSpec,
     ExecutiveNarrative,
@@ -23,7 +30,34 @@ from rfp2deck.core.schemas import (
 from rfp2deck.llm.structured import response_as_schema
 from rfp2deck.qa.coverage import build_traceability_report
 
+log = get_logger(__name__)
 
+
+def _logged_node(func: Callable[[AgentState], Dict[str, Any]]) -> Callable[[AgentState], Dict[str, Any]]:
+    """Wrap a graph node so its start, duration, and failures are logged.
+
+    LangGraph nodes otherwise run silently; this surfaces which node was active
+    when an error (e.g. an LLM timeout) occurred and how long each step took.
+    """
+
+    @functools.wraps(func)
+    def wrapper(state: AgentState) -> Dict[str, Any]:
+        log.info("Node START: %s", func.__name__)
+        start = time.perf_counter()
+        try:
+            result = func(state)
+        except Exception:
+            elapsed = time.perf_counter() - start
+            log.exception("Node FAILED: %s after %.1fs", func.__name__, elapsed)
+            raise
+        elapsed = time.perf_counter() - start
+        log.info("Node DONE: %s in %.1fs", func.__name__, elapsed)
+        return result
+
+    return wrapper
+
+
+@_logged_node
 def understand_rfp(state: AgentState) -> Dict[str, Any]:
     """Extract a structured understanding of the RFP."""
     prompt = RFP_UNDERSTAND_PROMPT.format(
@@ -35,6 +69,7 @@ def understand_rfp(state: AgentState) -> Dict[str, Any]:
     return {"understanding": understanding}
 
 
+@_logged_node
 def classify_sections(state: AgentState) -> Dict[str, Any]:
     """Classify RFP into section taxonomy for better subtitle generation & narrative."""
     prompt = SECTION_TAXONOMY_PROMPT.format(
@@ -46,6 +81,7 @@ def classify_sections(state: AgentState) -> Dict[str, Any]:
     return {"section_map": state.section_map}
 
 
+@_logged_node
 def build_narrative(state: AgentState) -> Dict[str, Any]:
     """Build an executive narrative spine for the proposal."""
     prompt = EXEC_NARRATIVE_PROMPT.format(
@@ -213,30 +249,6 @@ def _appendix_arch_diagram(view_name: str, understanding: RFPUnderstanding) -> D
     )
 
 
-def _exec_summary_diagram_prompt(slide: SlideSpec) -> str:
-    """Create a high-quality prompt for the Executive Summary 3-card graphic."""
-    bullets = [b for b in (slide.bullets or []) if (b or "").strip()]
-    # Map up to 3 bullets to the three cards; fall back to generic hints if missing.
-    body_a = bullets[0] if len(bullets) > 0 else "Key opportunity and client context"
-    body_b = bullets[1] if len(bullets) > 1 else "Recommended approach and solution highlights"
-    body_c = bullets[2] if len(bullets) > 2 else "Expected business outcomes and impact"
-
-    return (
-        "Design a clean, consulting-style Executive Summary graphic with three equal cards.\n"
-        "Cards (left to right) titled: OPPORTUNITY, RECOMMENDATION, BUSINESS IMPACT.\n"
-        "Use the following body text exactly (no lorem ipsum, no placeholders):\n"
-        f"- OPPORTUNITY: {body_a}\n"
-        f"- RECOMMENDATION: {body_b}\n"
-        f"- BUSINESS IMPACT: {body_c}\n"
-        "Style: white background, subtle light-gray card borders, blue header bars, "
-        "simple sans-serif font, left-aligned text, generous spacing.\n"
-        "Do not add extra icons, charts, or decorative elements. No gradients or shadows. "
-        "No hand-drawn or sketch effects. Keep text crisp and readable.\n"
-        "Keep all text and shapes inside a 5–8% safe margin; do not place content at the edges.\n"
-        "Output a single slide-like image sized for 16:9."
-    )
-
-
 def _first_sentence(text: str, max_len: int = 200) -> str:
     t = (text or "").strip()
     if not t:
@@ -350,6 +362,127 @@ def _is_placeholder_exec_bullets(bullets: Optional[List[str]]) -> bool:
     return norm[:3] == placeholder
 
 
+def _context_detailed_points(understanding: RFPUnderstanding | None) -> List[BulletPoint]:
+    """Build grounded sub-points for the Customer Context slide.
+
+    Turns the three generic context headers into substantive points by hanging
+    concrete sub-points off each, drawn from the RFP understanding (assumptions,
+    requirements, risks). Returns [] when there is nothing grounded to say, so
+    the caller can fall back to flat bullets.
+    """
+    if understanding is None:
+        return []
+
+    points: List[BulletPoint] = []
+
+    # Current environment & constraints — from stated assumptions, else summary.
+    env_subs = [_clip(a, 120) for a in (getattr(understanding, "assumptions", []) or []) if (a or "").strip()][:3]
+    if not env_subs:
+        first = _first_sentence(getattr(understanding, "summary", "") or "", 140)
+        if first:
+            env_subs = [first]
+    if env_subs:
+        points.append(BulletPoint(text="Current environment and constraints", sub_points=env_subs))
+
+    # Stakeholder needs & pain points — from must/should requirements.
+    reqs = getattr(understanding, "requirements", []) or []
+    ranked = sorted(reqs, key=lambda r: {"must": 0, "should": 1, "may": 2}.get(getattr(r, "priority", "should"), 1))
+    need_subs = [_clip(getattr(r, "text", ""), 120) for r in ranked if (getattr(r, "text", "") or "").strip()][:4]
+    if need_subs:
+        points.append(BulletPoint(text="Stakeholder needs and pain points", sub_points=need_subs))
+
+    # Why change now — from stated risks/pressures driving the initiative.
+    why_subs = [_clip(r, 120) for r in (getattr(understanding, "risks", []) or []) if (r or "").strip()][:3]
+    if why_subs:
+        points.append(BulletPoint(text="Why change now", sub_points=why_subs))
+
+    return points
+
+
+def _requirements_detailed_points(understanding: RFPUnderstanding | None) -> List[BulletPoint]:
+    """Group RFP requirements into functional vs non-functional sub-points."""
+    if understanding is None:
+        return []
+    reqs = getattr(understanding, "requirements", []) or []
+    if not reqs:
+        return []
+    nf_kw = (
+        "security", "performance", "availability", "compliance", "scalab", "latency",
+        "throughput", "uptime", "encrypt", "privacy", "resilien", "audit", "sla",
+    )
+    functional: List[str] = []
+    nonfunctional: List[str] = []
+    for r in reqs:
+        text = (getattr(r, "text", "") or "").strip()
+        if not text:
+            continue
+        target = nonfunctional if any(k in text.lower() for k in nf_kw) else functional
+        target.append(_clip(text, 120))
+
+    points: List[BulletPoint] = []
+    if functional:
+        points.append(BulletPoint(text="Functional scope", sub_points=functional[:4]))
+    if nonfunctional:
+        points.append(BulletPoint(text="Non-functional requirements", sub_points=nonfunctional[:4]))
+    return points
+
+
+def _next_steps_bullets(understanding: RFPUnderstanding | None) -> List[str]:
+    """Supplier-driven calls to action for the customer.
+
+    Next Steps must express what WE (the supplier) propose the customer does
+    next to move the engagement forward — never proposal logistics (submission
+    dates, RFP numbers) or a restatement of what the customer wants.
+    """
+    customer = (getattr(understanding, "customer_name", None) or "").strip() if understanding else ""
+    who = customer or "your team"
+    return [
+        f"Schedule a solution deep-dive workshop with {who}",
+        "Confirm priority use cases and success criteria for Phase 1",
+        "Align on governance, delivery model, and key stakeholders",
+        "Agree commercial model and contracting approach",
+        "Approve mobilization to begin within two weeks of award",
+    ]
+
+
+# Phrases that don't belong on a supplier's Next Steps slide: proposal logistics,
+# the customer's own evaluation activities, or restatements of what the customer wants.
+_NON_ACTION_MARKERS = (
+    # Proposal / bid logistics
+    "proposal due", "submission deadline", "due date", "questions due", "q&a due",
+    "rfp ref", "rfp number", "rfp no", "bid due", "closing date", "deadline for",
+    "submit by", "submission date", "clarification question",
+    # Customer-side evaluation activities (not OUR next step)
+    "evaluat", "shortlist", "award decision", "select a vendor", "vendor selection",
+    "vendor response", "scoring", "score the", "review responses",
+    # Restating what the customer wants
+    "customer want", "client want", "they want", "customer would like",
+    "client would like", "customer needs", "client needs", "customer requires",
+)
+
+
+def _sanitize_next_steps(slide: SlideSpec, understanding: RFPUnderstanding | None) -> None:
+    """Keep a Next Steps slide to supplier-driven calls to action.
+
+    Drops proposal logistics, customer-side evaluation activities, and
+    restatements of what the customer wants. If too little actionable content
+    remains, replace it with supplier-driven calls to action.
+    """
+    cleaned: List[str] = []
+    for b in (slide.bullets or []):
+        low = (b or "").strip().lower()
+        if not low:
+            continue
+        if any(m in low for m in _NON_ACTION_MARKERS):
+            continue
+        cleaned.append(b)
+    if len(cleaned) < 3:
+        cleaned = _next_steps_bullets(understanding)
+    slide.bullets = cleaned
+    # Next Steps reads best as a clean action list, not nested detail.
+    slide.detailed_points = []
+
+
 def _is_archetype_present(existing_archetypes: set, target: str) -> bool:
     """Fuzzy archetype match to avoid near-duplicate auto-added slides.
 
@@ -379,6 +512,7 @@ def ensure_required_slides(
         title: str,
         bullets: Optional[List[str]] = None,
         diagram: Optional[DiagramSpec] = None,
+        detailed_points: Optional[List[BulletPoint]] = None,
     ) -> None:
         deck_plan.slides.append(
             SlideSpec(
@@ -386,6 +520,7 @@ def ensure_required_slides(
                 title=title,
                 archetype=archetype,
                 bullets=bullets or [],
+                detailed_points=detailed_points or [],
                 diagram=diagram,
             )
         )
@@ -433,14 +568,16 @@ def ensure_required_slides(
 
     # Customer Context
     if not _is_archetype_present(existing_keys, "customer context"):
+        ctx_points = _context_detailed_points(understanding)
         add_slide(
             "Customer Context",
             "Current State & Context",
-            bullets=[
+            bullets=[] if ctx_points else [
                 "Current environment and constraints",
                 "Key stakeholder needs and pain points",
                 "Why change / why now",
             ],
+            detailed_points=ctx_points,
         )
 
     # Requirements
@@ -556,16 +693,12 @@ def ensure_required_slides(
             ],
         )
 
-    # Next Steps
+    # Next Steps — supplier-driven calls to action (not proposal logistics).
     if not _is_archetype_present(existing_keys, "next steps"):
         add_slide(
             "Next Steps",
-            "Next Steps",
-            bullets=[
-                "Confirm scope and success criteria",
-                "Align on plan, governance, and resourcing",
-                "Kick-off and mobilization",
-            ],
+            "Recommended Next Steps",
+            bullets=_next_steps_bullets(understanding),
         )
 
     return deck_plan
@@ -629,19 +762,70 @@ def order_deck(deck_plan: DeckPlan) -> DeckPlan:
     return deck_plan
 
 
+def enrich_slide_detail(deck_plan: DeckPlan, understanding: RFPUnderstanding | None = None) -> DeckPlan:
+    """Upgrade thin content slides with grounded sub-points and fix Next Steps.
+
+    Applies to both model-generated and auto-added slides:
+      - Customer Context / "Current State" slides lacking sub-points get
+        substantive `detailed_points` drawn from the RFP understanding.
+      - Requirements slides get functional vs non-functional sub-points.
+      - Next Steps slides are sanitized of proposal logistics and, if needed,
+        replaced with supplier-driven calls to action.
+    """
+    for s in deck_plan.slides:
+        arch = (s.archetype or "").lower()
+        title = (s.title or "").lower()
+
+        if arch == "next steps" or "next step" in title:
+            _sanitize_next_steps(s, understanding)
+            continue
+
+        # Skip slides that already carry structured detail.
+        if getattr(s, "detailed_points", None):
+            continue
+
+        is_context = arch == "customer context" or "current state" in title or (
+            "context" in title and arch not in {"title", "agenda"}
+        )
+        is_requirements = arch == "requirements" or "requirement" in title
+
+        if is_context:
+            pts = _context_detailed_points(understanding)
+            if pts:
+                s.detailed_points = pts
+                s.bullets = []  # detailed_points supersede flat bullets in the renderer
+        elif is_requirements:
+            pts = _requirements_detailed_points(understanding)
+            if pts:
+                s.detailed_points = pts
+                s.bullets = []
+
+    return deck_plan
+
+
 def polish_deck_text(deck_plan: DeckPlan) -> DeckPlan:
     """Light text normalization for a cleaner consulting tone."""
+    def _clean(text: str) -> str:
+        t = (text or "").strip()
+        t = t.replace("  ", " ")
+        t = t.rstrip(".")
+        return t
+
     for s in deck_plan.slides:
-        if not s.bullets:
-            continue
-        new_bullets = []
-        for b in s.bullets:
-            t = (b or "").strip()
-            t = t.replace("  ", " ")
-            t = t.rstrip(".")
-            if t:
-                new_bullets.append(t)
-        s.bullets = new_bullets[:8]  # keep crisp
+        if s.bullets:
+            s.bullets = [c for c in (_clean(b) for b in s.bullets) if c][:8]
+        # Normalize nested points too, preserving their structure.
+        if getattr(s, "detailed_points", None):
+            cleaned_points = []
+            for point in s.detailed_points:
+                text = _clean(getattr(point, "text", ""))
+                if not text:
+                    continue
+                subs = [c for c in (_clean(sp) for sp in (point.sub_points or [])) if c][:5]
+                point.text = text
+                point.sub_points = subs
+                cleaned_points.append(point)
+            s.detailed_points = cleaned_points[:6]
     return deck_plan
 
 
@@ -689,18 +873,7 @@ def ensure_diagrams_for_key_slides(deck_plan: DeckPlan, understanding: RFPUnders
     return deck_plan
 
 
-def build_traceability(state: AgentState) -> Dict[str, Any]:
-    """Build a traceability report mapping requirements to slides."""
-    if state.understanding is None or state.deck_plan is None:
-        return {"traceability_report": None}
-    report = build_traceability_report(
-        understanding=state.understanding,
-        deck=state.deck_plan,
-    )
-    state.traceability_report = report
-    return {"traceability_report": report}
-
-
+@_logged_node
 def qa_and_report(state: AgentState) -> Dict[str, Any]:
     """Back-compat wrapper that stores report under the expected key."""
     if state.understanding is None or state.deck_plan is None:
@@ -713,6 +886,7 @@ def qa_and_report(state: AgentState) -> Dict[str, Any]:
     return {"report": report}
 
 
+@_logged_node
 def plan_deck(state: AgentState) -> Dict[str, Any]:
     """Plan a deck from RFP + optional RAG context."""
     template_info = state.template_info or {}
@@ -737,6 +911,7 @@ def plan_deck(state: AgentState) -> Dict[str, Any]:
         deck_plan, understanding=state.understanding, narrative=state.narrative
     )
     deck_plan = order_deck(deck_plan)
+    deck_plan = enrich_slide_detail(deck_plan, understanding=state.understanding)
     deck_plan = polish_deck_text(deck_plan)
     deck_plan = ensure_diagrams_for_key_slides(deck_plan, understanding=state.understanding)
 
@@ -744,6 +919,7 @@ def plan_deck(state: AgentState) -> Dict[str, Any]:
     return {"deck_plan": deck_plan}
 
 
+@_logged_node
 def compress_bullets(state: AgentState) -> Dict[str, Any]:
     """Editorial pass: tighten bullets to executive-grade language.
 
@@ -764,22 +940,115 @@ def compress_bullets(state: AgentState) -> Dict[str, Any]:
             if cs and cs.bullets:
                 s.bullets = cs.bullets
     except Exception:
-        # Compression is a best-effort polish; never fail the pipeline over it.
-        pass
+        # Compression is a best-effort polish; never fail the pipeline over it,
+        # but record why it was skipped so silent quality regressions are visible.
+        log.warning("Bullet compression skipped due to error; keeping original deck.", exc_info=True)
     return {"deck_plan": state.deck_plan}
 
 
-def run(state: AgentState) -> Dict[str, Any]:
-    """Entry point used by the LangGraph pipeline."""
-    understand_rfp(state)
-    classify_sections(state)
-    build_narrative(state)
-    plan_deck(state)
-    compress_bullets(state)
-    build_traceability(state)
-    return {
-        "understanding": state.understanding,
-        "deck_plan": state.deck_plan,
-        "traceability_report": state.traceability_report,
-        "section_map": state.section_map,
-    }
+def _fallback_note(slide: SlideSpec) -> str:
+    """Build a simple, deterministic speaker note from the slide's own content.
+
+    Used when the LLM notes pass is disabled or fails, so every slide still
+    carries at least basic talking points.
+    """
+    parts: List[str] = []
+    title = (slide.title or "").strip()
+    if title:
+        parts.append(f'This slide covers "{title}."')
+
+    points: List[str] = []
+    if getattr(slide, "detailed_points", None):
+        for p in slide.detailed_points:
+            if (p.text or "").strip():
+                points.append(p.text.strip())
+            for sp in (p.sub_points or []):
+                if (sp or "").strip():
+                    points.append(sp.strip())
+    else:
+        points = [b.strip() for b in (slide.bullets or []) if (b or "").strip()]
+
+    if points:
+        parts.append("Walk the audience through each point: " + "; ".join(points[:6]) + ".")
+        parts.append(
+            "For each, explain why it matters to the client and connect it to their priorities."
+        )
+    return " ".join(parts).strip()
+
+
+# Archetypes that are self-explanatory and don't warrant speaker notes.
+_NO_NOTES_ARCHETYPES = {"title", "agenda", "next steps"}
+
+
+def _slide_wants_notes(slide: SlideSpec) -> bool:
+    """Whether a slide should carry speaker notes (skip cover/agenda/next-steps)."""
+    arch = (slide.archetype or "").lower()
+    title = (slide.title or "").lower()
+    if arch in _NO_NOTES_ARCHETYPES:
+        return False
+    if "next step" in title or title == "agenda":
+        return False
+    return True
+
+
+@_logged_node
+def generate_notes(state: AgentState) -> Dict[str, Any]:
+    """Generate presenter speaker notes for content slides.
+
+    Best-effort: a single fast LLM pass writes notes that unpack the reasoning
+    behind each slide so a human can present it confidently. Any slide the model
+    misses (or the whole pass, if it fails) falls back to deterministic notes
+    derived from the slide content. Self-explanatory slides (Title, Agenda, Next
+    Steps) are skipped. Never fails the pipeline.
+    """
+    if state.deck_plan is None:
+        return {"deck_plan": None}
+
+    slides = state.deck_plan.slides
+    notes_slides = [s for s in slides if _slide_wants_notes(s)]
+    notes_by_id: Dict[str, str] = {}
+
+    if notes_slides and getattr(state, "enable_notes", True):
+        try:
+            compact = [
+                {
+                    "slide_id": s.slide_id,
+                    "title": s.title,
+                    "archetype": s.archetype,
+                    "bullets": s.bullets,
+                    "detailed_points": [
+                        {"text": p.text, "sub_points": p.sub_points}
+                        for p in (s.detailed_points or [])
+                    ],
+                }
+                for s in notes_slides
+            ]
+            prompt = SPEAKER_NOTES_PROMPT.format(
+                deck_plan_json=compact,
+                narrative_json=state.narrative.model_dump() if state.narrative else {},
+                understanding_summary=(
+                    getattr(state.understanding, "summary", "") if state.understanding else ""
+                )
+                or "",
+            )
+            deck_notes = response_as_schema(
+                prompt, DeckNotes, model=settings.model_fast, reasoning_effort="low"
+            )
+            for n in deck_notes.notes:
+                if n.slide_id and (n.notes or "").strip():
+                    notes_by_id[n.slide_id] = n.notes.strip()
+        except Exception:
+            # Notes are an enhancement; never fail the deck over them.
+            log.warning(
+                "Speaker-notes LLM pass failed; using deterministic fallback notes.",
+                exc_info=True,
+            )
+
+    for s in slides:
+        if not _slide_wants_notes(s):
+            s.notes = None
+            continue
+        note = notes_by_id.get(s.slide_id) or _fallback_note(s)
+        s.notes = note or None
+
+    return {"deck_plan": state.deck_plan}

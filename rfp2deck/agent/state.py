@@ -26,6 +26,7 @@ class AgentState(BaseModel):
     pptx_path: Optional[str] = None
     report: Optional[TraceabilityReport] = None
     deck_mode: Optional[str] = None
+    enable_notes: bool = True
     debug: Dict[str, Any] = {}
 
     def model_post_init(self, __context: Any) -> None:

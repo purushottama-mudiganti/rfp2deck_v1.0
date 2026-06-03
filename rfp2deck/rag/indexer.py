@@ -8,7 +8,10 @@ from typing import List, Tuple
 import faiss
 import numpy as np
 
+from rfp2deck.core.logging import get_logger
 from rfp2deck.rag.embeddings import embed_texts
+
+log = get_logger(__name__)
 
 
 @dataclass
@@ -32,11 +35,13 @@ def chunk_text(text: str, max_chars: int = 1800, overlap: int = 200) -> List[str
 
 
 def build_faiss_index(texts: List[str]) -> RAGIndex:
+    log.info("Building FAISS index from %d chunk(s)", len(texts))
     vecs = embed_texts(texts)
     faiss.normalize_L2(vecs)
     dim = vecs.shape[1]
     idx = faiss.IndexFlatIP(dim)
     idx.add(vecs)
+    log.info("FAISS index built (dim=%d, vectors=%d)", dim, idx.ntotal)
     return RAGIndex(index=idx, chunks=texts)
 
 

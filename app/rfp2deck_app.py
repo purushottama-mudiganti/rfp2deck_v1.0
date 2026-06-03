@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """UI for generating proposal decks from RFP inputs."""
 
+import logging
 import os
 import re
 import sys
@@ -75,6 +76,7 @@ if not st.session_state.authenticated:
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 setup_logging()
+log = logging.getLogger("rfp2deck.app")
 st.set_page_config(page_title="RFP → Proposal Deck Agent", layout="wide")
 
 
@@ -123,6 +125,9 @@ with st.sidebar:
         )
     )
 
+    enable_notes = st.checkbox(
+        "Generate speaker notes (presenter notes per slide)", value=True
+    )
     enable_diagrams = st.checkbox("Enable diagram generation (guarded + approval)", value=True)
     diagram_model = st.text_input("Diagram model", value="gpt-image-1")
     diagram_size = st.selectbox(
@@ -303,6 +308,7 @@ def build_output_filename(plan: DeckPlan, rfp_names: list[str] | None) -> str:
 
 def stop_on_error(message: str, status: st.delta_generator.DeltaGenerator | None, exc: Exception):
     """Show error details, mark status as failed, and stop execution."""
+    logging.getLogger("rfp2deck.app").error("%s", message, exc_info=exc)
     if status is not None:
         status.update(label=message, state="error")
     st.error(message)
@@ -444,8 +450,16 @@ if st.session_state.wizard_step == 1:
                 retrieved_context=retrieved_context,
             )
             state.deck_mode = st.session_state.get("deck_mode")
+            state.enable_notes = enable_notes
 
+            log.info(
+                "Invoking agent pipeline (rfp_chars=%d, deck_mode=%s, rag=%s)",
+                len(rfp_text or ""),
+                st.session_state.get("deck_mode"),
+                retrieved_context is not None,
+            )
             final_state = graph.invoke(state)
+            log.info("Agent pipeline completed.")
 
             if isinstance(final_state, dict):
                 deck_plan = final_state.get("deck_plan")

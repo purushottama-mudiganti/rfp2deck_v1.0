@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import time
 from copy import deepcopy
 from typing import Any, Dict, Type, TypeVar
 
-from pydantic import BaseModel
+from openai import APITimeoutError, OpenAIError
+from pydantic import BaseModel, ValidationError
 
 from rfp2deck.core.config import settings
+from rfp2deck.core.logging import get_logger
 from rfp2deck.llm.openai_client import get_client
+
+log = get_logger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -78,9 +83,14 @@ def response_as_schema(
     schema: Type[T],
     model: str | None = None,
     reasoning_effort: str = "medium",
-    timeout_seconds: float = 120.0,
+    timeout_seconds: float = 600.0,
 ) -> T:
-    """Call OpenAI Responses API using STRICT JSON Schema structured output."""
+    """Call OpenAI Responses API using STRICT JSON Schema structured output.
+
+    The request is streamed so the client timeout applies to the gap between
+    events rather than to total wall-clock time. High reasoning-effort requests
+    can think for several minutes, which would otherwise trip the read timeout.
+    """
     client = get_client(timeout=timeout_seconds, max_retries=2)
     model = model or settings.model_reasoning
 
@@ -98,18 +108,71 @@ def response_as_schema(
 
     strict_schema = _make_strict(inlined)
 
-    resp = client.responses.create(
-        model=model,
-        input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": schema.__name__,
-                "schema": strict_schema,
-                "strict": True,
-            }
-        },
-        reasoning={"effort": reasoning_effort} if reasoning_effort else None,
+    log.info(
+        "LLM structured call: schema=%s model=%s effort=%s prompt_chars=%d timeout=%.0fs",
+        schema.__name__,
+        model,
+        reasoning_effort,
+        len(prompt),
+        timeout_seconds,
+    )
+    start = time.perf_counter()
+    try:
+        with client.responses.stream(
+            model=model,
+            input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": schema.__name__,
+                    "schema": strict_schema,
+                    "strict": True,
+                }
+            },
+            reasoning={"effort": reasoning_effort} if reasoning_effort else None,
+        ) as stream:
+            for _ in stream:
+                pass
+            resp = stream.get_final_response()
+    except APITimeoutError:
+        elapsed = time.perf_counter() - start
+        log.error(
+            "LLM structured call TIMED OUT for schema=%s after %.1fs "
+            "(model=%s, effort=%s, timeout=%.0fs). Consider raising timeout_seconds "
+            "or lowering reasoning_effort.",
+            schema.__name__,
+            elapsed,
+            model,
+            reasoning_effort,
+            timeout_seconds,
+        )
+        raise
+    except OpenAIError:
+        elapsed = time.perf_counter() - start
+        log.exception(
+            "LLM structured call FAILED for schema=%s after %.1fs (model=%s, effort=%s)",
+            schema.__name__,
+            elapsed,
+            model,
+            reasoning_effort,
+        )
+        raise
+
+    elapsed = time.perf_counter() - start
+    output_text = resp.output_text or ""
+    log.info(
+        "LLM structured call OK: schema=%s in %.1fs (output_chars=%d)",
+        schema.__name__,
+        elapsed,
+        len(output_text),
     )
 
-    return schema.model_validate_json(resp.output_text)
+    try:
+        return schema.model_validate_json(output_text)
+    except ValidationError:
+        log.exception(
+            "Response did not match schema=%s. First 500 chars of output: %s",
+            schema.__name__,
+            output_text[:500],
+        )
+        raise
