@@ -21,6 +21,14 @@ class Settings:
     sp_client_id: str = os.getenv("SP_CLIENT_ID", "")
     sp_scopes: str = os.getenv("SP_SCOPES", "Files.Read.All,Sites.Read.All")
 
+    @property
+    def rag_index_dir(self) -> Path:
+        """Location of the persistent RAG index (e.g. built from SharePoint)."""
+        configured = os.getenv("RAG_INDEX_DIR")
+        if configured:
+            return Path(configured)
+        return self.data_dir / "indexes" / "default_rag"
+
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "uploads").mkdir(parents=True, exist_ok=True)

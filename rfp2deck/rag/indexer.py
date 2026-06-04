@@ -8,6 +8,7 @@ from typing import List, Tuple
 import faiss
 import numpy as np
 
+from rfp2deck.core.config import settings
 from rfp2deck.core.logging import get_logger
 from rfp2deck.rag.embeddings import embed_texts
 
@@ -18,6 +19,9 @@ log = get_logger(__name__)
 class RAGIndex:
     index: faiss.IndexFlatIP
     chunks: List[str]
+    # Embeddings model the vectors were built with. Used to guard against
+    # querying a persisted index with a different (incompatible) model.
+    embeddings_model: str | None = None
 
 
 def chunk_text(text: str, max_chars: int = 1800, overlap: int = 200) -> List[str]:
@@ -42,7 +46,7 @@ def build_faiss_index(texts: List[str]) -> RAGIndex:
     idx = faiss.IndexFlatIP(dim)
     idx.add(vecs)
     log.info("FAISS index built (dim=%d, vectors=%d)", dim, idx.ntotal)
-    return RAGIndex(index=idx, chunks=texts)
+    return RAGIndex(index=idx, chunks=texts, embeddings_model=settings.embeddings_model)
 
 
 def save_index(rag: RAGIndex, out_dir: Path) -> None:
@@ -51,6 +55,10 @@ def save_index(rag: RAGIndex, out_dir: Path) -> None:
     (out_dir / "chunks.json").write_text(
         json.dumps(rag.chunks, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    meta = {"embeddings_model": rag.embeddings_model or settings.embeddings_model}
+    (out_dir / "meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
 
 def load_index(in_dir: Path) -> RAGIndex:
@@ -58,4 +66,13 @@ def load_index(in_dir: Path) -> RAGIndex:
 
     idx = faiss.read_index(str(in_dir / "index.faiss"))
     chunks = json.loads((in_dir / "chunks.json").read_text(encoding="utf-8"))
-    return RAGIndex(index=idx, chunks=chunks)
+    embeddings_model = None
+    meta_path = in_dir / "meta.json"
+    if meta_path.exists():
+        try:
+            embeddings_model = json.loads(meta_path.read_text(encoding="utf-8")).get(
+                "embeddings_model"
+            )
+        except (ValueError, OSError):
+            log.warning("Could not read embeddings model from %s", meta_path)
+    return RAGIndex(index=idx, chunks=chunks, embeddings_model=embeddings_model)

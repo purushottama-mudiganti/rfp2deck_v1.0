@@ -20,7 +20,7 @@ try:
     from rfp2deck.ingestion.deck_analyzer import analyze_pptx_template
     from rfp2deck.ingestion.docx_parser import parse_docx
     from rfp2deck.ingestion.pdf_parser import parse_pdf
-    from rfp2deck.rag.indexer import build_faiss_index, chunk_text
+    from rfp2deck.rag.indexer import build_faiss_index, chunk_text, load_index
     from rfp2deck.rag.retriever import retrieve
     from rfp2deck.rendering.pptx_renderer import render_deck_from_template
 except ModuleNotFoundError:
@@ -37,7 +37,7 @@ except ModuleNotFoundError:
     from rfp2deck.ingestion.deck_analyzer import analyze_pptx_template
     from rfp2deck.ingestion.docx_parser import parse_docx
     from rfp2deck.ingestion.pdf_parser import parse_pdf
-    from rfp2deck.rag.indexer import build_faiss_index, chunk_text
+    from rfp2deck.rag.indexer import build_faiss_index, chunk_text, load_index
     from rfp2deck.rag.retriever import retrieve
     from rfp2deck.rendering.pptx_renderer import render_deck_from_template
 
@@ -99,6 +99,38 @@ st.session_state.setdefault("rag_index", None)
 # Embedded standard template path (no UI upload required)
 STANDARD_TEMPLATE = PROJECT_ROOT / "templates" / "standard_proposal_template_v1.pptx"
 
+
+@st.cache_resource(show_spinner=False)
+def load_persistent_index(index_dir: str):
+    """Load the persistent RAG index (e.g. built from SharePoint) from disk.
+
+    Cached so FAISS isn't re-read on every Streamlit rerun. Returns None if no
+    index exists at the given location. The directory path is the cache key, so
+    rebuilding under a new path (or clearing the cache) picks up changes.
+    """
+    path = Path(index_dir)
+    if not (path / "index.faiss").exists() or not (path / "chunks.json").exists():
+        return None
+    try:
+        rag = load_index(path)
+    except Exception as exc:  # corrupt index shouldn't crash the app
+        log.warning("Failed to load persistent RAG index from %s: %s", path, exc)
+        return None
+
+    # Guard against a dimension mismatch / garbage retrieval: the index is only
+    # valid if it was built with the embeddings model that's active now.
+    if rag.embeddings_model and rag.embeddings_model != settings.embeddings_model:
+        log.warning(
+            "Persistent RAG index at %s was built with embeddings model %r but the "
+            "active model is %r; ignoring it. Rebuild the index to use it.",
+            path,
+            rag.embeddings_model,
+            settings.embeddings_model,
+        )
+        return None
+    return rag
+
+
 # ----------------------------
 # Sidebar
 # ----------------------------
@@ -147,6 +179,30 @@ with st.sidebar:
     st.caption(
         "Tip: upload a TXT file of reusable assets/proposal boilerplates " "to build a quick index."
     )
+
+    persistent_index = load_persistent_index(str(settings.rag_index_dir))
+    use_persistent_rag = st.checkbox(
+        "Use persistent knowledge base (SharePoint index)",
+        value=False,
+        disabled=persistent_index is None,
+        help="Retrieve reusable context from the prebuilt index at "
+        f"{settings.rag_index_dir}. Build it with the sharepoint_index CLI.",
+    )
+    if persistent_index is None:
+        index_files_exist = (settings.rag_index_dir / "index.faiss").exists()
+        if index_files_exist:
+            st.caption(
+                f"Persistent index at {settings.rag_index_dir} is unusable "
+                f"(corrupt or built with a different embeddings model than "
+                f"{settings.embeddings_model}). Rebuild it with the sharepoint_index CLI."
+            )
+        else:
+            st.caption(f"No persistent index found at {settings.rag_index_dir}.")
+    else:
+        st.caption(
+            f"Persistent index available ({len(persistent_index.chunks)} chunks). "
+            "An uploaded reference index takes priority when both are present."
+        )
 
     st.divider()
     st.caption("Template")
@@ -427,7 +483,15 @@ if st.session_state.wizard_step == 1:
                 st.session_state.rag_index = rag
                 st.success(f"Built RAG index with {len(chunks)} chunks.")
 
+            # Pick a retrieval source: the in-memory index built from an
+            # uploaded TXT takes priority; otherwise fall back to the persistent
+            # knowledge base (e.g. the SharePoint index) when the user opted in.
             rag = st.session_state.get("rag_index")
+            rag_source = "in-memory" if rag is not None else None
+            if rag is None and use_persistent_rag:
+                rag = persistent_index
+                rag_source = "persistent"
+
             if rag is not None:
                 query = """
                 mandatory proposal sections, required slides,
@@ -437,7 +501,7 @@ if st.session_state.wizard_step == 1:
                 """
                 top = retrieve(rag, query, k=10)
                 retrieved_context = "\n\n".join([f"[score={c.score:.3f}]\n{c.text}" for c in top])
-                st.caption("Retrieved reusable context from in-memory RAG index.")
+                st.caption(f"Retrieved reusable context from {rag_source} RAG index.")
 
             st.session_state.retrieved_context = retrieved_context
             step_progress.progress(0.85)

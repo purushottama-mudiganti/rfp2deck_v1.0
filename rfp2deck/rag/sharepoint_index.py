@@ -92,7 +92,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
-    out_dir = Path(args.out_dir) if args.out_dir else (settings.data_dir / "indexes" / "default_rag")
+    out_dir = Path(args.out_dir) if args.out_dir else settings.rag_index_dir
     extensions = [e.strip() for e in args.extensions.split(",") if e.strip()]
     count = build_sharepoint_index(
         site_url=args.site_url,
