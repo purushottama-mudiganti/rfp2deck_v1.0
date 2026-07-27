@@ -199,7 +199,7 @@ All configuration is via environment variables (loaded from `.env`). See
 | `OPENAI_UNDERSTANDING_EVIDENCE_TIMEOUT_S` | `300` | Timeout for each evidence extraction call. |
 | `OPENAI_UNDERSTANDING_EVIDENCE_CACHE` | `true` | Cache source-chunk structured evidence under `.data/evidence_cache` so downstream retries do not repeat extraction calls. |
 | `APP_DATA_DIR` | `.data` | Base directory for indexes/outputs/reports. |
-| `HCLTECH_TEMPLATE_PATH` | *(empty)* | Path to the official HCLTech `.potx` or a converted `.pptx` corporate template. |
+| `HCLTECH_TEMPLATE_PATH` | `templates/hcltech_expanded_v5.potx` | Corporate template path. Defaults to the bundled, repo-relative HCLTech `.potx` (resolved against the project root, so it works on any host). Override with an absolute path or another `.pptx`/`.potx` if needed. |
 | `TEMPLATE_CACHE_DIR` | `.data/templates` | Cache directory for PPTX files generated from POTX templates. |
 | `APP_PASSWORD` | *(empty)* | If set, the UI requires this password before use. |
 | `SP_TENANT_ID` / `SP_CLIENT_ID` | *(empty)* | Azure AD app for SharePoint device-code auth. |
@@ -214,24 +214,32 @@ All configuration is via environment variables (loaded from `.env`). See
 
 ## Using the app (3-step wizard)
 
-The corporate template is configured with `HCLTECH_TEMPLATE_PATH`. Point it at the official HCLTech
-Expanded Version `.potx` or a converted `.pptx`. When a `.potx` is configured, the app creates a cached
-PPTX-compatible copy under `TEMPLATE_CACHE_DIR` and renders from that cache. You do **not** upload a
-template in the UI; you only provide the RFP and, optionally, reusable content.
+The corporate template is configured with `HCLTECH_TEMPLATE_PATH`. It **defaults to the bundled
+`templates/hcltech_expanded_v5.potx`**, a repo-relative path that is resolved against the project root,
+so the app renders with the official HCLTech Expanded Version template out of the box — locally, in WSL,
+and on deployment platforms — without any host-specific configuration. When a `.potx` is configured, the
+app creates a cached PPTX-compatible copy under `TEMPLATE_CACHE_DIR` and renders from that cache. You do
+**not** upload a template in the UI; you only provide the RFP and, optionally, reusable content.
 
-When running from WSL, either keep the Windows path in `.env`:
-
-```env
-HCLTECH_TEMPLATE_PATH='C:\Users\...\Expanded Version 5.0.potx'
-```
-
-or use the equivalent WSL mount path:
+To override the default, point `HCLTECH_TEMPLATE_PATH` at another `.pptx`/`.potx`. Relative paths are
+resolved against the project root; absolute paths are used as-is (Windows drive-letter paths are
+auto-mapped to `/mnt/<drive>/...` under WSL). Quote values that contain spaces:
 
 ```env
-HCLTECH_TEMPLATE_PATH='/mnt/c/Users/.../Expanded Version 5.0.potx'
+# Bundled default (portable — recommended):
+HCLTECH_TEMPLATE_PATH=templates/hcltech_expanded_v5.potx
+# Absolute override (Windows / WSL):
+# HCLTECH_TEMPLATE_PATH='C:\Users\...\Expanded Version 5.0.potx'
+# HCLTECH_TEMPLATE_PATH='/mnt/c/Users/.../Expanded Version 5.0.potx'
 ```
 
-Quoted values are recommended because the OneDrive and branding-kit paths contain spaces.
+### Deploying to Streamlit Cloud (or similar)
+
+Because the template is committed and referenced by a repo-relative path, no template configuration is
+required on the host. If you ever need to override it, set `HCLTECH_TEMPLATE_PATH` as a top-level key in
+the Streamlit **Secrets** manager (App → Settings → Secrets, or `.streamlit/secrets.toml`) — Streamlit
+exposes top-level secrets as environment variables, so the existing `os.getenv` lookup picks it up. On
+other platforms, set it as a normal container/service environment variable.
 
 ### Sidebar settings
 - **Deck Mode** — *Bid Defense (Core Only)* or *Full Proposal (Core + Appendix)*.

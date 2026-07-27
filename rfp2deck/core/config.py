@@ -104,7 +104,10 @@ class Settings:
         configured = os.getenv("HCLTECH_TEMPLATE_PATH") or os.getenv("PROPOSAL_TEMPLATE_PATH")
         if configured:
             return _coerce_env_path(configured)
-        return Path("templates") / "hcltech_modern_template_16x9.pptx"
+        # Bundled default (committed to the repo, resolved relative to PROJECT_ROOT)
+        # so deployments without a configured path — e.g. Streamlit Cloud — still
+        # render with the official HCLTech corporate template.
+        return Path("templates") / "hcltech_expanded_v5.potx"
 
     @property
     def template_cache_dir(self) -> Path:
