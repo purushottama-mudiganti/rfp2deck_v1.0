@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
+import sys
 import time
 from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
@@ -71,7 +73,14 @@ def setup_logging(level: str | None = None, log_file: str | None = None) -> None
             logging.getLogger(name).setLevel(logging.WARNING)
 
     setattr(root, _CONFIGURED_FLAG, True)
-    root.debug("Logging configured (level=%s, file=%s)", level_name, log_file or "<none>")
+    root.info(
+        "Logging configured (level=%s, file=%s, python=%s, platform=%s, cwd=%s)",
+        level_name,
+        str(Path(log_file).resolve()) if log_file else "<none>",
+        sys.executable,
+        platform.platform(),
+        Path.cwd(),
+    )
 
 
 def get_logger(name: str) -> logging.Logger:

@@ -9,6 +9,7 @@ streamlit>=1.32
 # Parsing
 python-docx>=1.1.2
 PyMuPDF>=1.24.7
+openpyxl>=3.1.5
 
 # RAG
 faiss-cpu>=1.8.0.post1

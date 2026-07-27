@@ -1,14 +1,79 @@
+SOURCE_EVIDENCE_PROMPT = """
+You are extracting auditable evidence from one bounded chunk of an RFP package.
+
+SOURCE METADATA:
+- document_id: {document_id}
+- document_name: {document_name}
+- document_type: {document_type}
+- authority: {authority}
+- issue_date: {issue_date}
+- chunk_id: {chunk_id}
+
+RULES:
+- Extract only evidence explicitly present in SOURCE_CHUNK. Do not reconcile
+  against documents or chunks that are not shown and do not invent missing facts.
+- Preserve the supplied page, paragraph, table-row, sheet, or row locator in
+  `source_ref` and `source_refs` for every requirement.
+- Set `source_document_ids` to include `{document_id}` for every requirement.
+- Preserve a short exact excerpt in `source_text`.
+- A vendor question is non-authoritative context. Extract it as a clarification
+  only when paired with a customer response; an unanswered question is unresolved
+  and must not become a requirement.
+- A customer response can clarify scope. Record its effect without expanding it
+  beyond the answer actually given.
+- Separate tender administration and submission tools from solution scope.
+- Capture all requirement-bearing evidence in this chunk, including tables and
+  annexures. Do not summarize several distinct requirements into one vague item.
+- Return one JSON object matching the supplied schema and no other text.
+
+SOURCE_CHUNK:
+{source_chunk}
+"""
+
+
 RFP_UNDERSTAND_PROMPT = """
 You are a senior proposal leader and RFP analysis expert for complex technology and
 consulting deals.
 
 Your task:
-Read the full RFP text and produce a **structured, accurate, non-speculative**
-understanding of the opportunity.
+Read the complete RFP package and produce a **structured, accurate,
+non-speculative** understanding of the opportunity. The package can contain a
+base RFP, annexures, customer addenda, clarification questions and customer
+responses, commercial schedules, and supporting documents.
 
 CRITICAL INSTRUCTIONS:
-- Use **only** information explicitly present in the RFP_TEXT or clearly implied by it.
+- Use **only** information explicitly present in the RFP_PACKAGE or clearly implied by it.
 - **Do not invent** requirements, assumptions, metrics, or client details.
+- Respect source authority and document boundaries:
+  - A customer-issued addendum/amendment overrides conflicting earlier material.
+  - An explicit customer clarification response governs the ambiguity it answers.
+  - The base RFP and requirement-bearing annexures remain authoritative where
+    they have not been amended.
+  - A vendor question is context only. Never turn the question, its premise, or
+    a technology named only in the question into a requirement unless the
+    customer response explicitly confirms it.
+  - Supporting/reference documents do not create scope unless an authoritative
+    source incorporates that content.
+- For every requirement, populate `source_refs` and `source_document_ids` using
+  the supplied source markers. Preserve a short exact excerpt in `source_text`.
+- Put only effective `active` or `clarified` requirements in `requirements`.
+  Put replaced requirements in `superseded_requirements` and unanswered or
+  genuinely conflicting requirements in `unresolved_requirements`.
+- Record the impact of material customer responses in `clarification_outcomes`.
+  Record unresolved contradictions in `source_conflicts`; do not silently choose.
+- First separate **proposal/tender administration** from **solution scope**:
+  - Tender submission portals, pricing-envelope instructions, contact process,
+    clarification process, contract forms, and procurement workflow are NOT
+    solution requirements unless they are explicitly repeated in a scope,
+    functional, technical, integration, or deliverables section.
+  - If a tool is mentioned only as "submit proposal via <tool>", put it under
+    `procurement_or_submission_tools` / `submission_instructions`, not in target
+    architecture, solution technologies, or functional requirements.
+- Give highest weight to requirement-bearing sections, regardless of exact
+  document nomenclature: scope of work, statement of work, requirements,
+  functional/non-functional requirements, deliverables, technical requirements,
+  integration/interface requirements, data/reporting/analytics sections,
+  annexes, and appendices that describe modules or to-be capabilities.
 - If something is unclear or missing, explicitly mark it as `"unknown"` or
   `"not specified in RFP"` in the JSON (according to the schema).
 - Prefer **verbatim phrases** from the RFP for critical items such as:
@@ -19,17 +84,46 @@ ANALYSIS LENSES (reflect these in the JSON fields of the schema):
 - Client context: industry, geography, business drivers, transformation theme.
 - Objectives: business outcomes, technical outcomes, success criteria.
 - Scope: functional scope, technical scope, in-scope / out-of-scope items.
+- Project scope:
+  - Populate `project_scope` with a concise description of what the solution is
+    actually meant to deliver.
+  - Populate `in_scope_work` with concrete work items from requirement-bearing
+    sections.
 - Requirements:
   - Functional requirements and use cases.
   - Non-functional requirements (performance, security, compliance, availability, etc.).
   - Integration, data, and reporting/analytics expectations.
+- Deployment / operations:
+  - Capture explicit or implied deployment constraints from the RFP: hosting model,
+    environments, connectivity, identity/security controls, release model,
+    high availability, disaster recovery, backup/restore, monitoring, support,
+    data residency, and operations handover.
+  - If the RFP does not prescribe a deployment model, preserve the need as a
+    requirement and mark the exact model as "to be confirmed"; do not invent a
+    vendor-specific platform.
 - Key technologies:
-  - Capture every **named** technology, platform, framework, datastore, messaging
-    system, cloud, or tool explicitly mentioned in the RFP (e.g., "AKS", "PostgreSQL",
-    "Kafka", "Redis", "Datadog", "Elasticsearch").
-  - Populate the `key_technologies` field with these verbatim names. Do **not**
-    invent technologies that are not named in the RFP; if none are named, return an
-    empty list.
+  - Populate `solution_technologies` and `key_technologies` only with named
+    technologies/platforms/tools that are part of current-state systems,
+    target-state solution scope, integration endpoints, data stores, reporting,
+    analytics, security, infrastructure, or explicit technical constraints.
+  - Populate `procurement_or_submission_tools` with tools mentioned only for
+    tender/proposal administration, such as proposal portals or pricing
+    submission tools.
+  - Populate `non_solution_references` with named tools that appear in the RFP
+    but should not shape the proposed solution.
+  - Do **not** promote a procurement/submission-only tool into architecture,
+    requirements, or diagrams.
+  - Do **not** invent technologies that are not named in the RFP; if none are
+    named for the solution, return an empty list.
+- Software Bill of Materials:
+  - Populate `software_bill_of_materials` with named solution components,
+    source/target systems, data stores, integration/runtime components,
+    reporting/analytics tools, security/monitoring tools, and material libraries
+    explicitly required or strongly implied by the solution scope.
+  - Include a `source_or_basis` value such as "explicit RFP requirement",
+    "derived from data integration scope", or "to be confirmed".
+  - Do not include procurement/submission-only tools in the SBOM.
+  - If versions are not stated, set `version_or_constraint` to "not specified in RFP".
 - Delivery constraints:
   - Timelines, milestones, SLAs, support windows, transition constraints.
   - Budget or commercial expectations (if stated).
@@ -38,8 +132,22 @@ ANALYSIS LENSES (reflect these in the JSON fields of the schema):
   - Mandatory compliance items / disqualifiers.
   - Preferred technologies, vendors, or models.
 - Risks and sensitivities:
-  - Known risks, constraints, dependencies called out by the client.
-  - Any explicit “red lines”.
+  - Populate `risks` with both client-stated risks and bidder delivery risks
+    that are clearly implied by the RFP scope, requirements, unresolved
+    questions, dependencies, constraints, integrations, data quality,
+    security/compliance approvals, deployment/cutover, availability/DR,
+    stakeholder availability, acceptance windows, or support handover.
+  - A proposal for a real project should normally have risks even when the RFP
+    does not use the word "risk". Do not leave `risks` empty unless the package
+    is too small to infer delivery exposure.
+  - Phrase inferred risks transparently, e.g. "Inferred from integration scope:
+    source-system access and interface readiness may delay build validation."
+  - Do not invent client facts, dates, systems, or obligations. You may infer a
+    delivery risk from an RFP signal, but name the signal in the risk text.
+  - Include explicit red lines and unresolved customer decisions as risks when
+    they can affect delivery, acceptance, security, operations, or commercials.
+  - Return 4-8 concise risk statements when the opportunity has meaningful
+    delivery scope.
 
 OUTPUT FORMAT:
 - Return a **single JSON object** that **strictly matches the provided schema**.
@@ -47,8 +155,14 @@ OUTPUT FORMAT:
 - Do **not** include comments, markdown, or trailing commas.
 - Only use fields and keys defined in the schema.
 
-RFP_TEXT:
+RFP_PACKAGE:
 {rfp_text}
+
+SOURCE_RECONCILIATION:
+{source_reconciliation}
+
+RFP_FOCUS_GUIDE:
+{rfp_focus_guide}
 """
 
 SECTION_TAXONOMY_PROMPT = """
@@ -59,8 +173,15 @@ Classify the RFP into a concise section taxonomy that helps with slide subtitles
 and narrative flow.
 
 INSTRUCTIONS:
-- Use only information present in the RFP_TEXT (and optional reusable context).
+- Use only information present in the RFP_PACKAGE (and optional reusable context).
 - Do not invent sections that are not grounded in the RFP.
+- Apply source precedence: customer addenda and explicit customer clarification
+  responses override conflicts in earlier RFP material. Vendor questions alone
+  are not requirements and must not create solution sections.
+- Distinguish requirement-bearing sections from procurement/admin sections.
+  Submission portals, pricing-envelope instructions, contract forms, and tender
+  procedures should be classified as `other` or `commercials`, not as solution
+  requirements or architecture.
 - If the RFP lacks a clear structure, infer a minimal, reasonable grouping from
   headings or topic shifts without adding new requirements.
 
@@ -82,8 +203,11 @@ OUTPUT FORMAT:
 - If you cannot confidently classify, return {{"sections": []}}.
 - Do not include any text outside the JSON.
 
-RFP_TEXT:
+RFP_PACKAGE:
 {rfp_text}
+
+RFP_FOCUS_GUIDE:
+{rfp_focus_guide}
 
 REUSABLE CONTEXT (optional):
 {rag_context}
@@ -116,6 +240,8 @@ NARRATIVE STRUCTURE (reflect through fields in the JSON schema):
 - Proposed Solution at a Glance:
   - High-level architecture / approach (non-technical executive view).
   - Key workstreams or phases.
+  - Where the scope provides suitable data and repeatable decisions, identify
+    optional AI-assisted opportunities while keeping the operational core deterministic.
 - Value & Impact:
   - Business value, risk reduction, speed, cost efficiency, experience, etc.
 - Differentiation:
@@ -127,6 +253,18 @@ NARRATIVE STRUCTURE (reflect through fields in the JSON schema):
 
 GUARDRAILS:
 - Use **only** details that are grounded in the RFP understanding or reusable context.
+- Base the win thesis on `project_scope`, `in_scope_work`, `requirements`, and
+  `solution_technologies`.
+- Use only effective items in `requirements`. Do not use
+  `superseded_requirements` as current scope, and present
+  `unresolved_requirements` only as decisions, assumptions, or dependencies.
+- Do not use `procurement_or_submission_tools`, `submission_instructions`, or
+  `non_solution_references` as solution themes, differentiators, architecture
+  components, or executive-summary points.
+- AI/ML is an optional proposal enhancement, not an invented RFP requirement.
+  Mention it only where the scope provides credible data and a measurable use
+  case. Qualify it by data readiness, accuracy, human oversight, security,
+  explainability, infrastructure, and run cost.
 - If critical information is missing (e.g., no explicit business KPIs), state
   this in the appropriate field as `"not specified in RFP"` or equivalent per schema.
 
@@ -149,29 +287,153 @@ Using the **Executive Narrative Spine** and **RFP understanding**, design a
 **consulting-grade proposal deck plan** that:
 - Is tailored to the specific client context.
 - Mirrors the RFP’s milestones, evaluation criteria, and priorities.
-- Is optimized for a **senior executive audience**.
+- Is optimized for a **senior executive audience** and works as a
+  **standalone customer pre-read before bid defense**.
+
+CUSTOMER PRE-READ STANDARD:
+- The customer must understand the argument without opening speaker notes or
+  hearing a presenter. Speaker notes may add delivery coaching but must never
+  contain essential rationale that is absent from the visible slide.
+- Preserve the successful proposal pattern demonstrated by winning HCLTech
+  decks: executive summary in complete prose; explicit scope and out-of-scope;
+  requirements and evaluation criteria; solution considerations and tenets;
+  requirement-to-architecture mapping; detailed architecture and operating
+  model; incremental Agile delivery with dependencies and release gates; assumptions,
+  risks, governance, credentials/evidence, commercials, and appendix backup.
+- Use this storyline order unless the RFP explicitly demands another sequence:
+  Executive Summary -> current-state challenges -> business outcomes/success
+  measures -> proposed solution -> end-to-end operational flow -> concrete
+  solution architecture -> integration/data/reporting design -> security and
+  resilience -> scope/assumptions -> delivery roadmap -> risks -> commercials
+  -> next steps. Do not introduce current-state challenges after solution slides.
+- Use concise prose, not slogan fragments. A normal narrative slide should
+  usually contain 80-160 visible words across its title, takeaway, and proof
+  object. Architecture-only and transition slides may contain less; detailed
+  appendix slides may contain more.
+- Never delete content merely to make a layout fit. Split the topic into two
+  purposeful slides, summarize detail into an appendix, or select a layout with
+  more capacity. Silent truncation is prohibited.
 
 RULES:
 - The **narrative spine is the primary driver** of the storyline.
   - Ensure every slide clearly supports a part of the narrative spine.
+- Treat `project_scope`, `in_scope_work`, `requirements`, and
+  `solution_technologies` as the authoritative solution source.
+- Do not build solution claims from `superseded_requirements`. Treat
+  `unresolved_requirements` and unresolved `source_conflicts` as explicit
+  assumptions, dependencies, risks, or customer decisions rather than facts.
+- Never use `procurement_or_submission_tools`, `submission_instructions`, or
+  `non_solution_references` as target architecture components, solution pillars,
+  diagram labels, or executive-summary themes.
 - Prefer **visuals over text**, especially for:
   - Architecture
+  - Deployment architecture
+  - High availability / disaster recovery
   - Roadmap / Timeline
   - Ingress / Egress flows
   - Canonical data model
   - Operating model / governance
 - If reusable context contains mandatory sections or standards, you MUST incorporate them into the slide plan unless they conflict with the RFP.
+- For technical, data, integration, analytics, or platform proposals, include:
+  - A Target / Solution Architecture slide that shows the concrete build
+    pattern, not generic boxes. For a data hub, this must show source systems,
+    ingestion/extraction, validation/business rules, central operational data
+    store or lakehouse, application services, APIs, reporting/BI, security,
+    monitoring, and operational support boundaries.
+  - An AI/ML opportunity assessment when the scope contains suitable data,
+    recurring exceptions, forecasting needs, analytics, or support workflows.
+    Prioritise 2-4 use cases by business value, data readiness, implementation
+    effort, infrastructure, and ongoing cost.
+  - Keep critical transactions and operational decisions deterministic. Use
+    rules/statistical baselines first, managed consumption or small models only
+    where justified, confidence thresholds, human review, no autonomous
+    write-back, and a deterministic fallback. Do not assume dedicated GPUs.
+  - One Deployment / Resilience Architecture slide showing runtime environments,
+    hosting assumption, network/security boundaries, release path, HA/DR,
+    backup/restore, monitoring, and support touchpoints. If the RFP does not
+    mandate a model, mark the hosting choice as an assumption and avoid tutorial
+    detail.
+- A proposed solution technology stack slide/table covering concrete ingestion,
+    orchestration, validation/transformation, application, integration, data,
+    analytics, identity/secrets, observability/security-operations, DevSecOps,
+    and applicable AI services. Name implementable products/services rather than
+    lifecycle activities or source interfaces alone. Preserve mandated or
+    referenced solution technologies; complete missing layers with a qualified
+    ecosystem-aligned recommendation and mark each row as required/referenced,
+    proposed/confirm, or platform-decision-required.
+    The slide MUST populate the structured `table` field with headers and rows;
+    do not return a title, key message, or bullets without the table payload.
+    Never include procurement, tender, clarification, pricing-upload, or
+    proposal-submission tools such as Ariba unless they are explicitly part of
+    the operational target solution in an authoritative requirement.
+- Deployment model guidance:
+  - Choose an appropriate deployment/release pattern based on the RFP risk and
+    operational profile: blue-green, canary, rolling, phased migration, pilot by
+    site/business unit, or scheduled cutover.
+  - Explain why the model fits. Do not name cloud services/products unless the
+    RFP names them or reusable context explicitly mandates them.
+
+AI/ML VALUE AND COST DISCIPLINE:
+- Do not add AI terminology to every slide. Integrate it selectively into the
+  solution opportunity, target architecture, technology stack, roadmap,
+  testing, security/observability, risks, and assumptions.
+- Candidate patterns include intelligent document/email extraction, anomaly
+  and data-quality detection, forecasting/optimisation, and a governed
+  operations/support copilot only when the scope provides relevant evidence.
+- Separate core platform, optional AI-assisted capability, and future
+  optimisation so the customer can price and phase them independently.
+- Require data-readiness and baseline-value assessment, a low-risk pilot,
+  accepted accuracy/explainability thresholds, unit-cost and model monitoring,
+  and an explicit scale/stop decision before production expansion.
+
+AGILE DELIVERY MODEL (DEFAULT):
+- Unless the RFP explicitly mandates another method, propose an Agile,
+  product/value-stream-oriented delivery model. Do not create a sequential
+  analysis -> design -> build -> test -> deploy plan and relabel it Agile.
+- Organize work into one or more persistent, cross-functional squads aligned to
+  customer outcomes or coherent workstreams. Each squad should combine the
+  relevant business analysis, architecture, engineering, data/integration,
+  quality automation, security, DevSecOps/platform, and change capabilities.
+  Do not create separate BA, development, testing, and deployment squads that
+  hand work to one another.
+- Show customer Product Owner ownership of priorities and acceptance; a Scrum
+  Master or Agile Delivery Lead enabling flow; and empowered squad members who
+  share the Definition of Done. Add specialist chapters/communities of practice
+  only when they provide standards and coaching without becoming approval silos.
+- Base delivery on a prioritized outcome backlog, regular refinement and sprint
+  planning, short iterations (normally propose two-week sprints unless the RFP
+  indicates another cadence), daily coordination, integrated demonstrations,
+  retrospectives, and evidence-based release decisions.
+- Embed architecture, UX, data, testing, security, automation, documentation,
+  and operational readiness within each increment. Quality and security are
+  continuous activities, not downstream phases.
+- Describe an incremental release strategy: thin end-to-end slices, early MVP or
+  pilot value, frequent usable increments, controlled production releases, and
+  feedback-driven backlog reprioritization. Connect release cadence to the
+  recommended blue-green, canary, rolling, pilot, or phased deployment pattern.
+- Governance should provide outcome alignment, dependency resolution, risk and
+  commercial oversight, not task-level command and control. Preserve any
+  RFP-mandated approvals as lightweight architecture, security, service, or
+  release gates around Agile execution; explain this as a tailored hybrid when
+  necessary rather than reverting to waterfall execution.
+- Delivery and squad slides must state responsibilities, cadence, artifacts,
+  decision rights, dependencies, measures, and customer touchpoints. Avoid
+  generic ceremony lists or organization charts with no operating explanation.
 - For visual slides, specify a `diagram` object including at least:
-  - `diagram_type` (e.g., layered architecture, sequence flow, data flow, swimlane roadmap).
+  - `diagram_type` (e.g., layered architecture, deployment architecture, HA/DR topology, sequence flow, data flow, swimlane roadmap).
   - `diagram_prompt` (clear description of what should be shown).
 
 SLIDE-LEVEL REQUIREMENTS:
 Each slide MUST include (in the JSON schema fields):
 - slide_id
 - title (headline-style, outcome-oriented)
-- archetype (e.g., context, problem, approach, architecture, roadmap, commercials, team, risk, next_steps)
-- bullets (0–5 bullets, max 12 words each, executive tone, no boilerplate)
+- archetype (use schema values such as Architecture, Deployment Architecture,
+  High Availability & DR, Software Bill of Materials, Timeline, Delivery Plan,
+  Team, Risks, Commercials, Next Steps)
+- bullets (normally 3-6 complete points, typically 18-35 words each; preserve
+  rationale, client implication, qualifiers, and named evidence)
 - detailed_points (use INSTEAD of bullets for context/narrative-heavy slides — see below)
+- key_message / cards / comparison / kpis (modern layout structures — see below)
 - optional table (when a tabular view adds clarity)
 - optional diagram (for visual content as defined above)
 - rfp_section (or requirement reference) – where in the RFP this slide is responding
@@ -186,7 +448,8 @@ DETAILED POINTS (sub-bullets) — REQUIRED FOR CONTEXT-HEAVY SLIDES:
     - `text`: the headline idea (short, ≤ ~8 words).
     - `sub_points`: 2–4 concrete supporting statements GROUNDED in the RFP
       (name the actual systems, constraints, stakeholders, requirements, or
-      risks). Each sub-point ≤ ~14 words.
+      risks). Each sub-point should normally be 15-30 words and explain both the
+      evidence and why it matters.
 - Leave `bullets` empty when you use `detailed_points` for that slide.
 - Example for a Current State slide:
     {{"text": "Legacy estate constrains delivery",
@@ -196,7 +459,35 @@ DETAILED POINTS (sub-bullets) — REQUIRED FOR CONTEXT-HEAVY SLIDES:
 - Do not invent specifics not supported by the RFP understanding; if a theme has
   no grounded detail, omit it rather than padding with generic filler.
 
+MODERN LAYOUT STRUCTURES (USE THESE FOR A POLISHED, PROFESSIONAL DECK):
+The renderer styles these natively in the HCLTech brand look — prefer them over
+plain bullet lists wherever they fit. A slide may combine `key_message` (top) +
+ONE body structure (cards OR comparison OR detailed_points OR bullets) + `kpis`
+(bottom).
+- `key_message`: one complete, emphasised "so what" sentence shown under the
+  title (normally 15-28 words). Use it to state the customer implication.
+- `cards`: 2–4 titled cards rendered as a grid. Use for capability overviews,
+  executive-summary quadrants, pillars, or any "headline + supporting detail"
+  set. Each card = {{heading (up to 8 words), body (1-2 complete explanatory
+  sentences) and/or bullets (2-4 evidence points), accent}}. A card should
+  usually carry 35-75 words, not a slogan. Set `accent` semantically:
+  "challenge"/"risk" (coral),
+  "solution"/"approach" (blue), "why"/"differentiator" (purple),
+  "outcome"/"value" (green), "info" (teal).
+- `comparison`: a two-column "problem vs. goal" / "today vs. tomorrow" block,
+  {{left:{{heading,items[],accent}}, right:{{heading,items[],accent}}}}. Ideal for
+  current-state-vs-target and challenge-vs-objective slides.
+- `kpis`: up to 4 short stat chips along the bottom (e.g. "340+ flights/day",
+  "100% scope coverage", "RTO 12h / RPO 8h"). Use only RFP-grounded numbers;
+  never invent metrics.
+
 EXECUTIVE SUMMARY (CRITICAL):
+- The Executive Summary is a customer pre-read page, not three slogans. Use
+  either 3-4 substantial cards or detailed points totalling roughly 180-280
+  visible words. Each block must contain a conclusion plus its rationale.
+- Recommended blocks: client situation and stakes; our proposed response; why
+  the approach is credible/differentiated; outcomes and commitments. Use
+  "Why HCLTech" only when reusable context provides defensible evidence.
 - The Executive Summary slide must present the **win thesis**, structured as:
   1. The client's situation / what is at stake.
   2. Our differentiating approach (how we will win).
@@ -217,6 +508,41 @@ NEXT STEPS (CRITICAL):
   or asked for. Those are not next steps.
 - Keep to 3–5 crisp action bullets.
 
+ROADMAP / TIMELINE (CRITICAL):
+- Do not emit a waterfall list containing only Mobilize, Design, Build, Test,
+  Launch, and Hypercare. A customer pre-read must show iterative delivery and
+  how usable increments move from backlog to production.
+- Use 4-6 detailed points or cards to show mobilisation/inception, architecture
+  runway, recurring sprint cycles, incremental releases, operational transition,
+  and continuous improvement. Show discovery, build, test, security, and change
+  progressing concurrently within each increment.
+- For each roadmap stage or release horizon state the outcome, principal
+  activities, tangible deliverables, dependencies, feedback loop, and release or
+  decision gate. Include durations only when grounded in the RFP or qualified as
+  a proposed cadence.
+- Connect backlog items and increments to requirements, demonstrations,
+  acceptance evidence, cutover readiness, operational transition, and value
+  realization.
+
+TESTING AND ACCEPTANCE (PROPOSAL-SPECIFIC):
+- Build the testing story around this solution's named interfaces, data flows,
+  functional-replacement outcomes, reconciliation controls, security and
+  non-functional requirements, customer UAT ownership, and cutover evidence.
+- State what will be proven, the evidence produced, the customer decision it
+  supports, and how defects or reconciliation exceptions are resolved.
+- Do not create a textbook test pyramid, generic test-type inventory, or a
+  sequential unit/SIT/UAT/regression tutorial detached from the RFP.
+
+WARRANTY AND AMS (PROPOSAL-SPECIFIC):
+- Map the actual live-service components and integrations to business-flow
+  monitoring, incident ownership, runbooks, correction/replay controls,
+  warranty transition, service evidence, and a prioritised improvement backlog.
+- Show how support protects the customer's operational outcomes, not only how
+  an IT service desk routes tickets. Use service levels only when grounded in
+  the RFP; otherwise label them as proposed or to be agreed.
+- Do not create a generic L1/L2/L3 pyramid, ITIL tutorial, or squad/governance
+  picture that could be reused unchanged for an unrelated proposal.
+
 TITLE STYLE (consulting standard):
 - Use *assertion headlines*: the slide title states the message.
   Bad: "Architecture"
@@ -224,9 +550,20 @@ TITLE STYLE (consulting standard):
 - Keep titles to a single line where possible (≤ ~8 words); long titles wrap and
   crowd the slide.
 
+IMAGE + TEXT — KEEP THEM ON SEPARATE SLIDES:
+- A diagram is the focus of its slide. When a slide carries a `diagram`, keep it
+  visual-first: leave `bullets`/`detailed_points`/`cards` EMPTY so the renderer
+  shows the diagram full-bleed.
+- Put the explanatory narrative for that visual on a SEPARATE adjacent slide
+  (e.g. "Solution architecture" = the diagram; "How the architecture works" =
+  the supporting cards/bullets). Do not crowd a diagram slide with body text.
+- The explanatory slide must describe design choices, requirement mapping,
+  controls, and customer implications. It must not merely repeat diagram labels.
+
 BULLET STYLE:
-- Max 5 bullets per slide.
-- Max 12 words per bullet.
+- Normally 3-6 bullets per slide, written as complete thoughts.
+- A bullet may use 18-35 words when needed to preserve meaning. Prefer one
+  sentence with evidence and implication over context-free fragments.
 - Active voice, concrete nouns and verbs.
 - No vague terms like "robust", "leverage synergies", "cutting-edge", etc.
 - Every bullet should either:
@@ -235,29 +572,58 @@ BULLET STYLE:
   - De-risk the program.
 
 DIAGRAMS (VERY IMPORTANT):
-- For Architecture, Timeline, Team, Data Model, Operating Model:
+- For Architecture, Deployment Architecture, High Availability & DR, Timeline,
+  Team, Data Model, Operating Model:
   Provide a `diagram` object with:
-  - kind (architecture/timeline/org/data_model)
+  - kind (architecture/deployment/hadr/timeline/org/data_model)
   - prompt (clear, renderable, consulting style)
 - The diagram prompt MUST be **grounded in this specific RFP**:
   - Name the actual technologies, platforms, datastores, and tools from the RFP
-    understanding's `key_technologies` (e.g., the named cloud, Kubernetes flavour,
-    database, messaging, and observability tools) — never generic placeholders
-    like "Application / Database / Integration".
+    understanding's `solution_technologies` and in-scope requirements. Do not use
+    tools listed only under `procurement_or_submission_tools` or
+    `non_solution_references`.
   - Name the actual roles for team/org diagrams.
   - Reference the client by name where natural.
+  - When AI/ML opportunities are applicable, show one optional AI-assisted
+    services sidecar connected only to curated/authorised data. Label the
+    applicable use cases, confidence threshold, human-review path,
+    deterministic fallback, usage/model monitoring, and no autonomous
+    write-back. Do not depict GPU clusters unless explicitly required.
 - The diagram prompt must also describe:
   - major boxes/entities
   - the flows/arrows
   - labeling guidance
   - "white background, minimal text, no logos"
+  - "18pt+ labels, at most 12 primary nodes, no more than two text lines per
+    node, no descriptive paragraphs, footnotes, or tiny legends"
   - "keep all text and shapes inside a 5-8% safe margin; do not place content at the edges"
 
 ALIGNMENT & COVERAGE:
 - Map slides to RFP milestones and evaluation criteria wherever possible.
 - Ensure Team and Commercials content is present (can be multiple slides if needed).
 - Avoid redundant slides that do not add clear narrative value.
+- Do not create multiple slides with the same thesis under different names.
+  In particular, avoid separate slides that all restate "single trusted data
+  hub", "reduce manual handling", "centralized reporting", or "Agile squads"
+  unless each slide has a distinct proof object.
 - Do not add filler slides; every slide must map to RFP needs and narrative.
+- Do not create title-only `Content` slides or decorative section dividers.
+  A content slide must contain a body structure, table, comparison, KPI, or
+  diagram that advances the proposal story.
+- Use the short title `Agenda` on the Agenda slide. Do not turn the Agenda into
+  an assertion headline; its native HCLTech layout has a structural title area.
+- Do not use an End Plate layout for Next Steps. Next Steps contains actionable
+  content and must use a readable multi-point content layout.
+- Set `layout_hint` only when its placeholder type matches the supplied payload:
+  table layouts require `table`, and diagram/image layouts require `diagram`.
+- Avoid using the same macro-layout on more than two consecutive slides.
+- Include an assumptions/dependencies/constraints page when the RFP or proposed
+  design depends on customer inputs, source readiness, hosting choices, access,
+  data quality, third parties, approvals, or unresolved architecture decisions.
+- Include a requirements-to-solution or evaluation-criteria mapping page for
+  complex RFPs so the customer can see why the proposed design is compliant.
+- Keep exhaustive SBOM, requirement matrices, and detailed commercials in an
+  appendix section when they interrupt the executive narrative.
 
 SLIDE COUNT (RIGHT-SIZE TO THE PROPOSAL):
 - There is no fixed number of slides. Decide the count from what the RFP and
@@ -266,6 +632,10 @@ SLIDE COUNT (RIGHT-SIZE TO THE PROPOSAL):
 - Optimize for a senior-executive audience: every slide must earn its place.
 - Do NOT pad to hit a number, and do NOT split one idea across multiple
   near-duplicate slides — merge thin or overlapping topics instead.
+- A focused proposal response should usually have 16-22 main slides plus
+  appendix backup. Use appendix slides for SBOM, detailed requirement matrices,
+  and exhaustive governance/detail. Do not pad the main deck with tutorial-like
+  deployment, HA/DR, or Agile ceremony slides.
 
 CONSTRAINTS:
 - Use only layout names from `Template layouts available`.
@@ -296,22 +666,53 @@ Executive narrative spine (JSON):
 {narrative_json}
 """
 
+DECK_SECTION_EXPANSION_PROMPT = """
+You are a Tier-1 consulting proposal slide architect.
+
+TASK:
+Expand ONLY the requested proposal sections into a DeckPlan JSON. This is one
+small batch in a larger proposal deck. Do not create slides outside the supplied
+section list.
+{role_focus}
+RULES:
+- Return strict JSON matching the DeckPlan schema.
+- Create 1 slide for each section unless the section explicitly asks for 2.
+- Use RFP-grounded content only from INPUT_JSON.
+- Be specific enough for a customer pre-read; avoid slogans and generic filler.
+- Keep each slide readable: 3-5 bullets, 3-4 detailed points, or a table/diagram.
+- Diagram slides must be visual-first: include a diagram and leave bullets,
+  detailed_points, cards, and comparison empty.
+- For architecture/data/deployment/delivery sections, include concrete labels,
+  flows, controls, assumptions, and named systems from the input.
+- Preserve the slide_id and archetype supplied in SECTIONS.
+
+SECTIONS TO EXPAND:
+{sections_json}
+
+INPUT_JSON:
+{input_json}
+"""
+
 SLIDE_COMPRESSION_PROMPT = """
 You are a senior consulting editor and presentation coach.
 
 TASK:
-Edit the bullets of each slide in the DeckPlan to be **executive-grade** while
-preserving the original meaning.
+Edit the bullets of each slide in the DeckPlan to be **customer-pre-read grade**
+while preserving the original meaning and all decision-relevant context.
 
 EDITING RULES:
-- Max **5 bullets** per slide.
-- Max **12 words** per bullet.
+- Normally 3-6 bullets per slide.
+- Use 18-35 words where necessary to preserve rationale, evidence, qualifiers,
+  named systems, and customer implications.
+- Never shorten a point into a slogan or remove information simply to fit a
+  presumed slide limit. The renderer will split or reflow content when needed.
 - Use **active voice**, with concrete nouns and strong verbs.
 - Remove filler and weak terms such as:
   - "robust", "world-class", "cutting-edge", "synergy", "leverage", "very", etc.
 - Do **not** introduce any new factual claims, commitments, or metrics.
 - Preserve:
   - The original intent of each bullet.
+  - Explanatory context, examples, assumptions, and why the point matters.
   - The order of bullets on each slide (unless the schema explicitly allows reordering).
 
 SCOPE OF CHANGES:
@@ -319,6 +720,7 @@ SCOPE OF CHANGES:
 - Do not alter:
   - slide_id
   - `detailed_points` (headline + sub_points) — preserve these exactly as given
+  - `key_message`, `cards`, `comparison`, `kpis` — preserve these exactly as given
   - mappings to RFP sections / milestones
   - diagram or table definitions
   - titles or archetypes (unless the schema explicitly instructs otherwise).

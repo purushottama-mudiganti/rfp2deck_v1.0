@@ -139,6 +139,7 @@ celerybeat.pid
 .env
 .envrc
 .venv
+.venv-win
 env/
 venv/
 ENV/
@@ -209,3 +210,6 @@ __marimo__/
 
 # Local data folder for the generated artifacts
 .data/
+
+# Streamlit agent skills (environment-specific symlinks)
+.agents/skills/developing-with-streamlit/

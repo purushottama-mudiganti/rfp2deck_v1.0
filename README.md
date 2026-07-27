@@ -1,6 +1,6 @@
 # RFP → Proposal Deck Generator
 
-Turn a raw **RFP** (PDF/DOCX) into a polished, **consulting-grade PowerPoint proposal** — with an
+Turn a complete **RFP package** (PDF/DOCX/XLSX) into a polished, **consulting-grade PowerPoint proposal** — with an
 executive narrative, an auto-built slide storyline, optional AI-generated diagrams (behind a human
 approval gate), per-slide speaker notes, and a requirement-to-slide traceability report.
 
@@ -35,7 +35,7 @@ outputs, image generation) · **python-pptx** (deterministic rendering).
 
 ## What it does
 
-Given an RFP and an (embedded) corporate template, the app produces:
+Given an RFP package and an (embedded) corporate template, the app produces:
 
 - 📊 **A generated proposal deck (`.pptx`)** rendered deterministically from a bundled template, with a
   consistent visual identity (navy title/closing "sandwich", accent rules, styled bullets).
@@ -50,8 +50,9 @@ Given an RFP and an (embedded) corporate template, the app produces:
 
 Key qualities:
 
-- **Grounded, not hallucinated.** Every LLM step is instructed to use only what's in the RFP (and
-  optional reusable context), and to mark unknowns rather than invent.
+- **Grounded, not hallucinated.** Every LLM step uses source-labelled evidence from the base RFP,
+  annexures, customer addenda, and clarification responses. Vendor questions alone cannot create
+  requirements, and unknowns remain unresolved rather than being invented.
 - **Deterministic rendering.** Slides are drawn with `python-pptx` at computed coordinates — no
   "LLM-writes-XML" surprises. The same plan renders the same deck.
 - **Human-in-the-loop for anything generative.** Images never reach the deck without explicit approval.
@@ -60,12 +61,14 @@ Key qualities:
 
 ## How it works (the pipeline)
 
-The core is a **LangGraph state machine** ([rfp2deck/agent/graph.py](rfp2deck/agent/graph.py)) of seven
+The core is a **LangGraph state machine** ([rfp2deck/agent/graph.py](rfp2deck/agent/graph.py)) of nine
 nodes. State flows through a single [`AgentState`](rfp2deck/agent/state.py) object; each node enriches it.
 
 ```mermaid
 flowchart LR
-    A[understand_rfp] --> B[derive_sections]
+    S[reconcile_sources] --> X[extract_source_evidence]
+    X --> A[understand_rfp]
+    A --> B[derive_sections]
     B --> C[build_narrative]
     C --> D[plan_deck]
     D --> E[compress_bullets]
@@ -76,6 +79,8 @@ flowchart LR
 
 | Node | Purpose | Output on state |
 |------|---------|-----------------|
+| `reconcile_sources` | Prepare source precedence, clarification evidence, and unresolved question references. | `source_reconciliation` |
+| `extract_source_evidence` | For large packages, extract structured evidence from bounded fast-model chunks, merge duplicates, and use indexed requirement/source-reference encoding when ordinary JSON exceeds the final budget. Small packages bypass this step. | `source_evidence`, `evidence_text` |
 | `understand_rfp` | Extract a structured, non-speculative understanding of the RFP (summary, requirements, risks, assumptions, **named technologies**). | `understanding` |
 | `derive_sections` | Classify the RFP into a section taxonomy to guide narrative flow. | `section_map` |
 | `build_narrative` | Build the **executive narrative spine** (value proposition, strategic outcomes, solution themes). | `narrative` |
@@ -113,7 +118,7 @@ After the graph runs, the UI optionally generates/approves diagrams and then cal
 
 - **Python 3.10+**
 - An **OpenAI API key** with access to the configured models (reasoning, fast, embeddings, and
-  `gpt-image-1` for diagrams)
+  the configured image model for diagrams)
 
 ### 1) Create & activate a virtual environment
 
@@ -168,11 +173,34 @@ All configuration is via environment variables (loaded from `.env`). See
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `OPENAI_API_KEY` | *(required)* | OpenAI authentication. |
-| `OPENAI_MODEL_REASONING` | `gpt-5.2` | Model for understanding, narrative, and deck planning (high reasoning). |
-| `OPENAI_MODEL_FAST` | `gpt-5-mini` | Cheaper/faster model for speaker notes. |
+| `OPENAI_MODEL_REASONING` | `gpt-5.4-2026-03-05` | Model for understanding, narrative, and deck planning. |
+| `OPENAI_MODEL_FAST` | `gpt-5.4-mini-2026-03-17` | Faster model for bounded evidence extraction and speaker notes. |
+| `OPENAI_IMAGE_MODEL` | `gpt-image-2` | Model for AI-generated diagram images. |
 | `OPENAI_EMBEDDINGS_MODEL` | `text-embedding-3-large` | Embeddings for RAG retrieval. |
 | `OPENAI_TIMEOUT_S` | `120` | Per-request timeout (seconds). |
+| `OPENAI_RETRY_ATTEMPTS` | `3` | Attempts for retryable OpenAI transient errors. |
+| `OPENAI_RETRY_BASE_WAIT_S` | `5` | Initial application-level retry delay; subsequent attempts use exponential backoff. |
+| `OPENAI_RETRY_MAX_WAIT_S` | `90` | Maximum retry wait when OpenAI returns `Retry-After` / `retry_after`. |
+| `OPENAI_STRUCTURED_STREAMING` | `false` | Opt into streaming for structured Responses calls; non-streaming is more stable for large RFP prompts. |
+| `OPENAI_REASONING_EFFORT_HIGH` | `high` | Effort used by RFP understanding and narrative calls. |
+| `OPENAI_REASONING_EFFORT_MEDIUM` | `medium` | Effort used by section classification and bullet compression calls. |
+| `OPENAI_REASONING_EFFORT_LOW` | `low` | Effort used by speaker-notes calls. |
+| `OPENAI_REASONING_EFFORT_DECK_PLAN` | `medium` | Dedicated DeckPlan effort; avoids coupling a large structured-output call to the high-effort understanding pass. |
+| `OPENAI_DECK_PLAN_TIMEOUT_S` | `420` | Per-attempt timeout for DeckPlan generation. |
+| `OPENAI_DECK_PLAN_RAG_MAX_CHARS` | `18000` | Maximum ranked reusable-context characters included in the DeckPlan prompt. |
+| `OPENAI_DECK_PLAN_LAYOUT_LIMIT` | `64` | Maximum relevant template layouts exposed to DeckPlan; full layout selection remains deterministic in the renderer. |
+| `OPENAI_DECK_PLAN_PROMPT_MAX_CHARS` | `30000` | Switch to compact DeckPlan prompting above this prompt size; useful for corporate proxies with request-body limits. |
+| `OPENAI_DECK_PLAN_CHUNKED` | `true` | Generate the DeckPlan in small section batches to avoid corporate proxy request-size limits while preserving proposal depth. |
+| `OPENAI_DECK_PLAN_BATCH_SIZE` | `4` | Number of proposal sections expanded per DeckPlan batch call. Lower this if a proxy blocks larger request bodies. |
+| `OPENAI_UNDERSTANDING_DIRECT_MAX_CHARS` | `180000` | Maximum source-package size sent directly to RFPUnderstanding; larger packages use chunk extraction. |
+| `OPENAI_UNDERSTANDING_EVIDENCE_CHUNK_CHARS` | `55000` | Maximum characters per source-aware evidence extraction call. |
+| `OPENAI_UNDERSTANDING_EVIDENCE_MAX_CHARS` | `180000` | Final merged-evidence budget for the RFPUnderstanding prompt. |
+| `OPENAI_UNDERSTANDING_EVIDENCE_WORKERS` | `2` | Concurrent bounded evidence calls; keep low to avoid rate and service pressure. |
+| `OPENAI_UNDERSTANDING_EVIDENCE_TIMEOUT_S` | `300` | Timeout for each evidence extraction call. |
+| `OPENAI_UNDERSTANDING_EVIDENCE_CACHE` | `true` | Cache source-chunk structured evidence under `.data/evidence_cache` so downstream retries do not repeat extraction calls. |
 | `APP_DATA_DIR` | `.data` | Base directory for indexes/outputs/reports. |
+| `HCLTECH_TEMPLATE_PATH` | *(empty)* | Path to the official HCLTech `.potx` or a converted `.pptx` corporate template. |
+| `TEMPLATE_CACHE_DIR` | `.data/templates` | Cache directory for PPTX files generated from POTX templates. |
 | `APP_PASSWORD` | *(empty)* | If set, the UI requires this password before use. |
 | `SP_TENANT_ID` / `SP_CLIENT_ID` | *(empty)* | Azure AD app for SharePoint device-code auth. |
 | `SP_SCOPES` | `Files.Read.All,Sites.Read.All` | Microsoft Graph scopes for SharePoint indexing. |
@@ -186,21 +214,40 @@ All configuration is via environment variables (loaded from `.env`). See
 
 ## Using the app (3-step wizard)
 
-The bundled corporate template is **embedded** at
-[`templates/standard_proposal_template_v1.pptx`](templates/standard_proposal_template_v1.pptx) — you do
-**not** upload a template. You only provide the RFP (and, optionally, reusable content).
+The corporate template is configured with `HCLTECH_TEMPLATE_PATH`. Point it at the official HCLTech
+Expanded Version `.potx` or a converted `.pptx`. When a `.potx` is configured, the app creates a cached
+PPTX-compatible copy under `TEMPLATE_CACHE_DIR` and renders from that cache. You do **not** upload a
+template in the UI; you only provide the RFP and, optionally, reusable content.
+
+When running from WSL, either keep the Windows path in `.env`:
+
+```env
+HCLTECH_TEMPLATE_PATH='C:\Users\...\Expanded Version 5.0.potx'
+```
+
+or use the equivalent WSL mount path:
+
+```env
+HCLTECH_TEMPLATE_PATH='/mnt/c/Users/.../Expanded Version 5.0.potx'
+```
+
+Quoted values are recommended because the OneDrive and branding-kit paths contain spaces.
 
 ### Sidebar settings
 - **Deck Mode** — *Bid Defense (Core Only)* or *Full Proposal (Core + Appendix)*.
 - **Generate speaker notes** — toggle per-slide presenter notes.
 - **Enable diagram generation** — toggle the AI-diagram step (with approval).
-- **Diagram model / size / quality** — controls for image generation (`gpt-image-1` by default).
+- **Diagram model / size / quality** — controls for image generation (`OPENAI_IMAGE_MODEL` by default).
 - **Build/Update RAG index** — index an uploaded reusable-content `.txt` for retrieval.
 
 ### Step 1 — Upload & Plan
-Upload your **RFP (PDF/DOCX)** (one or more files) and optionally a **reusable-content `.txt`**. Click
-**Generate Plan**. The agent pipeline runs and produces the **deck plan** and **traceability report**
-(both viewable as JSON in expanders).
+Upload the **primary RFP and annexures (PDF/DOCX/XLSX)**. Upload customer-issued clarification Q&A
+and addenda in the separate authoritative-source control, and place non-binding material under
+supporting documents. The app preserves page, paragraph/table-row, or workbook sheet/row locators,
+then applies source precedence before producing the **deck plan** and **traceability report**.
+
+For clarification workbooks, use recognisable question and answer headings such as `Vendor Question`
+and `Customer Response`. An unanswered vendor question remains non-authoritative and unresolved.
 
 ### Step 2 — Diagrams & Approval (if enabled)
 Click **Generate / Regenerate Diagrams**. Each proposed diagram is rendered as a preview image. **Tick
@@ -264,7 +311,7 @@ rfp2deck_v1.0/
 │  └─ rfp2deck_app.py            # Streamlit UI: password gate + 3-step wizard
 ├─ rfp2deck/
 │  ├─ agent/
-│  │  ├─ graph.py                # LangGraph: 7-node pipeline wiring
+│  │  ├─ graph.py                # LangGraph: 9-node pipeline wiring
 │  │  ├─ nodes.py                # Node fns + deterministic deck post-processing
 │  │  ├─ prompts.py              # All prompt templates
 │  │  └─ state.py                # AgentState (Pydantic) shared across nodes
@@ -277,6 +324,8 @@ rfp2deck_v1.0/
 │  ├─ ingestion/
 │  │  ├─ pdf_parser.py           # PDF → text (PyMuPDF)
 │  │  ├─ docx_parser.py          # DOCX → text (python-docx)
+│  │  ├─ xlsx_parser.py          # XLSX → sheet/row evidence + clarification Q&A
+│  │  ├─ source_package.py       # Source roles, authority, precedence, prompt package
 │  │  ├─ pptx_parser.py          # PPTX → text (python-pptx)
 │  │  └─ deck_analyzer.py        # Template layout/placeholder analysis
 │  ├─ llm/
@@ -293,7 +342,7 @@ rfp2deck_v1.0/
 │  └─ rendering/
 │     └─ pptx_renderer.py        # Deterministic PPTX rendering (theme, layout, fit, notes)
 ├─ templates/
-│  └─ standard_proposal_template_v1.pptx   # Embedded corporate template
+│  └─ *.pptx                       # Optional local PPTX templates
 ├─ requirements.txt
 ├─ pyproject.toml
 ├─ .env.example
@@ -302,7 +351,8 @@ rfp2deck_v1.0/
 
 ### The agent graph in detail
 
-- **State** ([state.py](rfp2deck/agent/state.py)) carries `rfp_text`, `template_info`, RAG context, and
+- **State** ([state.py](rfp2deck/agent/state.py)) carries the source-labelled RFP package,
+  `source_documents`, `clarification_records`, `source_reconciliation`, `template_info`, RAG context, and
   every artifact produced along the way (`understanding`, `narrative`, `deck_plan`, `report`), plus UI
   toggles (`deck_mode`, `enable_notes`).
 - **Node logging.** Each node is wrapped by `_logged_node`, which logs START/DONE/duration and surfaces
@@ -321,8 +371,10 @@ rfp2deck_v1.0/
 
 Defined in [rfp2deck/core/schemas.py](rfp2deck/core/schemas.py). The important ones:
 
-- **`RFPUnderstanding`** — `summary`, `requirements[]` (id/text/priority/source_ref), `assumptions`,
-  `risks`, and `key_technologies[]` (named tech used to ground diagrams).
+- **`SourceDocument` / `SourceReconciliation`** — document role, authority, locators, clarification
+  records, precedence rules, conflicts, and unresolved customer questions.
+- **`RFPUnderstanding`** — effective `requirements[]` with source references, authority, status and
+  confidence; superseded and unresolved requirements are retained separately for auditability.
 - **`ExecutiveNarrative`** — `value_proposition`, `strategic_outcomes`, `solution_themes`,
   `executive_summary_points`, `mandatory_sections`, `milestone_mapping`.
 - **`DeckPlan` → `SlideSpec`** — each slide has `title`, `archetype` (a fixed vocabulary), `bullets`,
@@ -355,8 +407,8 @@ Defined in [rfp2deck/core/schemas.py](rfp2deck/core/schemas.py). The important o
 
 ### Diagram generation & the approval gate
 
-- [diagrams/generator.py](rfp2deck/diagrams/generator.py) calls OpenAI image generation (`gpt-image-1` by
-  default) and returns PNG bytes.
+- [diagrams/generator.py](rfp2deck/diagrams/generator.py) calls OpenAI image generation
+  (`OPENAI_IMAGE_MODEL` by default) and returns PNG bytes.
 - The UI generates one image per slide that has a `DiagramSpec`, holds them **in memory**, and shows
   previews. The renderer inserts an image **only if** `diagram.approved` is `True` *and* a matching image
   exists for that `slide_id`. Unapproved diagrams are silently skipped.
@@ -395,10 +447,11 @@ logged with the active node and a traceback. Tune with `LOG_LEVEL` / `LOG_FILE` 
 |---------|--------------------|
 | `OPENAI_API_KEY is not set` warning, auth errors | Populate `.env` and restart the app. |
 | App shows a password box and stops | `APP_PASSWORD` is set; enter it (or unset it for local use). |
-| "Embedded template missing" | Ensure `templates/standard_proposal_template_v1.pptx` exists. |
+| "Corporate template is unavailable" | Set `HCLTECH_TEMPLATE_PATH` to the official HCLTech `.potx` or a converted `.pptx`. |
 | Diagrams don't appear in the deck | They weren't **approved** in Step 2, or the image failed to generate. |
 | Long titles look tight | Headlines auto-shrink to ≤2 lines; prefer ≤8-word assertion titles for best results. |
-| Slow runs / timeouts | Reasoning passes use a high-effort model; raise `OPENAI_TIMEOUT_S` or use faster models. |
+| DeckPlan returns 5xx errors or takes many minutes | Keep `OPENAI_REASONING_EFFORT_DECK_PLAN=medium`; the planner now compacts template metadata and uses one explicit retry layer. Check the OpenAI status page if 5xx responses persist. |
+| Other slow runs / timeouts | Reasoning passes may use high effort; adjust the node-specific effort or timeout only after checking prompt size and service status. |
 | Need detail on a failure | Check `logs/rfp2deck.log`; set `LOG_LEVEL=DEBUG`. |
 
 ---

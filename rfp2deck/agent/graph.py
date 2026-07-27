@@ -6,9 +6,11 @@ from rfp2deck.agent.nodes import (
     build_narrative,
     compress_bullets,
     derive_sections,
+    extract_source_evidence,
     generate_notes,
     plan_deck,
     qa_and_report,
+    reconcile_sources,
     understand_rfp,
 )
 from rfp2deck.agent.state import AgentState
@@ -20,6 +22,8 @@ log = get_logger(__name__)
 def build_graph():
     log.info("Building agent graph")
     g = StateGraph(AgentState)
+    g.add_node("reconcile_sources", reconcile_sources)
+    g.add_node("extract_source_evidence", extract_source_evidence)
     g.add_node("understand_rfp", understand_rfp)
     g.add_node("derive_sections", derive_sections)
     g.add_node("build_narrative", build_narrative)
@@ -28,7 +32,9 @@ def build_graph():
     g.add_node("generate_notes", generate_notes)
     g.add_node("qa_and_report", qa_and_report)
 
-    g.set_entry_point("understand_rfp")
+    g.set_entry_point("reconcile_sources")
+    g.add_edge("reconcile_sources", "extract_source_evidence")
+    g.add_edge("extract_source_evidence", "understand_rfp")
     g.add_edge("understand_rfp", "derive_sections")
     g.add_edge("derive_sections", "build_narrative")
     g.add_edge("build_narrative", "plan_deck")
@@ -37,5 +43,5 @@ def build_graph():
     g.add_edge("generate_notes", "qa_and_report")
     g.add_edge("qa_and_report", END)
     compiled = g.compile()
-    log.info("Agent graph compiled (7 nodes)")
+    log.info("Agent graph compiled (9 nodes)")
     return compiled

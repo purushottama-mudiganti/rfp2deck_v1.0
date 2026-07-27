@@ -15,14 +15,32 @@ try:
     from rfp2deck.agent.state import AgentState
     from rfp2deck.core.config import settings
     from rfp2deck.core.logging import setup_logging
-    from rfp2deck.core.schemas import DeckPlan, TraceabilityReport
+    from rfp2deck.core.pipeline_cache import (
+        build_diagram_cache_key,
+        build_diagram_prompt_cache_key,
+        build_plan_cache_key,
+        hash_files,
+        read_bytes_cache,
+        read_json_cache,
+        sha256_bytes,
+        sha256_text,
+        stable_hash,
+        write_bytes_cache,
+        write_json_cache,
+    )
+    from rfp2deck.core.schemas import (
+        ClarificationRecord,
+        DeckPlan,
+        SourceDocument,
+        TraceabilityReport,
+    )
     from rfp2deck.diagrams.generator import generate_diagram_png
     from rfp2deck.ingestion.deck_analyzer import analyze_pptx_template
-    from rfp2deck.ingestion.docx_parser import parse_docx
-    from rfp2deck.ingestion.pdf_parser import parse_pdf
+    from rfp2deck.ingestion.source_package import parse_source_document, render_source_package
+    from rfp2deck.ingestion.template_resolver import resolve_pptx_template
     from rfp2deck.rag.indexer import build_faiss_index, chunk_text, load_index
     from rfp2deck.rag.retriever import retrieve
-    from rfp2deck.rendering.pptx_renderer import render_deck_from_template
+    from rfp2deck.rendering.pptx_renderer import render_deck_from_template, rendered_slide_count
 except ModuleNotFoundError:
     # Ensure local package imports work when running via `streamlit run app/rfp2deck_app.py`.
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -32,14 +50,32 @@ except ModuleNotFoundError:
     from rfp2deck.agent.state import AgentState
     from rfp2deck.core.config import settings
     from rfp2deck.core.logging import setup_logging
-    from rfp2deck.core.schemas import DeckPlan, TraceabilityReport
+    from rfp2deck.core.pipeline_cache import (
+        build_diagram_cache_key,
+        build_diagram_prompt_cache_key,
+        build_plan_cache_key,
+        hash_files,
+        read_bytes_cache,
+        read_json_cache,
+        sha256_bytes,
+        sha256_text,
+        stable_hash,
+        write_bytes_cache,
+        write_json_cache,
+    )
+    from rfp2deck.core.schemas import (
+        ClarificationRecord,
+        DeckPlan,
+        SourceDocument,
+        TraceabilityReport,
+    )
     from rfp2deck.diagrams.generator import generate_diagram_png
     from rfp2deck.ingestion.deck_analyzer import analyze_pptx_template
-    from rfp2deck.ingestion.docx_parser import parse_docx
-    from rfp2deck.ingestion.pdf_parser import parse_pdf
+    from rfp2deck.ingestion.source_package import parse_source_document, render_source_package
+    from rfp2deck.ingestion.template_resolver import resolve_pptx_template
     from rfp2deck.rag.indexer import build_faiss_index, chunk_text, load_index
     from rfp2deck.rag.retriever import retrieve
-    from rfp2deck.rendering.pptx_renderer import render_deck_from_template
+    from rfp2deck.rendering.pptx_renderer import render_deck_from_template, rendered_slide_count
 
 # Set APP_PASSWORD so that the public URL is not accessed by all 
 # The password in the UI should match with the APP_PASSWORD set in the environment variables.
@@ -94,10 +130,30 @@ st.session_state.setdefault("template_info", None)
 st.session_state.setdefault("retrieved_context", None)
 st.session_state.setdefault("diagrams_generated", False)  # ran generation at least once
 st.session_state.setdefault("diagram_images", {})
+st.session_state.setdefault("diagram_failures", [])
 st.session_state.setdefault("rag_index", None)
 
-# Embedded standard template path (no UI upload required)
-STANDARD_TEMPLATE = PROJECT_ROOT / "templates" / "standard_proposal_template_v1.pptx"
+# Corporate template path (no UI upload required). Configure this with
+# HCLTECH_TEMPLATE_PATH in .env. It may point to either the official HCLTech
+# POTX or a PPTX derived from that POTX.
+_configured_template = settings.proposal_template_path
+STANDARD_TEMPLATE = (
+    _configured_template
+    if _configured_template.is_absolute()
+    else PROJECT_ROOT / _configured_template
+)
+_configured_template_cache = settings.template_cache_dir
+STANDARD_TEMPLATE_CACHE_DIR = (
+    _configured_template_cache
+    if _configured_template_cache.is_absolute()
+    else PROJECT_ROOT / _configured_template_cache
+)
+
+
+@st.cache_resource(show_spinner=False)
+def resolve_standard_template(template_path: str, cache_dir: str) -> Path:
+    """Resolve the configured template to a PPTX path python-pptx can read."""
+    return resolve_pptx_template(Path(template_path), Path(cache_dir))
 
 
 @st.cache_resource(show_spinner=False)
@@ -146,13 +202,24 @@ with st.sidebar:
     st.session_state.deck_mode = deck_mode
     st.caption(f"Selected mode: {deck_mode}")
 
+    deck_plan_specialists = st.checkbox(
+        "Specialist-architect planning (parallel Application/Integration/Data architects)",
+        value=settings.deck_plan_specialists,
+        help="When on, each proposal section is expanded by a role-focused specialist "
+        "in parallel instead of one generalist. Overrides the OPENAI_DECK_PLAN_SPECIALISTS "
+        "default per run — no redeploy needed to switch.",
+    )
+    st.session_state.deck_plan_specialists = deck_plan_specialists
+
     st.write("Models are configured via `.env`.")
     st.code(
         "Reasoning model: {reasoning}\n"
         "Fast model: {fast}\n"
+        "Image model: {image}\n"
         "Embeddings: {embeddings}".format(
             reasoning=settings.model_reasoning,
             fast=settings.model_fast,
+            image=settings.image_model,
             embeddings=settings.embeddings_model,
         )
     )
@@ -161,7 +228,7 @@ with st.sidebar:
         "Generate speaker notes (presenter notes per slide)", value=True
     )
     enable_diagrams = st.checkbox("Enable diagram generation (guarded + approval)", value=True)
-    diagram_model = st.text_input("Diagram model", value="gpt-image-1")
+    diagram_model = st.text_input("Diagram model", value=settings.image_model)
     diagram_size = st.selectbox(
         "Diagram size",
         options=["auto", "1024x1024", "1024x1536", "1536x1024"],
@@ -206,12 +273,21 @@ with st.sidebar:
 
     st.divider()
     st.caption("Template")
-    if STANDARD_TEMPLATE.exists():
-        st.success(f"Using embedded template: {STANDARD_TEMPLATE.name}")
-    else:
-        st.error(
-            "Embedded template missing. Ensure templates/standard_proposal_template_v1.pptx exists."
+    try:
+        resolved_template = resolve_standard_template(
+            str(STANDARD_TEMPLATE), str(STANDARD_TEMPLATE_CACHE_DIR)
         )
+        if STANDARD_TEMPLATE.suffix.lower() == ".potx":
+            st.success(f"Using HCLTech POTX: {STANDARD_TEMPLATE.name}")
+            st.caption(f"Cached PPTX: {resolved_template.name}")
+        else:
+            st.success(f"Using HCLTech template: {resolved_template.name}")
+    except Exception as exc:
+        st.error(
+            "Corporate template is unavailable. Set HCLTECH_TEMPLATE_PATH in .env "
+            "to the official HCLTech .potx or a converted .pptx."
+        )
+        st.caption(str(exc))
 
     if st.button("Reset wizard", use_container_width=True):
         keys = [
@@ -224,8 +300,13 @@ with st.sidebar:
             "retrieved_context",
             "diagrams_generated",
             "diagram_images",
+            "diagram_failures",
             "rag_index",
             "render_complete",
+            "rfp_step1",
+            "clarifications_step1",
+            "supporting_step1",
+            "ref_step1",
         ]
         for k in keys:
             if k in st.session_state:
@@ -236,47 +317,119 @@ with st.sidebar:
 # ----------------------------
 # Helpers
 # ----------------------------
-def parse_rfp(upload) -> tuple[str, dict]:
-    """Parse a single RFP upload and return its extracted text and metadata."""
+def parse_rfp_source(upload, role: str) -> tuple[SourceDocument, list[ClarificationRecord], dict]:
+    """Parse one package source while preserving its role and locators."""
     name = getattr(upload, "name", "rfp")
-    suffix = Path(name).suffix.lower()
-    data = upload.getvalue()
-    if suffix == ".pdf":
-        parsed = parse_pdf(data)
-        st.success(f"Parsed PDF ({parsed.page_count} pages).")
+    document, clarifications = parse_source_document(name, upload.getvalue(), role=role)
+    meta = {
+        "name": document.name,
+        "document_id": document.document_id,
+        "document_type": document.document_type,
+        "authority": document.authority,
+        "issue_date": document.issue_date,
+        "locator": document.locator_format,
+        **document.metadata,
+    }
+    if clarifications:
+        meta["clarifications"] = len(clarifications)
+    return document, clarifications, meta
+
+
+def parse_rfp_sources(
+    uploads: list,
+    role: str,
+) -> tuple[list[SourceDocument], list[ClarificationRecord], list[dict]]:
+    """Parse a group of package sources with a shared upload role."""
+    documents: list[SourceDocument] = []
+    clarifications: list[ClarificationRecord] = []
+    summaries: list[dict] = []
+    for upload in uploads or []:
+        name = getattr(upload, "name", "rfp")
+        st.info(f"Parsing {name}...")
+        document, extracted_clarifications, meta = parse_rfp_source(upload, role)
+        documents.append(document)
+        clarifications.extend(extracted_clarifications)
+        summaries.append(meta)
+    return documents, clarifications, summaries
+
+
+def source_count_label(summary: dict) -> str:
+    """Return a compact, format-specific extraction summary."""
+    if summary.get("extension") == ".pdf":
+        return f'{summary.get("pages", 0)} pages'
+    if summary.get("extension") == ".docx":
         return (
-            parsed.text,
-            {"name": name, "type": "pdf", "pages": parsed.page_count},
+            f'{summary.get("paragraphs", 0)} paragraphs, '
+            f'{summary.get("tables", 0)} tables'
         )
-    parsed = parse_docx(data)
-    st.success(f"Parsed DOCX ({parsed.paragraph_count} paragraphs).")
-    return (
-        parsed.text,
-        {
-            "name": name,
-            "type": "docx",
-            "paragraphs": parsed.paragraph_count,
-        },
+    if summary.get("extension") == ".xlsx":
+        return (
+            f'{summary.get("sheets", 0)} sheets, {summary.get("rows", 0)} rows, '
+            f'{summary.get("clarifications", 0)} Q&A records'
+        )
+    return "Parsed"
+
+
+def upload_fingerprint(uploads_by_role: list[tuple[str, list]]) -> list[dict]:
+    """Hash uploaded file bytes without depending on Streamlit object identity."""
+    files = []
+    for role, uploads in uploads_by_role:
+        for upload in uploads or []:
+            data = upload.getvalue()
+            files.append(
+                {
+                    "role": role,
+                    "name": getattr(upload, "name", "upload"),
+                    "size": len(data),
+                    "sha256": sha256_bytes(data),
+                }
+            )
+    return files
+
+
+def pipeline_logic_hash() -> str:
+    """Hash prompt/node/schema files that materially affect Step 1 planning."""
+    return hash_files(
+        [
+            PROJECT_ROOT / "rfp2deck" / "agent" / "prompts.py",
+            PROJECT_ROOT / "rfp2deck" / "agent" / "nodes.py",
+            PROJECT_ROOT / "rfp2deck" / "core" / "schemas.py",
+        ]
     )
 
 
-def parse_rfps(uploads: list) -> tuple[str, list[dict], int, int]:
-    """Parse multiple RFPs and return combined text and summary stats."""
-    texts: list[str] = []
-    summaries: list[dict] = []
-    total_pages = 0
-    total_paragraphs = 0
-    for upload in uploads:
-        name = getattr(upload, "name", "rfp")
-        st.info(f"Parsing {name}...")
-        text, meta = parse_rfp(upload)
-        texts.append(text)
-        summaries.append(meta)
-        if meta.get("type") == "pdf":
-            total_pages += int(meta.get("pages", 0))
-        else:
-            total_paragraphs += int(meta.get("paragraphs", 0))
-    return "\n\n".join(texts), summaries, total_pages, total_paragraphs
+def build_step1_cache_key(
+    *,
+    uploads_by_role: list[tuple[str, list]],
+    template_info: dict,
+    retrieved_context: str | None,
+    deck_mode: str | None,
+    enable_notes: bool,
+    deck_plan_specialists: bool,
+) -> str:
+    return build_plan_cache_key(
+        {
+            "files": upload_fingerprint(uploads_by_role),
+            "template_layouts": template_info.get("slide_layout_names", []),
+            "template_placeholders_hash": stable_hash(template_info.get("placeholder_map", {})),
+            "retrieved_context_hash": sha256_text(retrieved_context or ""),
+            "deck_mode": deck_mode or "",
+            "enable_notes": bool(enable_notes),
+            "models": {
+                "reasoning": settings.model_reasoning,
+                "fast": settings.model_fast,
+                "deck_plan_effort": settings.reasoning_effort_deck_plan,
+                "high_effort": settings.reasoning_effort_high,
+            },
+            "planning": {
+                "chunked": settings.deck_plan_chunked,
+                "batch_size": settings.deck_plan_batch_size,
+                "prompt_max_chars": settings.deck_plan_prompt_max_chars,
+                "specialists": bool(deck_plan_specialists),
+            },
+            "logic_hash": pipeline_logic_hash(),
+        }
+    )
 
 
 def normalize_models(deck_plan, report):
@@ -294,11 +447,67 @@ def count_diagrams(plan: DeckPlan, diagram_images: dict[str, bytes] | None = Non
     approved = 0
     diagram_images = diagram_images or {}
     for s in plan.slides:
-        if s.diagram and (s.slide_id in diagram_images):
+        prompt = (getattr(s.diagram, "prompt", "") or "").strip() if s.diagram else ""
+        if s.diagram and (s.slide_id in diagram_images or (prompt and prompt in diagram_images)):
             total += 1
             if bool(s.diagram.approved):
                 approved += 1
     return total, approved
+
+
+def diagram_prompt_for_slide(slide) -> str:
+    diagram = getattr(slide, "diagram", None)
+    return (getattr(diagram, "prompt", "") or "").strip() if diagram else ""
+
+
+def diagram_image_for_slide(slide, diagram_images: dict[str, bytes] | None) -> bytes | None:
+    images = diagram_images or {}
+    if getattr(slide, "slide_id", None) in images:
+        return images[slide.slide_id]
+    prompt = diagram_prompt_for_slide(slide)
+    if prompt and prompt in images:
+        return images[prompt]
+    return None
+
+
+def load_cached_diagram_images(
+    plan: DeckPlan,
+    current_images: dict[str, bytes] | None,
+    *,
+    model: str,
+    size: str,
+    quality: str,
+) -> dict[str, bytes]:
+    """Reload diagram PNGs from persistent cache after Streamlit/server restart."""
+    images = dict(current_images or {})
+    if not settings.pipeline_cache:
+        return images
+    for slide in plan.slides:
+        diagram = getattr(slide, "diagram", None)
+        if not diagram:
+            continue
+        prompt = diagram_prompt_for_slide(slide)
+        if slide.slide_id in images:
+            if prompt:
+                images.setdefault(prompt, images[slide.slide_id])
+            continue
+        if prompt and prompt in images:
+            images[slide.slide_id] = images[prompt]
+            continue
+        cache_key = build_diagram_cache_key(
+            prompt=diagram.prompt,
+            model=model,
+            size=size,
+            quality=quality,
+        )
+        cached = read_bytes_cache(cache_key, ".png")
+        if cached is None and prompt:
+            cached = read_bytes_cache(build_diagram_prompt_cache_key(prompt=prompt), ".png")
+        if cached:
+            images[slide.slide_id] = cached
+            if prompt:
+                images[prompt] = cached
+    return images
 
 
 def wizard_header(step: int):
@@ -383,7 +592,7 @@ st.divider()
 # STEP 1
 # ----------------------------
 if st.session_state.wizard_step == 1:
-    st.subheader("Step 1 - Upload RFP and Generate Deck Plan (Standard Template)")
+    st.subheader("Step 1 - Upload RFP Package and Generate Deck Plan")
     step1_progress_slot = st.empty()
 
     def show_step1_progress(value: float, text: str) -> None:
@@ -395,12 +604,26 @@ if st.session_state.wizard_step == 1:
     c1, c2 = st.columns(2)
     with c1:
         rfp_files = st.file_uploader(
-            "Upload RFP file(s) (PDF/DOCX)",
-            type=["pdf", "docx"],
+            "Primary RFP and requirement annexures",
+            type=["pdf", "docx", "xlsx"],
             key="rfp_step1",
             accept_multiple_files=True,
         )
     with c2:
+        clarification_files = st.file_uploader(
+            "Customer clarifications and addenda",
+            type=["pdf", "docx", "xlsx"],
+            key="clarifications_step1",
+            accept_multiple_files=True,
+        )
+    with st.expander("Optional supporting material", expanded=False):
+        supporting_files = st.file_uploader(
+            "Supporting reference documents",
+            type=["pdf", "docx", "xlsx"],
+            key="supporting_step1",
+            accept_multiple_files=True,
+            help="Supporting material is contextual and cannot create scope unless the RFP or a customer response incorporates it.",
+        )
         ref_txt = st.file_uploader(
             "Optional: Reusable content (TXT) for RAG", type=["txt"], key="ref_step1"
         )
@@ -419,49 +642,74 @@ if st.session_state.wizard_step == 1:
         step_progress = st.progress(0.0)
         step_status = st.status("Step 1 in progress...", expanded=False)
         step_progress.progress(0.1)
-        if not STANDARD_TEMPLATE.exists():
-            st.error(
-                "Embedded template is missing. Please restore templates/standard_proposal_template_v1.pptx"
-            )
-            st.stop()
 
         if not rfp_files:
-            st.error("Please upload at least one RFP file (PDF or DOCX).")
+            st.error("Please upload at least one primary RFP file (PDF, DOCX, or XLSX).")
             st.stop()
 
         try:
-            rfp_names = [getattr(f, "name", "rfp") for f in rfp_files]
+            resolved_template = resolve_standard_template(
+                str(STANDARD_TEMPLATE), str(STANDARD_TEMPLATE_CACHE_DIR)
+            )
+            all_uploads = list(rfp_files) + list(clarification_files or []) + list(
+                supporting_files or []
+            )
+            rfp_names = [getattr(f, "name", "rfp") for f in all_uploads]
             st.session_state.rfp_names = rfp_names
             step_progress.progress(0.3)
 
-            tpl_bytes = STANDARD_TEMPLATE.read_bytes()
+            tpl_bytes = resolved_template.read_bytes()
             st.session_state.tpl_bytes = tpl_bytes
 
-            rfp_text, rfp_summaries, total_pages, total_paragraphs = parse_rfps(rfp_files)
+            primary_documents, primary_clarifications, primary_summaries = parse_rfp_sources(
+                rfp_files, "primary"
+            )
+            clarification_documents, customer_clarifications, clarification_summaries = (
+                parse_rfp_sources(clarification_files or [], "clarification")
+            )
+            supporting_documents, supporting_clarifications, supporting_summaries = (
+                parse_rfp_sources(supporting_files or [], "supporting")
+            )
+            source_documents = (
+                primary_documents + clarification_documents + supporting_documents
+            )
+            clarification_records = (
+                primary_clarifications + customer_clarifications + supporting_clarifications
+            )
+            rfp_summaries = (
+                primary_summaries + clarification_summaries + supporting_summaries
+            )
+            rfp_text = render_source_package(source_documents)
             step_progress.progress(0.5)
 
             if rfp_summaries:
-                st.markdown("**RFP upload summary**")
+                st.markdown("**RFP package evidence summary**")
                 rows = []
                 for s in rfp_summaries:
-                    if s.get("type") == "pdf":
-                        rows.append(
-                            {
-                                "File": s["name"],
-                                "Type": "PDF",
-                                "Count": f'{s.get("pages", 0)} pages',
-                            }
-                        )
-                    else:
-                        rows.append(
-                            {
-                                "File": s["name"],
-                                "Type": "DOCX",
-                                "Count": f'{s.get("paragraphs", 0)} paragraphs',
-                            }
-                        )
+                    rows.append(
+                        {
+                            "File": s["name"],
+                            "Role": s["document_type"].replace("_", " ").title(),
+                            "Authority": s["authority"].replace("_", " ").title(),
+                            "Issue Date": s.get("issue_date") or "Unknown",
+                            "Extracted": source_count_label(s),
+                        }
+                    )
                 st.table(rows)
-                st.caption(f"Totals: {total_pages} pages, {total_paragraphs} paragraphs")
+                unresolved_count = sum(
+                    1 for item in clarification_records if not item.customer_response.strip()
+                )
+                st.caption(
+                    f"Sources: {len(source_documents)} | Clarification Q&A records: "
+                    f"{len(clarification_records)} | Unanswered questions: {unresolved_count}"
+                )
+                package_warnings = [
+                    f"{document.name}: {warning}"
+                    for document in source_documents
+                    for warning in document.warnings
+                ]
+                if package_warnings:
+                    st.warning("\n".join(package_warnings[:10]))
 
             # Analyze template layouts/placeholders
             ti = analyze_pptx_template(tpl_bytes)
@@ -506,19 +754,61 @@ if st.session_state.wizard_step == 1:
             st.session_state.retrieved_context = retrieved_context
             step_progress.progress(0.85)
 
+            cache_key = build_step1_cache_key(
+                uploads_by_role=[
+                    ("primary", list(rfp_files or [])),
+                    ("clarification", list(clarification_files or [])),
+                    ("supporting", list(supporting_files or [])),
+                ],
+                template_info=template_info,
+                retrieved_context=retrieved_context,
+                deck_mode=st.session_state.get("deck_mode"),
+                enable_notes=enable_notes,
+                deck_plan_specialists=deck_plan_specialists,
+            )
+            if settings.pipeline_cache:
+                cached = read_json_cache(cache_key)
+                if cached:
+                    log.info("Step 1 pipeline cache HIT: %s", cache_key[:16])
+                    deck_plan = DeckPlan.model_validate(cached.get("deck_plan"))
+                    report_payload = cached.get("report")
+                    report = (
+                        TraceabilityReport.model_validate(report_payload)
+                        if report_payload
+                        else None
+                    )
+                    st.session_state.deck_plan = deck_plan
+                    st.session_state.report = report
+                    st.session_state.diagrams_generated = False
+                    st.session_state.diagram_images = {}
+                    st.session_state.diagram_failures = []
+                    st.session_state.render_complete = False
+                    step_progress.progress(1.0)
+                    step_status.update(label="Step 1 complete from cache.", state="complete")
+                    st.success("Step 1 loaded from cache. Moving to next step...")
+                    st.session_state.wizard_step = 2 if enable_diagrams else 3
+                    st.rerun()
+                log.info("Step 1 pipeline cache MISS: %s", cache_key[:16])
+                st.caption(f"Step 1 cache miss: {cache_key[:12]}")
+
             # Run agent
             graph = build_graph()
             state = AgentState(
                 rfp_text=rfp_text,
                 template_info=template_info,
                 retrieved_context=retrieved_context,
+                source_documents=source_documents,
+                clarification_records=clarification_records,
             )
             state.deck_mode = st.session_state.get("deck_mode")
             state.enable_notes = enable_notes
+            state.deck_plan_specialists = deck_plan_specialists
 
             log.info(
-                "Invoking agent pipeline (rfp_chars=%d, deck_mode=%s, rag=%s)",
+                "Invoking agent pipeline (rfp_chars=%d, sources=%d, clarifications=%d, deck_mode=%s, rag=%s)",
                 len(rfp_text or ""),
+                len(source_documents),
+                len(clarification_records),
                 st.session_state.get("deck_mode"),
                 retrieved_context is not None,
             )
@@ -537,11 +827,24 @@ if st.session_state.wizard_step == 1:
                 st.stop()
 
             deck_plan, report = normalize_models(deck_plan, report)
+            if settings.pipeline_cache:
+                write_json_cache(
+                    cache_key,
+                    {
+                        "cache_key": cache_key,
+                        "cache_version": settings.pipeline_cache_version,
+                        "deck_plan": deck_plan.model_dump(),
+                        "report": report.model_dump() if report else None,
+                    },
+                )
+                log.info("Step 1 pipeline cache SAVED: %s", cache_key[:16])
+                st.caption("Saved Step 1 plan to pipeline cache.")
 
             st.session_state.deck_plan = deck_plan
             st.session_state.report = report
             st.session_state.diagrams_generated = False  # reset for new run
             st.session_state.diagram_images = {}
+            st.session_state.diagram_failures = []
             st.session_state.render_complete = False
             step_progress.progress(1.0)
             step_status.update(label="Step 1 complete.", state="complete")
@@ -591,6 +894,17 @@ if st.session_state.wizard_step == 2:
 
     plan: DeckPlan = st.session_state.deck_plan
 
+    # Surface persistent images immediately after a restart. Approval is a
+    # session decision; it must not prevent already-paid-for images from being
+    # discovered and reviewed again.
+    st.session_state.diagram_images = load_cached_diagram_images(
+        plan,
+        st.session_state.get("diagram_images"),
+        model=diagram_model,
+        size=diagram_size,
+        quality=diagram_quality,
+    )
+
     if not enable_diagrams:
         st.info("Diagram generation disabled in sidebar. You can go to Step 3.")
         if st.button("Proceed to Step 3", type="primary", use_container_width=True):
@@ -629,43 +943,102 @@ if st.session_state.wizard_step == 2:
 
     if gen_clicked:
         diagram_images = {}
+        diagram_failures = []
 
         slides_with_diagrams = [s for s in plan.slides if s.diagram]
         total_targets = len(slides_with_diagrams)
         progress = st.progress(0)
         status = st.status("Generating diagrams...", expanded=False)
 
-        try:
-            made = 0
-            for idx, s in enumerate(slides_with_diagrams, start=1):
-                if not s.diagram:
-                    continue
-                img_bytes = generate_diagram_png(
-                    s.diagram.prompt,
-                    out_path=None,
+        made = 0
+        for idx, s in enumerate(slides_with_diagrams, start=1):
+            if not s.diagram:
+                continue
+            status.update(
+                label=f"Generating diagram {idx}/{total_targets}: {s.title}",
+                state="running",
+            )
+            try:
+                diagram_cache_key = build_diagram_cache_key(
+                    prompt=s.diagram.prompt,
                     model=diagram_model,
                     size=diagram_size,
                     quality=diagram_quality,
                 )
+                img_bytes = (
+                    read_bytes_cache(diagram_cache_key, ".png")
+                    if settings.pipeline_cache
+                    else None
+                )
+                if img_bytes:
+                    status.update(
+                        label=f"Loaded cached diagram {idx}/{total_targets}: {s.title}",
+                        state="running",
+                    )
+                else:
+                    img_bytes = generate_diagram_png(
+                        s.diagram.prompt,
+                        out_path=None,
+                        model=diagram_model,
+                        size=diagram_size,
+                        quality=diagram_quality,
+                    )
+                    if settings.pipeline_cache:
+                        write_bytes_cache(diagram_cache_key, img_bytes, ".png")
                 diagram_images[s.slide_id] = img_bytes
+                prompt = diagram_prompt_for_slide(s)
+                if prompt:
+                    diagram_images[prompt] = img_bytes
+                    if settings.pipeline_cache:
+                        write_bytes_cache(
+                            build_diagram_prompt_cache_key(prompt=prompt),
+                            img_bytes,
+                            ".png",
+                        )
                 made += 1
                 status.update(
                     label=f"Generated {idx}/{total_targets} diagrams",
                     state="running",
                 )
+            except Exception as exc:
+                diagram_failures.append(
+                    {
+                        "slide_id": s.slide_id,
+                        "title": s.title,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                status.update(
+                    label=f"Skipped failed diagram {idx}/{total_targets}: {s.title}",
+                    state="running",
+                )
+            finally:
                 progress.progress(idx / max(total_targets, 1))
 
-            status.update(label="Diagram generation complete.", state="complete")
-            st.session_state.deck_plan = plan
-            st.session_state.diagram_images = diagram_images
-            st.session_state.diagrams_generated = True
-            st.success(f"Generated {made} diagram(s). Now approve below.")
+        st.session_state.deck_plan = plan
+        st.session_state.diagram_images = diagram_images
+        st.session_state.diagram_failures = diagram_failures
+        st.session_state.diagrams_generated = True
+        if made:
+            status.update(label="Diagram generation complete with available images.", state="complete")
+            if diagram_failures:
+                st.warning(
+                    f"Generated {made} diagram(s); {len(diagram_failures)} diagram(s) failed and were skipped."
+                )
+            else:
+                st.success(f"Generated {made} diagram(s). Now approve below.")
             st.rerun()
-        except Exception as exc:
-            stop_on_error("Diagram generation failed. See details below.", status, exc)
+        else:
+            status.update(label="Diagram generation failed for all diagrams.", state="error")
+            st.error("No diagrams were generated. Check the failure details below and retry.")
+            st.json(diagram_failures)
 
     diagram_images = st.session_state.get("diagram_images", {})
-    any_images = any((s.diagram and s.slide_id in diagram_images) for s in plan.slides)
+    diagram_failures = st.session_state.get("diagram_failures", [])
+    if diagram_failures:
+        with st.expander("Skipped diagram failures", expanded=False):
+            st.json(diagram_failures)
+    any_images = any((s.diagram and diagram_image_for_slide(s, diagram_images)) for s in plan.slides)
     if not any_images:
         st.info("No diagram images generated yet. Click **Generate / Regenerate Diagrams** above.")
         st.stop()
@@ -674,13 +1047,14 @@ if st.session_state.wizard_step == 2:
 
     with st.form("diagram_approvals_form"):
         for s in plan.slides:
-            if not s.diagram or s.slide_id not in diagram_images:
+            img_bytes = diagram_image_for_slide(s, diagram_images)
+            if not s.diagram or img_bytes is None:
                 continue
 
             st.markdown(f"""**{s.slide_id} — {s.title}**  
 Kind: `{s.diagram.kind}`""")
 
-            st.image(diagram_images[s.slide_id], caption=s.diagram.prompt)
+            st.image(img_bytes, caption=s.diagram.prompt)
 
             s.diagram.approved = st.checkbox(
                 f"Approve diagram for {s.slide_id}",
@@ -715,12 +1089,36 @@ if st.session_state.wizard_step == 3:
 
     plan: DeckPlan = st.session_state.deck_plan
     tpl_bytes = st.session_state.tpl_bytes
+    st.session_state.diagram_images = load_cached_diagram_images(
+        plan,
+        st.session_state.get("diagram_images"),
+        model=diagram_model,
+        size=diagram_size,
+        quality=diagram_quality,
+    )
 
-    total, approved = count_diagrams(plan, st.session_state.get("diagram_images"))
-    cols = st.columns(3)
-    cols[0].metric("Slides", value=len(plan.slides))
-    cols[1].metric("Diagrams generated", value=total)
-    cols[2].metric("Diagrams approved", value=approved)
+    diagram_images = st.session_state.get("diagram_images") or {}
+    total, approved = count_diagrams(plan, diagram_images)
+    final_pages = rendered_slide_count(plan, diagram_images, tpl_bytes)
+    cols = st.columns(4)
+    cols[0].metric("Planned slides", value=len(plan.slides))
+    cols[1].metric("Final PPTX slides", value=final_pages)
+    cols[2].metric("Usable diagrams", value=total)
+    cols[3].metric("Approved for PPTX", value=approved)
+
+    missing_approved = [
+        slide.title
+        for slide in plan.slides
+        if slide.diagram
+        and slide.diagram.approved
+        and diagram_image_for_slide(slide, diagram_images) is None
+    ]
+    if missing_approved:
+        st.warning(
+            "Approved diagram assets are missing and will render as recovery text: "
+            + "; ".join(missing_approved)
+            + ". Regenerate only these diagrams before customer delivery."
+        )
 
     if enable_diagrams and total > 0 and approved == 0:
         st.warning("No diagrams are approved. They will NOT be inserted into the PPTX.")
