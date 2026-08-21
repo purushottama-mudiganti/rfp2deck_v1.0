@@ -229,9 +229,102 @@ class ExecutiveNarrative(BaseModel):
     milestone_mapping: dict = Field(default_factory=dict)
 
 
+DiagramVisualType = Literal[
+    "architecture",
+    "technical_architecture",
+    "deployment",
+    "hadr",
+    "timeline",
+    "process",
+    "org",
+    "data_flow",
+    "sequence",
+    "swimlane",
+    "topology",
+    "data_model",
+    "testing",
+    "ams",
+    "generic",
+]
+
+
+class DiagramBrief(BaseModel):
+    """Proposal-derived visual intent before it is converted into an image prompt."""
+
+    slide_id: str = ""
+    title: str = ""
+    visual_type: DiagramVisualType = "generic"
+    purpose: str = ""
+    entities: List[str] = Field(default_factory=list)
+    flows: List[str] = Field(default_factory=list)
+    controls: List[str] = Field(default_factory=list)
+    evidence_refs: List[str] = Field(default_factory=list)
+    must_show: List[str] = Field(default_factory=list)
+    must_not_show: List[str] = Field(default_factory=list)
+    open_assumptions: List[str] = Field(default_factory=list)
+
+
+class DiagramBriefSet(BaseModel):
+    briefs: List[DiagramBrief] = Field(default_factory=list)
+
+
+SourcingModel = Literal[
+    "customer-existing",
+    "COTS/SaaS",
+    "managed-cloud",
+    "open-source",
+    "custom-build",
+    "integration-only",
+    "customer-decision",
+]
+
+
+class SolutionComponentDecision(BaseModel):
+    """Build/buy/integrate decision for a business-facing solution component."""
+
+    capability: str
+    recommendation: str
+    sourcing_model: SourcingModel = "customer-decision"
+    role: str = ""
+    rationale: str = ""
+    system_of_record: str = ""
+    data_inputs: List[str] = Field(default_factory=list)
+    data_outputs: List[str] = Field(default_factory=list)
+    decision_status: Literal[
+        "RFP-mandated", "RFP-referenced", "recommended", "customer-decision"
+    ] = "customer-decision"
+    evidence_refs: List[str] = Field(default_factory=list)
+    alternatives_considered: List[str] = Field(default_factory=list)
+    open_assumptions: List[str] = Field(default_factory=list)
+
+
+class TechnologyRecommendation(BaseModel):
+    architecture_layer: str
+    proposed_technology: str
+    technology_category: str
+    role: str
+    status: Literal["RFP-mandated", "RFP-referenced", "recommended", "customer-decision"]
+    rationale: str
+    sourcing_model: SourcingModel = "customer-decision"
+    build_vs_buy_rationale: str = ""
+    evidence_refs: List[str] = Field(default_factory=list)
+    alternatives_considered: List[str] = Field(default_factory=list)
+
+
+class TechnologyRecommendationSet(BaseModel):
+    recommendations: List[TechnologyRecommendation] = Field(default_factory=list)
+    component_decisions: List[SolutionComponentDecision] = Field(default_factory=list)
+    platform_assumptions: List[str] = Field(default_factory=list)
+    hosting_model: Literal["public-cloud", "private-cloud", "on-premises", "hybrid", "customer-decision"] = "customer-decision"
+    selected_platform: str = ""
+    deployment_rationale: str = ""
+    primary_region_strategy: str = ""
+
+
 class DiagramSpec(BaseModel):
     kind: Literal[
         "architecture",
+        "technical_architecture",
         "deployment",
         "hadr",
         "timeline",
@@ -245,6 +338,13 @@ class DiagramSpec(BaseModel):
     prompt: str
     approved: bool = False  # UI gate; renderer inserts image only if approved
     image_path: Optional[str] = None  # filled by diagram generator
+    entities: List[str] = Field(default_factory=list)
+    flows: List[str] = Field(default_factory=list)
+    controls: List[str] = Field(default_factory=list)
+    evidence_refs: List[str] = Field(default_factory=list)
+    open_assumptions: List[str] = Field(default_factory=list)
+    grounding_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    grounding_warnings: List[str] = Field(default_factory=list)
 
 
 class BulletPoint(BaseModel):
@@ -328,6 +428,19 @@ class SlideSpec(BaseModel):
 class DeckPlan(BaseModel):
     deck_title: str
     slides: List[SlideSpec]
+
+
+class SlideBulletEdit(BaseModel):
+    """Bullet-only editorial result keyed to an existing slide."""
+
+    slide_id: str
+    bullets: List[str] = Field(default_factory=list)
+
+
+class BulletCompressionSet(BaseModel):
+    """Compact output for the bullet-compression pass."""
+
+    slides: List[SlideBulletEdit] = Field(default_factory=list)
 
 
 class SlideNote(BaseModel):

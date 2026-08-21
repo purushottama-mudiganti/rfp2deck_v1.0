@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 import base64
+import json
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -19,12 +20,19 @@ from rfp2deck.agent.nodes import (
     enforce_slide_density,
     order_deck,
     _compact_deck_plan_prompt,
+    _chunked_plan_input,
     _fallback_deck_plan,
+    _fallback_visual_briefs,
+    _source_grounded_technical_architecture_elements,
     _proposal_section_skeleton,
     _chunked_deck_plan,
     _risk_detailed_points,
     _ai_ml_opportunities,
-    _sdlc_technology_table,
+    _source_grounded_technology_table,
+    _technology_recommendation_table,
+    _align_recommendations_to_customer_platform,
+    _source_grounded_technology_fallback,
+    build_solution_brief,
     _sbom_table,
     _build_diagram_prompt,
     _testing_proposal_points,
@@ -32,9 +40,13 @@ from rfp2deck.agent.nodes import (
     _assumptions_dependency_points,
     _data_domain_points,
     ensure_diagrams_for_key_slides,
+    enrich_slide_detail,
     ensure_required_slides,
     consulting_grade_proposal_polish,
     prune_redundant_storyline_slides,
+    plan_deck,
+    derive_technology_recommendations,
+    generate_notes,
 )
 from rfp2deck.agent.state import AgentState
 from rfp2deck.diagrams import generator as diagram_generator
@@ -46,12 +58,18 @@ from rfp2deck.agent.evidence import (
 from rfp2deck.core.schemas import (
     BulletPoint,
     DeckPlan,
+    DeckNotes,
     DiagramSpec,
+    DiagramBrief,
     RFPUnderstanding,
     Requirement,
     SlideSpec,
+    SlideNote,
     SourceDocument,
     SourceEvidenceBatch,
+    SolutionComponentDecision,
+    TechnologyRecommendation,
+    TechnologyRecommendationSet,
 )
 from rfp2deck.ingestion.docx_parser import parse_docx
 from rfp2deck.ingestion.source_package import (
@@ -70,11 +88,39 @@ from rfp2deck.rendering.pptx_renderer import (
     _render_pages_for_slide,
     _repair_title_only_slide,
     _choose_hcltech_layout,
+    render_deck_from_template,
     rendered_slide_count,
 )
 
 
 class SourcePackageTests(unittest.TestCase):
+    def test_customer_logo_is_added_to_every_slide_without_master_changes(self) -> None:
+        from pptx import Presentation
+
+        template = Presentation()
+        template_stream = BytesIO()
+        template.save(template_stream)
+        logo = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+        deck = DeckPlan(deck_title="Test", slides=[
+            SlideSpec(slide_id="title", title="Test proposal", archetype="Title"),
+            SlideSpec(slide_id="content", title="A proposal point", archetype="Content", bullets=["A complete point"]),
+        ])
+
+        output = render_deck_from_template(
+            deck,
+            template_stream.getvalue(),
+            customer_logo=logo,
+        )
+        rendered = Presentation(BytesIO(output))
+
+        self.assertEqual(len(rendered.slides), 2)
+        for slide in rendered.slides:
+            logos = [shape for shape in slide.shapes if shape.name == "Customer Logo"]
+            self.assertEqual(len(logos), 1)
+            self.assertLess(logos[0].left + logos[0].width, rendered.slide_width)
+
     def test_compact_deck_plan_prompt_is_bounded(self) -> None:
         understanding = RFPUnderstanding(
             summary="A" * 3000,
@@ -227,11 +273,20 @@ class SourcePackageTests(unittest.TestCase):
         ids = {section["slide_id"] for section in sections}
 
         self.assertIn("sk_integration", ids)
+        self.assertIn("sk_technical_arch", ids)
         self.assertIn("sk_data_model", ids)
         self.assertIn("sk_reporting", ids)
         self.assertIn("sk_ai_opportunities", ids)
         self.assertIn("sk_migration", ids)
         self.assertIn("sk_ams", ids)
+        data_model_section = next(
+            section for section in sections if section["slide_id"] == "sk_data_model"
+        )
+        self.assertEqual(data_model_section["diagram_kind"], "data_model")
+        technical_section = next(
+            section for section in sections if section["slide_id"] == "sk_technical_arch"
+        )
+        self.assertEqual(technical_section["diagram_kind"], "technical_architecture")
         self.assertGreaterEqual(len(sections), 24)
 
     def test_ai_opportunities_are_grounded_in_data_hub_scope(self) -> None:
@@ -273,6 +328,63 @@ class SourcePackageTests(unittest.TestCase):
         )
         self.assertTrue(all(point.sub_points for point in points))
 
+    def test_platform_open_items_move_to_dependencies(self) -> None:
+        understanding = RFPUnderstanding(
+            customer_name="SATS",
+            summary="Deploy the digital catalogue on Azure.",
+        )
+        recommendations = TechnologyRecommendationSet(
+            hosting_model="public-cloud",
+            selected_platform="Microsoft Azure",
+            platform_assumptions=[
+                "SATS confirms the Azure landing-zone subscription and private-connectivity pattern.",
+                "SATS confirms environment promotion approvals and production support ownership.",
+            ],
+            recommendations=[
+                TechnologyRecommendation(
+                    architecture_layer="Recovery objectives",
+                    proposed_technology="Policy baseline",
+                    technology_category="operational decision",
+                    role="Agree recovery targets and evidence before production readiness",
+                    status="customer-decision",
+                    rationale="Business criticality drives recovery commitments",
+                ),
+            ],
+        )
+
+        visual_briefs = [
+            DiagramBrief(
+                slide_id="sk_deployment",
+                visual_type="deployment",
+                open_assumptions=[
+                    "Runtime environment count and release approvals are not specified.",
+                    "Enterprise integration targets and methods are not identified.",
+                    "Backup frequency, retention, RPO and RTO are not specified.",
+                    "Exact AWS hosting is not specified.",
+                ],
+            )
+        ]
+        points = _assumptions_dependency_points(
+            understanding,
+            recommendations,
+            visual_briefs,
+        )
+        platform_points = next(
+            point.sub_points
+            for point in points
+            if point.text == "Platform, security and environment decisions"
+        )
+        all_dependency_text = " ".join(
+            item for point in points for item in point.sub_points
+        )
+
+        self.assertTrue(any("landing-zone" in item for item in platform_points))
+        self.assertIn("Runtime environment count", all_dependency_text)
+        self.assertIn("Enterprise integration targets", all_dependency_text)
+        self.assertIn("Backup frequency", all_dependency_text)
+        self.assertIn("Recovery objectives", all_dependency_text)
+        self.assertNotIn("AWS", all_dependency_text)
+
     def test_data_domain_companion_content_is_authored_not_prompt_instructions(self) -> None:
         understanding = RFPUnderstanding(
             customer_name="SATS",
@@ -304,13 +416,11 @@ class SourcePackageTests(unittest.TestCase):
 
         enriched = ensure_required_slides(deck, understanding=understanding)
         ai_slides = [slide for slide in enriched.slides if "ai-assisted" in slide.title.lower()]
-        technology = _sdlc_technology_table(understanding)
 
         self.assertEqual(len(ai_slides), 1)
         self.assertGreaterEqual(len(ai_slides[0].cards), 3)
-        self.assertTrue(any(row[0] == "AI-assisted capabilities" for row in technology["rows"]))
 
-    def test_existing_technology_table_receives_ai_row(self) -> None:
+    def test_incomplete_technology_table_is_replaced_without_inventing_ai_product(self) -> None:
         understanding = RFPUnderstanding(
             summary="Data hub for flight files, SLA exceptions, reporting and support.",
             project_scope="Validate operational data, forecast demand, and support analytics.",
@@ -330,9 +440,10 @@ class SourcePackageTests(unittest.TestCase):
         enriched = ensure_required_slides(deck, understanding=understanding)
         rows = next(slide.table["rows"] for slide in enriched.slides if slide.slide_id == "tech")
 
-        self.assertTrue(any(row[0] == "AI-assisted capabilities" for row in rows))
+        self.assertTrue(any("No product selected by fallback" in row for row in rows))
+        self.assertFalse(any("Azure AI" in " ".join(row) or "Bedrock" in " ".join(row) for row in rows))
 
-    def test_azure_data_hub_stack_names_implementation_services(self) -> None:
+    def test_power_bi_does_not_imply_fabric_or_azure_stack(self) -> None:
         understanding = RFPUnderstanding(
             customer_name="SATS",
             summary="Central catering uplift data hub with reporting and SLA analytics.",
@@ -341,16 +452,15 @@ class SourcePackageTests(unittest.TestCase):
             procurement_or_submission_tools=["SAP Ariba"],
         )
 
-        table = _sdlc_technology_table(understanding)
+        table = _source_grounded_technology_table(understanding)
         text = " ".join(str(cell) for row in table["rows"] for cell in row)
 
-        self.assertIn("Fabric Data Factory pipelines", text)
-        self.assertIn("Microsoft Fabric OneLake", text)
-        self.assertIn("Azure Functions", text)
-        self.assertIn("Azure API Management", text)
-        self.assertIn("Microsoft Sentinel", text)
+        self.assertIn("Power BI", text)
+        self.assertNotIn("Fabric Data Factory pipelines", text)
+        self.assertNotIn("Microsoft Fabric OneLake", text)
+        self.assertNotIn("Azure Functions", text)
         self.assertNotIn("Ariba", text)
-        self.assertEqual(table["headers"][0], "Architecture layer")
+        self.assertEqual(table["headers"][0], "Source classification")
 
     def test_procurement_tools_are_excluded_from_sbom_and_diagrams(self) -> None:
         understanding = RFPUnderstanding(
@@ -366,7 +476,8 @@ class SourcePackageTests(unittest.TestCase):
 
         self.assertNotIn("Ariba", sbom_text)
         self.assertNotIn("Ariba", diagram_prompt)
-        self.assertIn("Fabric Data Factory pipelines", diagram_prompt)
+        self.assertIn("Power BI", diagram_prompt)
+        self.assertNotIn("Fabric Data Factory pipelines", diagram_prompt)
 
     def test_explicit_aws_signal_does_not_propose_fabric(self) -> None:
         understanding = RFPUnderstanding(
@@ -375,13 +486,681 @@ class SourcePackageTests(unittest.TestCase):
             solution_technologies=["AWS", "Amazon S3"],
         )
 
-        text = " ".join(str(cell) for row in _sdlc_technology_table(understanding)["rows"] for cell in row)
+        text = " ".join(str(cell) for row in _source_grounded_technology_table(understanding)["rows"] for cell in row)
 
-        self.assertIn("AWS Glue", text)
+        self.assertIn("AWS", text)
         self.assertIn("Amazon S3", text)
+        self.assertNotIn("AWS Glue", text)
         self.assertNotIn("Microsoft Fabric", text)
 
-    def test_architecture_prompt_places_ai_in_optional_sidecar(self) -> None:
+    def test_visual_briefs_do_not_cross_route_between_slide_types(self) -> None:
+        slides = [
+            SlideSpec(slide_id="sk_exec", title="Executive Summary", archetype="Solution Overview", diagram=DiagramSpec(kind="architecture", prompt="wrong")),
+            SlideSpec(slide_id="sk_technical_arch", title="Layered technical architecture connects systems and products", archetype="Architecture"),
+            SlideSpec(slide_id="sk_data_model", title="Core data domains and ownership", archetype="Content"),
+            SlideSpec(slide_id="sk_deployment", title="Deployment and resilience protect operations", archetype="Deployment Architecture"),
+            SlideSpec(slide_id="auto_hr_dr", title="HA and DR protect continuity", archetype="High Availability & DR"),
+            SlideSpec(slide_id="sk_testing", title="Acceptance evidence proves readiness", archetype="Delivery Plan"),
+            SlideSpec(slide_id="sk_ams", title="AMS protects the live service", archetype="Delivery Plan"),
+        ]
+        briefs = [
+            DiagramBrief(slide_id="architecture", visual_type="architecture", entities=["App", "API", "DB", "User"], flows=["User -> App", "App -> DB"]),
+            DiagramBrief(slide_id="sk_technical_arch", visual_type="technical_architecture", entities=["Source systems", "COTS products", "Custom services", "Data services"], flows=["Sources -> Integration", "Integration -> Services"], controls=["Security"], evidence_refs=["R-1"]),
+            DiagramBrief(slide_id="sk_data_model", visual_type="data_model", entities=["Catalogue", "Customer", "Solution", "Validation"], flows=["Catalogue -> Solution", "Customer -> Solution"], controls=["Ownership", "Quality"], evidence_refs=["R-1"]),
+            DiagramBrief(slide_id="sk_deployment", visual_type="deployment", entities=["Build", "UAT", "Production", "DR"], flows=["Build -> UAT", "UAT -> Production"]),
+            DiagramBrief(slide_id="auto_hr_dr", visual_type="hadr", entities=["Primary", "Standby", "Backup", "Monitor"], flows=["Primary -> Standby", "Primary -> Backup"]),
+            DiagramBrief(slide_id="sk_testing", visual_type="testing", entities=["API tests", "Data reconciliation", "UAT", "Evidence"], flows=["Tests -> Evidence", "Evidence -> UAT"]),
+            DiagramBrief(slide_id="sk_ams", visual_type="ams", entities=["Telemetry", "Alert", "Runbook", "Resolver"], flows=["Telemetry -> Alert", "Alert -> Resolver"]),
+        ]
+        deck = ensure_diagrams_for_key_slides(DeckPlan(deck_title="Test", slides=slides), RFPUnderstanding(summary="Test"), briefs)
+        by_id = {slide.slide_id: slide for slide in deck.slides}
+        self.assertIsNone(by_id["sk_exec"].diagram)
+        self.assertEqual(by_id["sk_technical_arch"].diagram.kind, "technical_architecture")
+        self.assertEqual(by_id["sk_data_model"].diagram.kind, "data_model")
+        self.assertEqual(by_id["sk_deployment"].diagram.kind, "deployment")
+        self.assertEqual(by_id["auto_hr_dr"].diagram.kind, "hadr")
+        self.assertEqual(by_id["sk_testing"].diagram.kind, "testing")
+        self.assertEqual(by_id["sk_ams"].diagram.kind, "ams")
+        self.assertNotEqual(by_id["sk_testing"].diagram.prompt, by_id["sk_ams"].diagram.prompt)
+
+    def test_required_visual_sections_receive_grounded_supplemental_briefs(self) -> None:
+        understanding = RFPUnderstanding(
+            summary="Governed catalogue platform",
+            project_scope="Integrate source catalogues and APIs, govern data, deploy and support the service.",
+            in_scope_work=["Catalogue consolidation", "API integration", "Search and approved publishing"],
+            requirements=[
+                Requirement(id="R-1", text="Integrate source APIs and files with validation and audit."),
+                Requirement(id="R-2", text="Provide backup, disaster recovery, monitoring and controlled access."),
+            ],
+        )
+        slides = [
+            SlideSpec(slide_id="sk_solution", title="Proposed solution at a glance", archetype="Solution Overview"),
+            SlideSpec(slide_id="sk_technical_arch", title="Layered technical architecture connects systems and products", archetype="Architecture"),
+            SlideSpec(slide_id="sk_integration", title="Integration architecture connects source and consumer systems", archetype="Architecture"),
+            SlideSpec(slide_id="sk_data_model", title="Core data domains and ownership", archetype="Content"),
+            SlideSpec(slide_id="sk_deployment", title="Deployment and resilience protect operations", archetype="Deployment Architecture"),
+            SlideSpec(slide_id="auto_ha_and_dr_protect_business_continuity", title="HA and DR protect business continuity", archetype="High Availability & DR"),
+            SlideSpec(slide_id="sk_roadmap", title="Agile roadmap releases value through increments", archetype="Timeline"),
+            SlideSpec(slide_id="sk_governance", title="Product-aligned squads combine business and engineering ownership", archetype="Team"),
+        ]
+        planned = ensure_diagrams_for_key_slides(
+            DeckPlan(deck_title="Test", slides=slides),
+            understanding,
+            _fallback_visual_briefs(understanding),
+        )
+        expected = {
+            "sk_solution": "generic",
+            "sk_technical_arch": "technical_architecture",
+            "sk_integration": "architecture",
+            "sk_data_model": "data_model",
+            "sk_deployment": "deployment",
+            "auto_ha_and_dr_protect_business_continuity": "hadr",
+            "sk_roadmap": "timeline",
+            "sk_governance": "org",
+        }
+        for slide in planned.slides:
+            self.assertIsNotNone(slide.diagram)
+            self.assertEqual(slide.diagram.kind, expected[slide.slide_id])
+            self.assertGreaterEqual(slide.diagram.grounding_score, 0.45)
+
+    def test_data_model_content_slide_gets_grounded_fallback_diagram(self) -> None:
+        understanding = RFPUnderstanding(
+            customer_name="SATS",
+            summary="Build a governed digital catalogue with shared data ownership.",
+            project_scope="Consolidate product and service catalogues, customer briefs, validation outcomes and pricing decisions.",
+            requirements=[
+                Requirement(id="R-1", text="Consolidate product, service and SKU catalogue records."),
+                Requirement(id="R-2", text="Capture customer requirements and solution shortlists."),
+                Requirement(id="R-3", text="Retain compliance validation and pricing decision evidence."),
+                Requirement(id="R-4", text="Assign domain ownership, stewardship, lineage and audit controls."),
+            ],
+        )
+        deck = DeckPlan(deck_title="Test", slides=[
+            SlideSpec(
+                slide_id="sk_data_model",
+                title="Core data domains and ownership",
+                archetype="Content",
+            )
+        ])
+
+        enrich_slide_detail(deck, understanding)
+        ensure_diagrams_for_key_slides(deck, understanding, visual_briefs=None)
+
+        slide = deck.slides[0]
+        self.assertIsNotNone(slide.diagram)
+        self.assertEqual(slide.diagram.kind, "data_model")
+        self.assertGreaterEqual(slide.diagram.grounding_score, 0.45)
+        self.assertIn("conceptual core data-domain and ownership map", slide.diagram.prompt)
+        self.assertIn("Grounded domain requirements", slide.diagram.prompt)
+        self.assertTrue(slide.detailed_points)
+
+    def test_layered_technical_architecture_uses_build_buy_and_data_source_decisions(self) -> None:
+        understanding = RFPUnderstanding(
+            customer_name="SATS",
+            summary="Build a governed digital catalogue on Microsoft Azure.",
+            project_scope=(
+                "Consolidate product data and approved images, optimise pricing, integrate warehouse "
+                "availability, and publish customer-facing catalogues."
+            ),
+            requirements=[
+                Requirement(id="R-1", text="Master product, SKU, dietary and packaging attributes."),
+                Requirement(id="R-2", text="Store approved product documents and images."),
+                Requirement(id="R-3", text="Use raw-material cost and market inputs for pricing optimisation."),
+                Requirement(id="R-4", text="Integrate cold and ambient warehouse inventory availability."),
+            ],
+        )
+        recommendations = TechnologyRecommendationSet(
+            hosting_model="public-cloud",
+            selected_platform="Microsoft Azure",
+            component_decisions=[
+                SolutionComponentDecision(
+                    capability="Product master and catalogue stewardship",
+                    recommendation="TIBCO EBX",
+                    sourcing_model="COTS/SaaS",
+                    role="Govern product hierarchy, attributes and stewardship workflow",
+                    system_of_record="Regional product owners and approved enterprise sources",
+                    data_inputs=["Product and SKU attributes", "Dietary and packaging attributes"],
+                    data_outputs=["Mastered catalogue records"],
+                    decision_status="recommended",
+                    rationale="Configurable mastering and stewardship avoid rebuilding commodity MDM controls",
+                    alternatives_considered=["Informatica MDM", "Semarchy xDM"],
+                ),
+                SolutionComponentDecision(
+                    capability="Approved digital assets",
+                    recommendation="Azure Data Lake Storage Gen2",
+                    sourcing_model="managed-cloud",
+                    role="Store documents and images while catalogue records retain governed links and metadata",
+                    system_of_record="Approved content owners",
+                    data_inputs=["Product images", "Technical documents"],
+                    data_outputs=["Versioned asset URIs and metadata"],
+                    decision_status="recommended",
+                    rationale="Object storage fits binary assets better than the master-data repository",
+                ),
+                SolutionComponentDecision(
+                    capability="Pricing optimisation",
+                    recommendation="Custom pricing optimisation service",
+                    sourcing_model="custom-build",
+                    role="Apply proposal-specific pricing constraints and approval logic",
+                    system_of_record="ERP or procurement pricing source",
+                    data_inputs=["Raw-material costs", "Market and customer constraints"],
+                    data_outputs=["Recommended price and decision evidence"],
+                    decision_status="recommended",
+                    rationale="The differentiated optimisation and approval rules are not catalogue-master functions",
+                    alternatives_considered=["Dedicated price optimisation SaaS", "ERP pricing extension"],
+                ),
+                SolutionComponentDecision(
+                    capability="Warehouse availability",
+                    recommendation="Warehouse Management System integration",
+                    sourcing_model="integration-only",
+                    role="Reuse cold and ambient inventory without duplicating stock ownership",
+                    system_of_record="Existing warehouse management systems",
+                    data_inputs=["Inventory and facility availability"],
+                    data_outputs=["Availability indicators"],
+                    decision_status="recommended",
+                    rationale="The catalogue consumes availability while the WMS remains authoritative",
+                ),
+                SolutionComponentDecision(
+                    capability="Optional enterprise DAM",
+                    recommendation="Optional DAM vendor",
+                    sourcing_model="customer-decision",
+                    role="Potential future enterprise media governance",
+                    decision_status="customer-decision",
+                ),
+            ],
+            recommendations=[
+                TechnologyRecommendation(
+                    architecture_layer="Object storage",
+                    proposed_technology="Azure Data Lake Storage Gen2",
+                    technology_category="object store",
+                    role="Store approved documents and images",
+                    status="recommended",
+                    rationale="Managed Azure storage fit",
+                    sourcing_model="managed-cloud",
+                    build_vs_buy_rationale="Use managed object storage instead of building binary storage",
+                )
+            ],
+        )
+        deck = DeckPlan(deck_title="Test", slides=[
+            SlideSpec(
+                slide_id="sk_technical_arch",
+                title="Layered technical architecture",
+                archetype="Architecture",
+            )
+        ])
+
+        enrich_slide_detail(deck, understanding, recommendations)
+        ensure_diagrams_for_key_slides(
+            deck,
+            understanding,
+            visual_briefs=None,
+            technology_recommendations=recommendations,
+        )
+
+        diagram = deck.slides[0].diagram
+        self.assertIsNotNone(diagram)
+        self.assertEqual(diagram.kind, "technical_architecture")
+        self.assertGreaterEqual(diagram.grounding_score, 0.45)
+        self.assertIn("layered technical architecture", diagram.prompt.lower())
+        self.assertIn("TIBCO EBX", diagram.prompt)
+        self.assertIn("Azure Data Lake Storage Gen2", diagram.prompt)
+        self.assertIn("Warehouse Management System integration", diagram.prompt)
+        self.assertIn("Raw-material costs", diagram.prompt)
+        self.assertNotIn("Optional DAM vendor", diagram.prompt)
+
+    def test_technology_recommendations_require_concrete_products(self) -> None:
+        recommendations = TechnologyRecommendationSet(recommendations=[
+            TechnologyRecommendation(architecture_layer="API/backend", proposed_technology="Java 21 with Spring Boot", technology_category="API framework", role="Implement catalogue APIs", status="recommended", rationale="Strong transactional and integration fit", evidence_refs=["PARAGRAPH 79"], alternatives_considered=[".NET 8", "Python FastAPI"]),
+            TechnologyRecommendation(architecture_layer="Data store", proposed_technology="PostgreSQL", technology_category="relational SQL database", role="Store governed catalogue and workflow data", status="recommended", rationale="Relational integrity and flexible JSON support", alternatives_considered=["SQL Server", "MongoDB"]),
+            TechnologyRecommendation(architecture_layer="Search", proposed_technology="OpenSearch", technology_category="search index", role="Faceted catalogue search", status="recommended", rationale="Search and filtering fit", alternatives_considered=["Elasticsearch"]),
+            TechnologyRecommendation(architecture_layer="Testing", proposed_technology="JUnit 5; REST Assured; Playwright", technology_category="automated test toolchain", role="Automate unit, API, and UI acceptance", status="recommended", rationale="Matches the proposed implementation layers", alternatives_considered=["Cypress"]),
+        ])
+        table = _technology_recommendation_table(recommendations)
+        text = " ".join(str(cell) for row in table["rows"] for cell in row)
+        self.assertIn("PostgreSQL", text)
+        self.assertIn("Java 21", text)
+        self.assertNotIn("FS Digital Catalogue", text)
+        self.assertNotIn("PARAGRAPH", text)
+        self.assertNotIn("Alternatives considered", text)
+
+    def test_customer_preferred_platform_overrides_conflicting_provider_draft(self) -> None:
+        recommendations = TechnologyRecommendationSet(
+            hosting_model="public-cloud",
+            selected_platform="Amazon Web Services",
+            deployment_rationale="Use AWS managed services",
+            primary_region_strategy="AWS multi-region deployment",
+            platform_assumptions=["Confirm the AWS landing zone."],
+            component_decisions=[
+                SolutionComponentDecision(
+                    capability="Object storage",
+                    recommendation="Amazon S3",
+                    sourcing_model="managed-cloud",
+                    role="Store catalogue assets on AWS",
+                    decision_status="recommended",
+                )
+            ],
+            recommendations=[
+                TechnologyRecommendation(architecture_layer="Application runtime", proposed_technology="Amazon ECS on AWS Fargate", technology_category="managed container runtime", role="Run application services", status="recommended", rationale="Managed runtime"),
+                TechnologyRecommendation(architecture_layer="Application UI", proposed_technology="React 19", technology_category="web framework", role="Build the user interface", status="recommended", rationale="Application fit"),
+            ],
+        )
+
+        aligned = _align_recommendations_to_customer_platform(
+            recommendations,
+            {"platform": "Microsoft Azure", "status": "Customer-preferred"},
+        )
+
+        self.assertEqual(aligned.selected_platform, "Microsoft Azure")
+        self.assertTrue(all("AWS" not in item.proposed_technology for item in aligned.recommendations))
+        self.assertEqual([item.proposed_technology for item in aligned.recommendations], ["React 19"])
+        self.assertEqual(aligned.component_decisions, [])
+        self.assertNotIn("AWS", aligned.deployment_rationale)
+        self.assertEqual(aligned.primary_region_strategy, "")
+        self.assertEqual(aligned.platform_assumptions, [])
+
+    def test_customer_platform_overrides_solution_brief_cloud_inference(self) -> None:
+        understanding = RFPUnderstanding(
+            customer_name="SATS",
+            opportunity_title="FS Digital Catalogue",
+            summary="Deploy the catalogue on AWS using Lambda services.",
+            solution_technologies=["Amazon Web Services", "AWS Lambda"],
+        )
+        customer_context = {
+            "platform": "Microsoft Azure",
+            "status": "Customer-preferred",
+            "details": "Use the approved Azure estate.",
+        }
+
+        brief = build_solution_brief(
+            understanding,
+            None,
+            customer_context,
+        )
+        plan_input = json.loads(
+            _chunked_plan_input(understanding, None, customer_context)
+        )
+
+        self.assertEqual(brief.target_cloud, "azure")
+        self.assertEqual(plan_input["solution_brief"]["target_cloud"], "azure")
+        self.assertEqual(
+            plan_input["customer_technology_context"]["platform"],
+            "Microsoft Azure",
+        )
+
+    def test_supporting_reference_survives_direct_path_as_advisory_context(self) -> None:
+        reference = SourceDocument(
+            document_id="doc-architecture-reference",
+            name="Catalogue Architecture Research.docx",
+            document_type="supporting_reference",
+            authority="contextual",
+            text=(
+                "Use an Experience Layer, API Layer and Business Service Layer. "
+                "Consider TIBCO MDM, Azure API Management and Data Lake Storage Gen2."
+            ),
+        )
+        state = AgentState(
+            rfp_text="Short authoritative RFP plus supporting material",
+            template_info={},
+            source_documents=[reference],
+        )
+        fake_settings = SimpleNamespace(
+            understanding_direct_max_chars=180000,
+            contextual_reference_max_chars=18000,
+        )
+
+        with patch("rfp2deck.agent.nodes.settings", fake_settings):
+            result = extract_source_evidence(state)
+
+        self.assertIn("ADVISORY SUPPORTING REFERENCE CONTEXT", result["contextual_reference_context"])
+        self.assertIn("TIBCO MDM", state.contextual_reference_context)
+        self.assertIsNone(result["evidence_text"])
+
+    def test_fallback_does_not_invent_azure_stack_or_region_pair(self) -> None:
+        understanding = RFPUnderstanding(
+            customer_name="SATS",
+            summary="A Singapore digital catalogue integrates pricing, inventory, documents and mastered product data.",
+            project_scope="Provide catalogue search, workflows, reporting and Azure deployment.",
+            solution_technologies=["Customer Catalogue SDK"],
+        )
+        recommendations = _source_grounded_technology_fallback(
+            understanding,
+            {
+                "platform": "Microsoft Azure",
+                "status": "Existing estate",
+                "details": "Singapore deployment with customer landing-zone controls.",
+            },
+            "Advisory research discusses TIBCO MDM as one product option. "
+            "Primary region is Advisory Alpha and the recovery region is Advisory Beta.",
+        )
+        technology_text = " ".join(
+            item.proposed_technology for item in recommendations.recommendations
+        )
+        self.assertIn("Customer Catalogue SDK", technology_text)
+        self.assertNotIn("React", technology_text)
+        self.assertNotIn("ASP.NET Core", technology_text)
+        self.assertNotIn("Azure API Management", technology_text)
+        self.assertNotIn("TIBCO MDM", technology_text)
+        self.assertEqual(recommendations.component_decisions, [])
+        self.assertEqual(recommendations.selected_platform, "Microsoft Azure")
+        self.assertEqual(recommendations.primary_region_strategy, "")
+
+    def test_technology_node_failure_preserves_sources_without_default_stack(self) -> None:
+        state = AgentState(
+            rfp_text="",
+            template_info={},
+            understanding=RFPUnderstanding(
+                summary="Singapore digital catalogue on the existing Azure estate.",
+                project_scope="Build web, API, data, reporting and deployment capabilities.",
+                solution_technologies=["Customer UI Framework"],
+            ),
+            customer_technology_context={
+                "platform": "Microsoft Azure",
+                "status": "Existing estate",
+                "details": "Singapore deployment.",
+            },
+        )
+        fake_settings = SimpleNamespace(
+            reasoning_effort_medium="medium",
+            deck_plan_timeout_s=30,
+        )
+
+        with patch("rfp2deck.agent.nodes.settings", fake_settings), patch(
+            "rfp2deck.agent.nodes.response_as_schema",
+            side_effect=RuntimeError("proxy timeout"),
+        ):
+            result = derive_technology_recommendations(state)
+
+        technologies = " ".join(
+            item.proposed_technology
+            for item in result["technology_recommendations"].recommendations
+        )
+        self.assertIn("Customer UI Framework", technologies)
+        self.assertNotIn("React", technologies)
+        self.assertNotIn("ASP.NET Core", technologies)
+        self.assertNotIn("Azure Container Apps", technologies)
+        self.assertEqual(result["technology_recommendations"].selected_platform, "Microsoft Azure")
+        self.assertEqual(result["technology_recommendations"].primary_region_strategy, "")
+
+    def test_incomplete_agent_stack_is_rederived_without_a_fixed_fallback(self) -> None:
+        state = AgentState(
+            rfp_text="",
+            template_info={},
+            understanding=RFPUnderstanding(
+                summary="Build a customer portal with APIs, search and governed catalogue data.",
+                project_scope="Deliver web, application, integration, data, testing and deployment capabilities.",
+            ),
+            customer_technology_context={"platform": "Customer Cloud", "status": "Customer-mandated"},
+        )
+        initial = TechnologyRecommendationSet(
+            recommendations=[
+                TechnologyRecommendation(
+                    architecture_layer="Portal",
+                    proposed_technology="Customer Web Runtime",
+                    technology_category="web runtime",
+                    role="Run the portal",
+                    status="recommended",
+                    rationale="Initial proposal-specific choice",
+                )
+            ]
+        )
+        repaired = TechnologyRecommendationSet(
+            selected_platform="Customer Cloud",
+            recommendations=[
+                TechnologyRecommendation(architecture_layer="Portal", proposed_technology="Customer Web Runtime", technology_category="web UI", role="Render journeys", status="recommended", rationale="Customer standard"),
+                TechnologyRecommendation(architecture_layer="Application", proposed_technology="Product Service Runtime", technology_category="application framework", role="Run APIs", status="recommended", rationale="Workload fit"),
+                TechnologyRecommendation(architecture_layer="Exchange", proposed_technology="Partner Exchange Gateway", technology_category="integration", role="Exchange partner data", status="recommended", rationale="Interface fit"),
+                TechnologyRecommendation(architecture_layer="Information", proposed_technology="Catalogue Record Store", technology_category="database", role="Persist governed records", status="recommended", rationale="Data fit"),
+                TechnologyRecommendation(architecture_layer="Delivery", proposed_technology="Customer Delivery Toolchain", technology_category="CI/CD and test", role="Build, test and deploy", status="recommended", rationale="Operating-model fit"),
+            ],
+        )
+        fake_settings = SimpleNamespace(reasoning_effort_medium="medium", deck_plan_timeout_s=30)
+
+        with patch("rfp2deck.agent.nodes.settings", fake_settings), patch(
+            "rfp2deck.agent.nodes.response_as_schema",
+            side_effect=[initial, repaired],
+        ) as structured_call:
+            result = derive_technology_recommendations(state)
+
+        self.assertEqual(structured_call.call_count, 2)
+        technologies = {
+            item.proposed_technology
+            for item in result["technology_recommendations"].recommendations
+        }
+        self.assertIn("Partner Exchange Gateway", technologies)
+        self.assertIn("Customer Delivery Toolchain", technologies)
+        self.assertEqual(result["technology_recommendations"].selected_platform, "Customer Cloud")
+
+    def test_explicit_primary_and_recovery_regions_are_preserved_verbatim(self) -> None:
+        recommendations = _source_grounded_technology_fallback(
+            RFPUnderstanding(summary="Customer-hosted application."),
+            {
+                "platform": "Customer Cloud",
+                "status": "Customer-mandated",
+                "details": "Primary region is Region Alpha and the recovery region is Region Beta.",
+            },
+        )
+
+        self.assertIn("Region Alpha", recommendations.primary_region_strategy)
+        self.assertIn("Region Beta", recommendations.primary_region_strategy)
+
+    def test_required_sections_include_reporting_testing_and_roadmap_explanation(self) -> None:
+        understanding = RFPUnderstanding(
+            summary="Digital catalogue data platform with governance, reporting, testing and incremental delivery.",
+            project_scope="Build a data platform that integrates catalogue data, APIs and dashboards, then deploy and support the service.",
+        )
+        sections = {item["slide_id"]: item for item in _proposal_section_skeleton(understanding)}
+        briefs = {item.slide_id: item for item in _fallback_visual_briefs(understanding)}
+
+        self.assertEqual(sections["sk_reporting"]["diagram_kind"], "process")
+        self.assertEqual(sections["sk_testing"]["diagram_kind"], "testing")
+        self.assertIn("sk_roadmap_detail", sections)
+        self.assertEqual(briefs["sk_reporting"].visual_type, "process")
+        self.assertEqual(briefs["sk_testing"].visual_type, "testing")
+
+    def test_fallback_technical_architecture_uses_source_content_not_fixed_layers(self) -> None:
+        integration_entities, integration_flows = _source_grounded_technical_architecture_elements(
+            RFPUnderstanding(
+                summary="Exchange partner files through SFTP with validation and audit.",
+                project_scope="Integrate external supplier interfaces and monitored file processing.",
+                in_scope_work=["Supplier SFTP exchange", "Catalogue validation service"],
+                requirements=[
+                    Requirement(id="R-1", text="Supplier files enter through SFTP and pass validation before catalogue publication."),
+                ],
+            )
+        )
+        application_entities, application_flows = _source_grounded_technical_architecture_elements(
+            RFPUnderstanding(
+                summary="Build a mobile and web workflow application with APIs and a database.",
+                project_scope="Deliver user journeys, business services, persistent data and cloud deployment.",
+                in_scope_work=["Mobile approval journey", "Product authoring workflow"],
+                solution_technologies=["Customer Design System"],
+                requirements=[
+                    Requirement(id="R-2", text="The application API stores approved product records in the customer database."),
+                ],
+            )
+        )
+        integration_text = " ".join(integration_entities + integration_flows)
+        application_text = " ".join(application_entities + application_flows)
+
+        self.assertIn("Supplier SFTP exchange", integration_text)
+        self.assertIn("Supplier files enter through SFTP", integration_text)
+        self.assertIn("Customer Design System", application_text)
+        self.assertIn("Mobile approval journey", application_text)
+        for fixed_layer in ("Experience Layer", "API Layer", "Business Service Layer", "Data Layer", "Cloud Layer"):
+            self.assertNotIn(fixed_layer, integration_text)
+            self.assertNotIn(fixed_layer, application_text)
+        self.assertNotEqual(integration_entities, application_entities)
+
+    def test_speaker_notes_are_generated_in_small_batches_with_visual_context(self) -> None:
+        slides = [
+            SlideSpec(
+                slide_id=f"slide_{index}",
+                title=f"Decision {index}",
+                archetype="Architecture" if index == 0 else "Content",
+                bullets=[f"Explain decision {index}"],
+                diagram=(
+                    DiagramSpec(kind="architecture", prompt="Show React, .NET and Azure APIs")
+                    if index == 0 else None
+                ),
+            )
+            for index in range(13)
+        ]
+        state = AgentState(
+            rfp_text="",
+            template_info={},
+            understanding=RFPUnderstanding(summary="A governed Azure catalogue."),
+            deck_plan=DeckPlan(deck_title="Test", slides=slides),
+            technology_recommendations=TechnologyRecommendationSet(selected_platform="Microsoft Azure"),
+        )
+        fake_settings = SimpleNamespace(
+            notes_batch_size=6,
+            notes_workers=3,
+            model_fast="test-fast-model",
+            reasoning_effort_low="low",
+        )
+
+        def fake_notes(prompt, schema, **kwargs):
+            payload = prompt.split("SLIDE BATCH (JSON; includes neighbouring titles, content, visual and table):\n", 1)[1]
+            payload = payload.split("\n\nEXECUTIVE NARRATIVE SPINE", 1)[0]
+            batch = json.loads(payload)
+            return DeckNotes(notes=[
+                SlideNote(slide_id=item["slide_id"], notes=f"Narrative for {item['title']} with design rationale and transition.")
+                for item in batch
+            ])
+
+        with patch("rfp2deck.agent.nodes.settings", fake_settings), patch(
+            "rfp2deck.agent.nodes.response_as_schema",
+            side_effect=fake_notes,
+        ) as structured_call:
+            generate_notes(state)
+
+        self.assertEqual(structured_call.call_count, 3)
+        self.assertTrue(all((slide.notes or "").startswith("Narrative for") for slide in slides))
+        first_prompt = structured_call.call_args_list[0].args[0]
+        self.assertIn("Show React, .NET and Azure APIs", " ".join(call.args[0] for call in structured_call.call_args_list))
+        self.assertIn("Microsoft Azure", first_prompt)
+
+    def test_full_deck_planning_receives_customer_platform_context(self) -> None:
+        understanding = RFPUnderstanding(
+            customer_name="SATS",
+            opportunity_title="FS Digital Catalogue",
+            summary="An earlier draft mentions an AWS target runtime.",
+        )
+        customer_context = {
+            "platform": "Microsoft Azure",
+            "status": "Customer-preferred",
+            "details": "Use the approved Azure estate.",
+        }
+        state = AgentState(
+            rfp_text="",
+            template_info={},
+            understanding=understanding,
+            customer_technology_context=customer_context,
+        )
+        fake_settings = SimpleNamespace(
+            deck_plan_specialists=False,
+            deck_plan_chunked=False,
+            deck_plan_prompt_max_chars=100000,
+            deck_plan_rag_max_chars=18000,
+            reasoning_effort_deck_plan="medium",
+            deck_plan_timeout_s=30,
+        )
+        generated = DeckPlan(
+            deck_title="FS Digital Catalogue",
+            slides=[SlideSpec(slide_id="title", title="FS Digital Catalogue")],
+        )
+
+        with patch("rfp2deck.agent.nodes.settings", fake_settings), patch(
+            "rfp2deck.agent.nodes.response_as_schema",
+            return_value=generated,
+        ) as structured_call, patch(
+            "rfp2deck.agent.nodes._post_process_deck_plan",
+            side_effect=lambda deck_plan, **_: deck_plan,
+        ) as post_process:
+            plan_deck(state)
+
+        prompt = structured_call.call_args.args[0]
+        self.assertIn('"platform":"Microsoft Azure"', prompt)
+        self.assertEqual(
+            post_process.call_args.kwargs["customer_technology_context"],
+            customer_context,
+        )
+
+    def test_deployment_diagram_uses_selected_platform_services(self) -> None:
+        recommendations = TechnologyRecommendationSet(
+            hosting_model="public-cloud",
+            selected_platform="Amazon Web Services",
+            deployment_rationale="Existing AWS operating model and managed-service fit",
+            primary_region_strategy="Multi-AZ primary region with a separate recovery region",
+            recommendations=[
+                TechnologyRecommendation(architecture_layer="Edge and ingress", proposed_technology="Amazon Route 53; AWS WAF; Application Load Balancer", technology_category="network edge", role="Secure and route inbound traffic", status="recommended", rationale="Managed ingress"),
+                TechnologyRecommendation(architecture_layer="Application runtime", proposed_technology="Amazon ECS on AWS Fargate", technology_category="managed container runtime", role="Run application and API services", status="recommended", rationale="Low operations overhead"),
+                TechnologyRecommendation(architecture_layer="Data store", proposed_technology="Amazon Aurora PostgreSQL", technology_category="relational SQL database", role="Store transactional catalogue data", status="recommended", rationale="Relational integrity"),
+                TechnologyRecommendation(architecture_layer="Identity and secrets", proposed_technology="Amazon Cognito; AWS Secrets Manager; AWS KMS", technology_category="identity and security", role="Protect identities, secrets, and keys", status="recommended", rationale="Managed security controls"),
+            ],
+        )
+        deck = DeckPlan(deck_title="Test", slides=[
+            SlideSpec(slide_id="deploy", title="Deployment architecture", archetype="Deployment Architecture")
+        ])
+        understanding = RFPUnderstanding(summary="Deploy a secure digital catalogue.")
+
+        enrich_slide_detail(deck, understanding, recommendations)
+        ensure_diagrams_for_key_slides(
+            deck,
+            understanding,
+            _fallback_visual_briefs(understanding),
+            recommendations,
+        )
+
+        prompt = deck.slides[0].diagram.prompt
+        self.assertIn("Amazon Web Services", prompt)
+        self.assertIn("Amazon ECS on AWS Fargate", prompt)
+        self.assertIn("AWS WAF", prompt)
+        self.assertTrue(any("Amazon Web Services" in item for item in deck.slides[0].bullets))
+
+    def test_deployment_diagram_replaces_stale_provider_and_visible_open_items(self) -> None:
+        recommendations = TechnologyRecommendationSet(
+            hosting_model="public-cloud",
+            selected_platform="Microsoft Azure",
+            deployment_rationale="Customer-preferred cloud and existing operating model",
+            primary_region_strategy="Azure Southeast Asia with zone redundancy",
+            platform_assumptions=["SATS confirms landing-zone connectivity and release approvals."],
+            recommendations=[
+                TechnologyRecommendation(architecture_layer="Edge and ingress", proposed_technology="Azure Front Door Premium; Azure Web Application Firewall", technology_category="network edge", role="Secure and route inbound traffic", status="recommended", rationale="Managed Azure ingress"),
+                TechnologyRecommendation(architecture_layer="Application runtime", proposed_technology="Azure App Service", technology_category="managed application runtime", role="Run application and API services", status="recommended", rationale="Managed runtime"),
+                TechnologyRecommendation(architecture_layer="Data store", proposed_technology="Azure Database for PostgreSQL Flexible Server", technology_category="relational SQL database", role="Store transactional catalogue data", status="recommended", rationale="Relational integrity"),
+                TechnologyRecommendation(architecture_layer="Identity and secrets", proposed_technology="Microsoft Entra ID; Azure Key Vault", technology_category="identity and security", role="Protect identities, secrets, and keys", status="recommended", rationale="Azure-native controls"),
+                TechnologyRecommendation(architecture_layer="Conflicting runtime", proposed_technology="Amazon ECS on AWS Fargate", technology_category="managed container runtime", role="Run a legacy draft runtime", status="recommended", rationale="Stale visual recommendation"),
+            ],
+        )
+        deck = DeckPlan(deck_title="Test", slides=[
+            SlideSpec(
+                slide_id="sk_deployment",
+                title="Deployment and resilience protect operations",
+                archetype="Deployment Architecture",
+                diagram=DiagramSpec(
+                    kind="deployment",
+                    prompt="Show an AWS target runtime. Label every box TBC with SATS.",
+                ),
+            )
+        ])
+
+        ensure_diagrams_for_key_slides(
+            deck,
+            RFPUnderstanding(customer_name="SATS", summary="Secure digital catalogue"),
+            visual_briefs=None,
+            technology_recommendations=recommendations,
+        )
+
+        prompt = deck.slides[0].diagram.prompt
+        self.assertIn("Microsoft Azure", prompt)
+        self.assertIn("Azure App Service", prompt)
+        self.assertNotIn("AWS", prompt)
+        self.assertNotIn("Amazon ECS", prompt)
+        self.assertNotIn("TBC", prompt)
+        self.assertNotIn("to be confirmed", prompt.lower())
+        self.assertNotIn("landing-zone connectivity", prompt)
+
+    def test_architecture_prompt_keeps_ai_bounded_without_repeated_sidecar(self) -> None:
         understanding = RFPUnderstanding(
             customer_name="SATS",
             summary="Data hub for flight, ELP, SLA, reporting and support data.",
@@ -402,10 +1181,8 @@ class SourcePackageTests(unittest.TestCase):
         enriched = ensure_diagrams_for_key_slides(deck, understanding)
         prompt = enriched.slides[0].diagram.prompt.lower()
 
-        self.assertIn("ai-assisted", prompt)
-        self.assertIn("deterministic fallback", prompt)
-        self.assertIn("no autonomous write-back", prompt)
-        self.assertIn("without dedicated gpu", prompt)
+        self.assertIn("one bounded component", prompt)
+        self.assertIn("do not add a separate ai sidecar", prompt)
 
     def test_non_data_proposal_does_not_force_ai_slide(self) -> None:
         understanding = RFPUnderstanding(
@@ -803,7 +1580,7 @@ class SourcePackageTests(unittest.TestCase):
             ["Explain source to target flow", "Explain controls and operations"],
         )
 
-    def test_hcltech_diagram_uses_native_diagram_layout_not_title_only(self) -> None:
+    def test_hcltech_diagram_uses_full_width_title_only_layout(self) -> None:
         from pptx import Presentation
 
         template = Path(".data/outputs/latest_user_deck.pptx")
@@ -819,8 +1596,7 @@ class SourcePackageTests(unittest.TestCase):
 
         layout = _choose_hcltech_layout(prs, slide)
 
-        self.assertIn("diagram", layout.name.lower())
-        self.assertNotEqual(layout.name.lower(), "title only")
+        self.assertEqual(layout.name.lower(), "title only")
 
     def test_rendered_slide_count_includes_diagram_companion(self) -> None:
         deck = DeckPlan(
@@ -831,7 +1607,10 @@ class SourcePackageTests(unittest.TestCase):
                     slide_id="arch",
                     title="Architecture",
                     archetype="Architecture",
-                    bullets=["Explain the design decision."],
+                    bullets=[
+                        "Explain the design decision.",
+                        "Connect the decision to operational risk and customer value.",
+                    ],
                     diagram=DiagramSpec(kind="architecture", prompt="draw architecture", approved=True),
                 ),
             ],
@@ -844,7 +1623,10 @@ class SourcePackageTests(unittest.TestCase):
             slide_id="arch_v2",
             title="Architecture",
             archetype="Architecture",
-            bullets=["Explain source to target flow"],
+            bullets=[
+                "Explain source to target flow",
+                "Explain the controls and operating boundary",
+            ],
             diagram=DiagramSpec(kind="architecture", prompt="draw architecture", approved=True),
         )
 
@@ -985,7 +1767,7 @@ class SourcePackageTests(unittest.TestCase):
         self.assertTrue(repaired)
         self.assertTrue(any("data hub" in (getattr(shape, "text", "") or "").lower() for shape in slide.shapes))
 
-    def test_delivery_testing_and_ams_diagrams_are_not_generic_squad_diagrams(self) -> None:
+    def test_testing_is_a_required_evidence_visual_but_ams_remains_grounded(self) -> None:
         deck = DeckPlan(
             deck_title="Test",
             slides=[
@@ -998,10 +1780,7 @@ class SourcePackageTests(unittest.TestCase):
 
         self.assertEqual(planned.slides[0].diagram.kind, "testing")
         self.assertIn("testing and acceptance evidence map", planned.slides[0].diagram.prompt.lower())
-        self.assertIn("do not show a textbook test pyramid", planned.slides[0].diagram.prompt.lower())
-        self.assertEqual(planned.slides[1].diagram.kind, "ams")
-        self.assertIn("warranty and ams service map", planned.slides[1].diagram.prompt.lower())
-        self.assertIn("do not use a generic l1/l2/l3 pyramid", planned.slides[1].diagram.prompt.lower())
+        self.assertIsNone(planned.slides[1].diagram)
 
     def test_testing_and_ams_are_tailored_to_named_solution_requirements(self) -> None:
         understanding = RFPUnderstanding(
@@ -1014,6 +1793,7 @@ class SourcePackageTests(unittest.TestCase):
                 Requirement(id="R-2", text="Replace ICCMS while preserving operational processes and functional outcomes.", priority="must"),
                 Requirement(id="R-3", text="Provide data validation, reconciliation, security audit evidence, and performance assurance.", priority="must"),
                 Requirement(id="R-4", text="Provide warranty and AMS support for production integrations, reporting, and incident resolution.", priority="must"),
+                Requirement(id="R-5", text="Show inventory availability in catalogue search results.", priority="must"),
             ],
         )
 
@@ -1024,6 +1804,7 @@ class SourcePackageTests(unittest.TestCase):
 
         self.assertTrue(any("FIH" in " ".join(point.sub_points) or "GP4" in " ".join(point.sub_points) for point in testing_points))
         self.assertTrue(any("ICCMS" in " ".join(point.sub_points) for point in testing_points))
+        self.assertFalse(any("inventory availability" in " ".join(point.sub_points).lower() for point in testing_points))
         self.assertIn("FIH", testing_prompt)
         self.assertIn("ICCMS", testing_prompt)
         self.assertIn("acceptance owner", testing_prompt.lower())
@@ -1031,7 +1812,8 @@ class SourcePackageTests(unittest.TestCase):
         self.assertTrue(any("SAP" in " ".join(point.sub_points) or "KSMS" in " ".join(point.sub_points) for point in ams_points))
         self.assertIn("business-flow observability", ams_prompt.lower())
         self.assertIn("correction/replay", ams_prompt.lower())
-        self.assertIn("to be agreed", ams_prompt.lower())
+        self.assertNotIn("to be agreed", ams_prompt.lower())
+        self.assertIn("assumptions and dependencies slide", ams_prompt.lower())
         self.assertIn("do not use a generic l1/l2/l3 pyramid", ams_prompt.lower())
 
     def test_corporate_proxy_block_page_is_detected_deep_in_error_body(self) -> None:
@@ -1123,6 +1905,141 @@ class SourcePackageTests(unittest.TestCase):
         self.assertLessEqual(mocked_response.call_count, 11)
         self.assertTrue(result["source_evidence"])
         self.assertLessEqual(len(result["evidence_text"]), 180000)
+
+    def test_contextual_reference_chunk_failure_uses_bounded_source_fallback(self) -> None:
+        text = (
+            "Azure target architecture uses API Management, App Service, PostgreSQL, "
+            "Blob Storage, Entra ID, Key Vault, monitoring and backup controls.\n"
+            * 55
+        )
+        document = SourceDocument(
+            document_id="doc-reference",
+            name="SATS Catalog Solution.docx",
+            document_type="supporting_reference",
+            authority="contextual",
+            text=text,
+        )
+        state = AgentState(
+            rfp_text=text,
+            template_info={},
+            source_documents=[document],
+        )
+        fake_settings = SimpleNamespace(
+            understanding_direct_max_chars=1000,
+            understanding_evidence_chunk_chars=4000,
+            understanding_evidence_max_chars=40000,
+            understanding_evidence_workers=1,
+            understanding_evidence_timeout_s=300,
+            understanding_evidence_grace_s=60,
+            understanding_contextual_evidence_llm_enabled=True,
+            understanding_contextual_evidence_grace_s=30,
+            understanding_evidence_cache=False,
+            model_fast="test-fast-model",
+            reasoning_effort_low="low",
+        )
+
+        with patch("rfp2deck.agent.nodes.settings", fake_settings), patch(
+            "rfp2deck.agent.nodes.response_as_schema",
+            side_effect=RuntimeError("background response timed out"),
+        ) as structured_call:
+            result = extract_source_evidence(state)
+
+        self.assertTrue(result["source_evidence"])
+        self.assertIn("Azure target architecture", result["evidence_text"])
+        self.assertTrue(document.warnings)
+        self.assertTrue(structured_call.call_args_list)
+        self.assertTrue(
+            all(
+                call.kwargs["timeout_seconds"] == 60
+                for call in structured_call.call_args_list
+            )
+        )
+        self.assertTrue(
+            all(
+                call.kwargs["background_grace_seconds"] == 30
+                for call in structured_call.call_args_list
+            )
+        )
+        self.assertTrue(
+            all(
+                call.kwargs["recoverable_failure"] is True
+                for call in structured_call.call_args_list
+            )
+        )
+
+    def test_contextual_reference_uses_local_evidence_without_llm_by_default(self) -> None:
+        text = (
+            "The target architecture uses Azure API Management, Entra ID, Blob Storage, "
+            "master data services and governed catalogue workflows.\n"
+            * 35
+        )
+        document = SourceDocument(
+            document_id="doc-local-reference",
+            name="Architecture Reference.docx",
+            document_type="supporting_reference",
+            authority="contextual",
+            text=text,
+        )
+        state = AgentState(
+            rfp_text=text,
+            template_info={},
+            source_documents=[document],
+        )
+        fake_settings = SimpleNamespace(
+            understanding_direct_max_chars=1000,
+            understanding_evidence_chunk_chars=4000,
+            understanding_evidence_max_chars=40000,
+            understanding_evidence_workers=2,
+            understanding_evidence_timeout_s=300,
+            understanding_evidence_grace_s=60,
+            understanding_contextual_evidence_llm_enabled=False,
+            understanding_evidence_cache=False,
+            model_fast="test-fast-model",
+            reasoning_effort_low="low",
+        )
+
+        with patch("rfp2deck.agent.nodes.settings", fake_settings), patch(
+            "rfp2deck.agent.nodes.response_as_schema"
+        ) as structured_call:
+            result = extract_source_evidence(state)
+
+        structured_call.assert_not_called()
+        self.assertIn("Azure API Management", result["evidence_text"])
+        self.assertFalse(document.warnings)
+
+    def test_authoritative_chunk_failure_still_stops_evidence_extraction(self) -> None:
+        text = "The solution must retain this authoritative requirement.\n" * 100
+        document = SourceDocument(
+            document_id="doc-authoritative",
+            name="RFP.docx",
+            document_type="base_rfp",
+            authority="authoritative",
+            text=text,
+        )
+        state = AgentState(
+            rfp_text=text,
+            template_info={},
+            source_documents=[document],
+        )
+        fake_settings = SimpleNamespace(
+            understanding_direct_max_chars=1000,
+            understanding_evidence_chunk_chars=4000,
+            understanding_evidence_max_chars=40000,
+            understanding_evidence_workers=1,
+            understanding_evidence_timeout_s=30,
+            understanding_evidence_grace_s=5,
+            understanding_evidence_cache=False,
+            model_fast="test-fast-model",
+            reasoning_effort_low="low",
+        )
+
+        with patch("rfp2deck.agent.nodes.settings", fake_settings), patch(
+            "rfp2deck.agent.nodes.response_as_schema",
+            side_effect=RuntimeError("background response timed out"),
+        ), self.assertRaises(RuntimeError) as raised:
+            extract_source_evidence(state)
+
+        self.assertIn("Evidence extraction failed for RFP.docx", str(raised.exception))
 
     def test_large_source_is_split_into_bounded_locator_aware_chunks(self) -> None:
         text = "--- PAGE 1 ---\n" + ("Requirement A must be retained.\n" * 350)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import random
 import time
 from copy import deepcopy
 from typing import Any, Dict, Type, TypeVar
@@ -17,7 +19,11 @@ T = TypeVar("T", bound=BaseModel)
 
 
 class StructuredLLMError(RuntimeError):
-    """Raised when a streamed structured-output call ends without completion."""
+    """Raised when a structured-output call ends without completion."""
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def _field(obj: Any, name: str, default: Any = None) -> Any:
@@ -77,6 +83,16 @@ def _is_proxy_block_error(exc: BaseException) -> bool:
     )
 
 
+def _is_retryable_proxy_gateway_error(exc: BaseException) -> bool:
+    """Treat proxy-generated 5xx pages as transient, not policy denials."""
+    status_code = getattr(exc, "status_code", None)
+    return (
+        _is_proxy_block_error(exc)
+        and isinstance(status_code, int)
+        and status_code >= 500
+    )
+
+
 def _format_proxy_block_error(
     exc: BaseException,
     *,
@@ -93,6 +109,24 @@ def _format_proxy_block_error(
         "Request allow-list/access for api.openai.com under the corporate Generative AI "
         "policy, connect through an approved network/VPN, or configure the approved proxy "
         "for the Python runtime."
+    )
+
+
+def _format_transient_proxy_error(
+    exc: BaseException,
+    *,
+    schema_name: str,
+    model: str,
+    reasoning_effort: str,
+) -> str:
+    status_code = getattr(exc, "status_code", None)
+    return (
+        "OpenAI API requests repeatedly failed at the corporate proxy gateway "
+        f"(schema={schema_name}, model={model}, effort={reasoning_effort}, "
+        f"status={status_code or 'unknown'}). The proxy returned a transient HTML "
+        "5xx error page for https://api.openai.com/v1/responses after all configured "
+        "attempts. This is a proxy availability/handling failure, not a model or "
+        "structured-output schema failure."
     )
 
 
@@ -151,6 +185,38 @@ def _is_retryable_openai_error(exc: BaseException) -> bool:
     )
 
 
+def _exception_diagnostics(exc: BaseException) -> Dict[str, Any]:
+    """Return safe transport diagnostics without logging prompts or credentials."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", {}) or {}
+    body = _error_body(exc)
+    cause = getattr(exc, "__cause__", None)
+    return {
+        "exception": type(exc).__name__,
+        "cause": type(cause).__name__ if cause is not None else "",
+        "status": getattr(exc, "status_code", None),
+        "code": body.get("error_code") or body.get("code"),
+        "request_id": (
+            headers.get("x-request-id")
+            or headers.get("request-id")
+            or getattr(exc, "request_id", None)
+        ),
+    }
+
+
+def _retry_delay_seconds(exc: BaseException, attempt: int) -> float:
+    fallback = min(
+        settings.openai_retry_base_wait_s * (2 ** max(0, attempt - 1)),
+        settings.openai_retry_max_wait_s,
+    )
+    explicit = _retry_after_seconds(exc, -1.0)
+    if explicit >= 0:
+        return min(explicit, settings.openai_retry_max_wait_s)
+    jitter_ratio = max(0.0, float(getattr(settings, "openai_retry_jitter_ratio", 0.2)))
+    jitter = random.uniform(0.0, fallback * jitter_ratio) if fallback > 0 else 0.0
+    return min(fallback + jitter, settings.openai_retry_max_wait_s)
+
+
 def _responses_create_with_backoff(
     client: Any,
     request_kwargs: Dict[str, Any],
@@ -161,21 +227,14 @@ def _responses_create_with_backoff(
 ) -> Any:
     max_attempts = max(1, settings.openai_retry_attempts)
     for attempt in range(1, max_attempts + 1):
+        attempt_start = time.perf_counter()
         try:
             return client.responses.create(**request_kwargs)
-        except APITimeoutError:
-            raise
-        except APIConnectionError as exc:
-            raise StructuredLLMError(
-                _format_connection_error(
-                    exc,
-                    schema_name=schema_name,
-                    model=model,
-                    reasoning_effort=reasoning_effort,
-                )
-            ) from exc
-        except OpenAIError as exc:
-            if _is_proxy_block_error(exc):
+        except (APITimeoutError, APIConnectionError, OpenAIError) as exc:
+            elapsed = time.perf_counter() - attempt_start
+            proxy_error = _is_proxy_block_error(exc)
+            transient_proxy = _is_retryable_proxy_gateway_error(exc)
+            if proxy_error and not transient_proxy:
                 raise StructuredLLMError(
                     _format_proxy_block_error(
                         exc,
@@ -184,30 +243,129 @@ def _responses_create_with_backoff(
                         reasoning_effort=reasoning_effort,
                     )
                 ) from exc
-            if attempt >= max_attempts or not _is_retryable_openai_error(exc):
+            retryable = (
+                transient_proxy
+                or isinstance(exc, (APITimeoutError, APIConnectionError))
+                or _is_retryable_openai_error(exc)
+            )
+            if attempt >= max_attempts or not retryable:
+                if transient_proxy:
+                    raise StructuredLLMError(
+                        _format_transient_proxy_error(
+                            exc,
+                            schema_name=schema_name,
+                            model=model,
+                            reasoning_effort=reasoning_effort,
+                        ),
+                        retryable=True,
+                    ) from exc
+                if isinstance(exc, APIConnectionError) and not isinstance(exc, APITimeoutError):
+                    raise StructuredLLMError(
+                        _format_connection_error(
+                            exc,
+                            schema_name=schema_name,
+                            model=model,
+                            reasoning_effort=reasoning_effort,
+                        ),
+                        retryable=True,
+                    ) from exc
                 raise
 
-            fallback = min(
-                settings.openai_retry_base_wait_s * (2 ** (attempt - 1)),
-                settings.openai_retry_max_wait_s,
-            )
-            delay = min(
-                _retry_after_seconds(exc, fallback),
-                settings.openai_retry_max_wait_s,
-            )
-            status_code = getattr(exc, "status_code", None)
-            body = _error_body(exc)
+            delay = _retry_delay_seconds(exc, attempt)
+            diagnostics = _exception_diagnostics(exc)
             log.warning(
-                "OpenAI response create failed with retryable error; waiting %.1fs "
-                "before retry %d/%d (schema=%s, model=%s, effort=%s, status=%s, code=%s)",
-                delay,
-                attempt + 1,
+                "OpenAI response create attempt %d/%d failed after %.1fs; waiting %.1fs "
+                "before retry (schema=%s, model=%s, effort=%s, exception=%s, cause=%s, "
+                "status=%s, code=%s, request_id=%s)",
+                attempt,
                 max_attempts,
+                elapsed,
+                delay,
                 schema_name,
                 model,
                 reasoning_effort,
-                status_code,
-                body.get("error_code") or body.get("code"),
+                diagnostics["exception"],
+                diagnostics["cause"],
+                diagnostics["status"],
+                diagnostics["code"],
+                diagnostics["request_id"],
+            )
+            time.sleep(delay)
+
+    raise RuntimeError("unreachable")
+
+
+def _responses_retrieve_with_backoff(
+    client: Any,
+    response_id: str,
+    *,
+    schema_name: str,
+    model: str,
+    reasoning_effort: str,
+) -> Any:
+    """Retrieve a background response with the same bounded transport policy."""
+    max_attempts = max(1, settings.openai_retry_attempts)
+    for attempt in range(1, max_attempts + 1):
+        attempt_start = time.perf_counter()
+        try:
+            return client.responses.retrieve(response_id)
+        except (APITimeoutError, APIConnectionError, OpenAIError) as exc:
+            elapsed = time.perf_counter() - attempt_start
+            proxy_error = _is_proxy_block_error(exc)
+            transient_proxy = _is_retryable_proxy_gateway_error(exc)
+            if proxy_error and not transient_proxy:
+                raise StructuredLLMError(
+                    _format_proxy_block_error(
+                        exc,
+                        schema_name=schema_name,
+                        model=model,
+                        reasoning_effort=reasoning_effort,
+                    )
+                ) from exc
+            retryable = (
+                transient_proxy
+                or isinstance(exc, (APITimeoutError, APIConnectionError))
+                or _is_retryable_openai_error(exc)
+            )
+            if attempt >= max_attempts or not retryable:
+                if transient_proxy:
+                    raise StructuredLLMError(
+                        _format_transient_proxy_error(
+                            exc,
+                            schema_name=schema_name,
+                            model=model,
+                            reasoning_effort=reasoning_effort,
+                        ),
+                        retryable=True,
+                    ) from exc
+                if isinstance(exc, APIConnectionError) and not isinstance(exc, APITimeoutError):
+                    raise StructuredLLMError(
+                        _format_connection_error(
+                            exc,
+                            schema_name=schema_name,
+                            model=model,
+                            reasoning_effort=reasoning_effort,
+                        ),
+                        retryable=True,
+                    ) from exc
+                raise
+            delay = _retry_delay_seconds(exc, attempt)
+            diagnostics = _exception_diagnostics(exc)
+            log.warning(
+                "OpenAI background retrieve attempt %d/%d failed after %.1fs; waiting %.1fs "
+                "before retry (schema=%s, response_id=%s, exception=%s, cause=%s, "
+                "status=%s, code=%s, request_id=%s)",
+                attempt,
+                max_attempts,
+                elapsed,
+                delay,
+                schema_name,
+                response_id,
+                diagnostics["exception"],
+                diagnostics["cause"],
+                diagnostics["status"],
+                diagnostics["code"],
+                diagnostics["request_id"],
             )
             time.sleep(delay)
 
@@ -233,6 +391,122 @@ def _raise_if_response_not_completed(
                 event_types=event_types,
             )
         )
+
+
+def _poll_background_response(
+    client: Any,
+    resp: Any,
+    *,
+    schema_name: str,
+    model: str,
+    reasoning_effort: str,
+    deadline: float,
+    grace_seconds: float | None = None,
+) -> Any:
+    """Poll a background Response using short, independently retried requests."""
+    response_id = _field(resp, "id")
+    if not response_id:
+        raise StructuredLLMError(
+            "OpenAI background response did not return a response ID "
+            f"(schema={schema_name}, model={model}, effort={reasoning_effort})"
+        )
+
+    status = _field(resp, "status", "unknown")
+    log.info(
+        "LLM structured background response created: schema=%s response_id=%s status=%s",
+        schema_name,
+        response_id,
+        status,
+    )
+    last_status = status
+    last_progress_log = time.perf_counter()
+    poll_s = max(0.0, float(getattr(settings, "openai_structured_background_poll_s", 2.0)))
+    grace_s = max(
+        0.0,
+        float(
+            grace_seconds
+            if grace_seconds is not None
+            else getattr(settings, "openai_structured_background_grace_s", 300.0)
+        ),
+    )
+    hard_deadline = deadline + grace_s
+    grace_logged = False
+    while status in {"queued", "in_progress"}:
+        now = time.perf_counter()
+        remaining = hard_deadline - now
+        if remaining <= 0:
+            try:
+                with_options = getattr(client, "with_options", None)
+                cancel_client = (
+                    with_options(timeout=10.0, max_retries=0)
+                    if callable(with_options)
+                    else client
+                )
+                cancelled = cancel_client.responses.cancel(response_id)
+                log.info(
+                    "Cancelled background response after application deadline: "
+                    "schema=%s response_id=%s status=%s",
+                    schema_name,
+                    response_id,
+                    _field(cancelled, "status", "unknown"),
+                )
+            except Exception as cancel_exc:
+                log.warning(
+                    "Could not cancel background response after application deadline: "
+                    "schema=%s response_id=%s cause=%s",
+                    schema_name,
+                    response_id,
+                    type(cancel_exc).__name__,
+                )
+            raise StructuredLLMError(
+                "OpenAI background response exceeded the configured timeout and grace period "
+                f"(schema={schema_name}, model={model}, effort={reasoning_effort}, "
+                f"response_id={response_id}, last_status={status}, grace_s={grace_s:.0f})",
+                retryable=True,
+            )
+        if now >= deadline and not grace_logged and grace_s > 0:
+            log.warning(
+                "LLM structured background response is still %s at the normal deadline; "
+                "continuing to poll the existing job for up to %.0fs of grace "
+                "(schema=%s, response_id=%s)",
+                status,
+                grace_s,
+                schema_name,
+                response_id,
+            )
+            grace_logged = True
+        if poll_s:
+            time.sleep(min(poll_s, remaining))
+        resp = _responses_retrieve_with_backoff(
+            client,
+            response_id,
+            schema_name=schema_name,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
+        status = _field(resp, "status", "unknown")
+        now = time.perf_counter()
+        if status != last_status or now - last_progress_log >= 30.0:
+            log.info(
+                "LLM structured background progress: schema=%s response_id=%s status=%s "
+                "deadline_phase=%s remaining=%.1fs",
+                schema_name,
+                response_id,
+                status,
+                "grace" if now >= deadline else "normal",
+                max(0.0, (hard_deadline if now >= deadline else deadline) - now),
+            )
+            last_status = status
+            last_progress_log = now
+
+    _raise_if_response_not_completed(
+        resp,
+        schema_name=schema_name,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        event_types=[],
+    )
+    return resp
 
 
 def _format_response_failure(
@@ -357,17 +631,55 @@ def response_as_schema(
     model: str | None = None,
     reasoning_effort: str = "medium",
     timeout_seconds: float = 600.0,
+    background: bool | None = None,
+    background_grace_seconds: float | None = None,
+    recoverable_failure: bool = False,
 ) -> T:
     """Call OpenAI Responses API using STRICT JSON Schema structured output.
 
     The project owns retry behavior so attempt counts and backoff are explicit.
-    Streaming remains optional because some large structured responses are more
-    reliable through the non-streaming endpoint.
+    Unless a caller makes an explicit transport choice, the shared policy uses
+    background creation only for prompts above its configured size threshold.
+    ``recoverable_failure`` changes logging only; exceptions still propagate so
+    the caller can apply its proposal-safe fallback.
     """
+    model = model or settings.model_reasoning
+    background_min_chars = max(
+        0, int(getattr(settings, "openai_structured_background_min_chars", 0) or 0)
+    )
+    background_enabled = bool(
+        getattr(settings, "openai_structured_background_enabled", True)
+    )
+    background_all = bool(
+        getattr(settings, "openai_structured_background_all", True)
+    )
+    background_grace_s = max(
+        0.0,
+        float(
+            background_grace_seconds
+            if background_grace_seconds is not None
+            else getattr(settings, "openai_structured_background_grace_s", 300.0)
+        ),
+    )
+    use_background = background_enabled and (
+        bool(background)
+        if background is not None
+        else (
+            background_all
+            or bool(background_min_chars and len(prompt) >= background_min_chars)
+        )
+    )
+    # Background create/retrieve requests should remain short even though the
+    # server-side job may run through the normal deadline plus its grace period.
+    request_timeout = (
+        min(timeout_seconds, max(1.0, float(getattr(settings, "openai_timeout_s", 120.0))))
+        if use_background
+        else timeout_seconds
+    )
     # Do not combine SDK retries with the explicit retry loop below. Previously,
     # three configured attempts could expand to as many as nine HTTP attempts.
-    client = get_client(timeout=timeout_seconds, max_retries=0)
-    model = model or settings.model_reasoning
+    client = get_client(timeout=request_timeout, max_retries=0)
+    prompt_fingerprint = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
 
     raw_schema: Dict[str, Any] = schema.model_json_schema()
     defs: Dict[str, Any] = {}
@@ -384,12 +696,23 @@ def response_as_schema(
     strict_schema = _make_strict(inlined)
 
     log.info(
-        "LLM structured call: schema=%s model=%s effort=%s prompt_chars=%d timeout=%.0fs",
+        "LLM structured call: schema=%s model=%s effort=%s prompt_chars=%d "
+        "prompt_id=%s timeout=%.0fs background_grace=%.0fs request_timeout=%.0fs "
+        "transport=%s attempts=%d",
         schema.__name__,
         model,
         reasoning_effort,
         len(prompt),
+        prompt_fingerprint,
         timeout_seconds,
+        background_grace_s if use_background else 0.0,
+        request_timeout,
+        (
+            "background-poll"
+            if use_background else "streaming"
+            if settings.openai_structured_streaming else "non-streaming"
+        ),
+        max(1, settings.openai_retry_attempts),
     )
     request_kwargs: Dict[str, Any] = {
         "model": model,
@@ -407,9 +730,38 @@ def response_as_schema(
         request_kwargs["reasoning"] = {"effort": reasoning_effort}
 
     start = time.perf_counter()
+    deadline = start + max(1.0, timeout_seconds)
     resp: Any = None
     try:
-        if not settings.openai_structured_streaming:
+        if use_background:
+            log.info(
+                "LLM structured call using background Responses API with short polling "
+                "(schema=%s, model=%s, effort=%s, default_all=%s, threshold_chars=%d)",
+                schema.__name__,
+                model,
+                reasoning_effort,
+                background_all,
+                background_min_chars,
+            )
+            background_kwargs = dict(request_kwargs)
+            background_kwargs["background"] = True
+            resp = _responses_create_with_backoff(
+                client,
+                background_kwargs,
+                schema_name=schema.__name__,
+                model=model,
+                reasoning_effort=reasoning_effort,
+            )
+            resp = _poll_background_response(
+                client,
+                resp,
+                schema_name=schema.__name__,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                deadline=deadline,
+                grace_seconds=background_grace_s,
+            )
+        elif not settings.openai_structured_streaming:
             log.info(
                 "LLM structured call using non-streaming Responses API "
                 "(schema=%s, model=%s, effort=%s)",
@@ -498,26 +850,45 @@ def response_as_schema(
                     resp = stream.get_final_response()
     except APITimeoutError:
         elapsed = time.perf_counter() - start
-        log.error(
-            "LLM structured call TIMED OUT for schema=%s after %.1fs "
-            "(model=%s, effort=%s, timeout=%.0fs). Consider raising timeout_seconds "
-            "or lowering reasoning_effort.",
+        message = (
+            "Recoverable LLM structured call timed out"
+            if recoverable_failure
+            else "LLM structured call TIMED OUT"
+        )
+        log_method = log.warning if recoverable_failure else log.error
+        log_method(
+            "%s for schema=%s after %.1fs (model=%s, effort=%s, timeout=%.0fs)%s",
+            message,
             schema.__name__,
             elapsed,
             model,
             reasoning_effort,
             timeout_seconds,
+            "; caller will apply its fallback" if recoverable_failure else "",
         )
         raise
     except StructuredLLMError:
         elapsed = time.perf_counter() - start
-        log.exception(
-            "LLM structured stream ended without completion for schema=%s after %.1fs "
-            "(model=%s, effort=%s)",
+        log_method = log.warning if recoverable_failure else log.exception
+        log_method(
+            "%s for schema=%s after %.1fs "
+            "(model=%s, effort=%s, transport=%s, prompt_id=%s)%s",
+            (
+                "Recoverable LLM structured call ended without completion"
+                if recoverable_failure
+                else "LLM structured call ended without completion"
+            ),
             schema.__name__,
             elapsed,
             model,
             reasoning_effort,
+            (
+                "background-poll"
+                if use_background else "streaming"
+                if settings.openai_structured_streaming else "non-streaming"
+            ),
+            prompt_fingerprint,
+            "; caller will apply its fallback" if recoverable_failure else "",
         )
         raise
     except RuntimeError as exc:
@@ -607,17 +978,27 @@ def response_as_schema(
     elapsed = time.perf_counter() - start
     output_text = resp.output_text or ""
     log.info(
-        "LLM structured call OK: schema=%s in %.1fs (output_chars=%d)",
+        "LLM structured call OK: schema=%s in %.1fs "
+        "(response_id=%s, status=%s, prompt_id=%s, output_chars=%d)",
         schema.__name__,
         elapsed,
+        _field(resp, "id"),
+        _field(resp, "status"),
+        prompt_fingerprint,
         len(output_text),
     )
 
     try:
         return schema.model_validate_json(output_text)
     except ValidationError:
-        log.exception(
-            "Response did not match schema=%s. First 500 chars of output: %s",
+        log_method = log.warning if recoverable_failure else log.exception
+        log_method(
+            "%s schema=%s. First 500 chars of output: %s",
+            (
+                "Recoverable response did not match"
+                if recoverable_failure
+                else "Response did not match"
+            ),
             schema.__name__,
             output_text[:500],
         )

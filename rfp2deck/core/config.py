@@ -58,7 +58,31 @@ class Settings:
     openai_retry_attempts: int = int(os.getenv("OPENAI_RETRY_ATTEMPTS", "3"))
     openai_retry_base_wait_s: float = float(os.getenv("OPENAI_RETRY_BASE_WAIT_S", "5"))
     openai_retry_max_wait_s: float = float(os.getenv("OPENAI_RETRY_MAX_WAIT_S", "90"))
+    openai_retry_jitter_ratio: float = float(os.getenv("OPENAI_RETRY_JITTER_RATIO", "0.20"))
     openai_structured_streaming: bool = _env_bool("OPENAI_STRUCTURED_STREAMING", False)
+    openai_structured_background_enabled: bool = _env_bool(
+        "OPENAI_STRUCTURED_BACKGROUND_ENABLED", True
+    )
+    # Prefer synchronous Responses for normal nodes because background mode has
+    # higher startup latency. Large prompts and explicitly long-running nodes
+    # still use background create + short polling.
+    openai_structured_background_all: bool = _env_bool(
+        "OPENAI_STRUCTURED_BACKGROUND_ALL", False
+    )
+    # Used only when OPENAI_STRUCTURED_BACKGROUND_ALL=false. Set to 0 to disable
+    # size-based background execution as well.
+    openai_structured_background_min_chars: int = int(
+        os.getenv("OPENAI_STRUCTURED_BACKGROUND_MIN_CHARS", "30000")
+    )
+    openai_structured_background_poll_s: float = float(
+        os.getenv("OPENAI_STRUCTURED_BACKGROUND_POLL_S", "2")
+    )
+    # A background job may still be healthy when a node's normal deadline is
+    # reached. Continue polling the existing response for this bounded grace
+    # period instead of starting duplicate model work.
+    openai_structured_background_grace_s: float = float(
+        os.getenv("OPENAI_STRUCTURED_BACKGROUND_GRACE_S", "300")
+    )
     reasoning_effort_high: str = os.getenv("OPENAI_REASONING_EFFORT_HIGH", "high")
     reasoning_effort_medium: str = os.getenv("OPENAI_REASONING_EFFORT_MEDIUM", "medium")
     reasoning_effort_low: str = os.getenv("OPENAI_REASONING_EFFORT_LOW", "low")
@@ -85,11 +109,28 @@ class Settings:
     understanding_evidence_timeout_s: float = float(
         os.getenv("OPENAI_UNDERSTANDING_EVIDENCE_TIMEOUT_S", "300")
     )
+    understanding_contextual_evidence_timeout_s: float = float(
+        os.getenv("OPENAI_CONTEXTUAL_EVIDENCE_TIMEOUT_S", "60")
+    )
+    understanding_contextual_evidence_llm_enabled: bool = _env_bool(
+        "OPENAI_CONTEXTUAL_EVIDENCE_LLM_ENABLED", False
+    )
+    understanding_contextual_evidence_grace_s: float = float(
+        os.getenv("OPENAI_CONTEXTUAL_EVIDENCE_GRACE_S", "30")
+    )
+    understanding_evidence_grace_s: float = float(
+        os.getenv("OPENAI_UNDERSTANDING_EVIDENCE_GRACE_S", "60")
+    )
     understanding_evidence_cache: bool = _env_bool(
         "OPENAI_UNDERSTANDING_EVIDENCE_CACHE", True
     )
+    contextual_reference_max_chars: int = int(
+        os.getenv("OPENAI_CONTEXTUAL_REFERENCE_MAX_CHARS", "18000")
+    )
+    notes_batch_size: int = int(os.getenv("OPENAI_NOTES_BATCH_SIZE", "6"))
+    notes_workers: int = int(os.getenv("OPENAI_NOTES_WORKERS", "3"))
     pipeline_cache: bool = _env_bool("RFP2DECK_PIPELINE_CACHE", True)
-    pipeline_cache_version: str = os.getenv("RFP2DECK_PIPELINE_CACHE_VERSION", "v1")
+    pipeline_cache_version: str = os.getenv("RFP2DECK_PIPELINE_CACHE_VERSION", "v3-proposal-derived-architecture")
     sp_tenant_id: str = os.getenv("SP_TENANT_ID", "")
     sp_client_id: str = os.getenv("SP_CLIENT_ID", "")
     sp_scopes: str = os.getenv("SP_SCOPES", "Files.Read.All,Sites.Read.All")

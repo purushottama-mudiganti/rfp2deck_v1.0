@@ -19,6 +19,8 @@ from rfp2deck.agent.prompts import (
     SLIDE_COMPRESSION_PROMPT,
     SOURCE_EVIDENCE_PROMPT,
     SPEAKER_NOTES_PROMPT,
+    TECHNOLOGY_RECOMMENDATION_PROMPT,
+    VISUAL_BRIEF_PROMPT,
 )
 from rfp2deck.agent.evidence import (
     merge_evidence_batches,
@@ -29,17 +31,22 @@ from rfp2deck.agent.rfp_focus import build_rfp_focus_guide
 from rfp2deck.agent.state import AgentState
 from rfp2deck.core.config import settings
 from rfp2deck.core.schemas import (
+    BulletCompressionSet,
     BulletPoint,
     Card,
     Comparison,
     ComparisonColumn,
     DeckNotes,
     DeckPlan,
+    DiagramBrief,
+    DiagramBriefSet,
     DiagramSpec,
     ExecutiveNarrative,
     RFPUnderstanding,
     SectionTaxonomy,
     SlideSpec,
+    TechnologyRecommendation,
+    TechnologyRecommendationSet,
     SourceDocument,
     SourceEvidenceBatch,
     TraceabilityReport,
@@ -91,6 +98,10 @@ def reconcile_sources(state: AgentState) -> Dict[str, Any]:
 
 def _extract_evidence_chunk(chunk) -> SourceEvidenceBatch:
     document = chunk.document
+    if _is_contextual_document(document) and not bool(
+        getattr(settings, "understanding_contextual_evidence_llm_enabled", False)
+    ):
+        return _contextual_evidence_from_source(chunk)
     prompt = SOURCE_EVIDENCE_PROMPT.format(
         document_id=document.document_id,
         document_name=document.name,
@@ -122,12 +133,35 @@ def _extract_evidence_chunk(chunk) -> SourceEvidenceBatch:
     else:
         evidence = None
     if evidence is None:
+        evidence_timeout_s = float(settings.understanding_evidence_timeout_s)
+        evidence_grace_s = float(
+            getattr(settings, "understanding_evidence_grace_s", 60.0)
+        )
+        is_contextual = _is_contextual_document(document)
+        if is_contextual:
+            evidence_timeout_s = float(
+                getattr(
+                    settings,
+                    "understanding_contextual_evidence_timeout_s",
+                    min(evidence_timeout_s, 60.0),
+                )
+            )
+            evidence_grace_s = float(
+                getattr(
+                    settings,
+                    "understanding_contextual_evidence_grace_s",
+                    min(evidence_grace_s, 30.0),
+                )
+            )
         evidence = response_as_schema(
             prompt,
             SourceEvidenceBatch,
             model=settings.model_fast,
             reasoning_effort=settings.reasoning_effort_low,
-            timeout_seconds=settings.understanding_evidence_timeout_s,
+            timeout_seconds=evidence_timeout_s,
+            background_grace_seconds=evidence_grace_s,
+            background=False if is_contextual else None,
+            recoverable_failure=is_contextual,
         )
         if cache_path is not None:
             try:
@@ -143,6 +177,140 @@ def _extract_evidence_chunk(chunk) -> SourceEvidenceBatch:
         if requirement.source_ref and not requirement.source_refs:
             requirement.source_refs = [requirement.source_ref]
     return evidence
+
+
+_CONTEXTUAL_EVIDENCE_TERMS = (
+    "architecture", "azure", "aws", "cloud", "platform", "cots", "saas",
+    "application", "service", "component", "integration", "interface", "api",
+    "event", "file", "data", "database", "storage", "catalog", "master data",
+    "mdm", "pricing", "warehouse", "security", "identity", "network",
+    "deployment", "runtime", "monitor", "backup", "recovery", "devops",
+)
+
+
+def _is_contextual_document(document: SourceDocument) -> bool:
+    return (
+        document.document_type == "supporting_reference"
+        or document.authority in {"contextual", "non_authoritative"}
+    )
+
+
+def _contextual_evidence_from_source(
+    chunk,
+    exc: BaseException | None = None,
+) -> SourceEvidenceBatch:
+    """Preserve bounded excerpts from a non-authoritative source.
+
+    Contextual sources may inform the architecture but cannot create authoritative
+    requirements. This therefore emits source text only as context facts, either
+    as the normal fast path or as recovery after an explicitly enabled LLM call.
+    """
+    raw_units = re.split(r"(?:\r?\n)+|(?<=[.!?])\s+(?=[A-Z0-9])", chunk.text or "")
+    units: List[str] = []
+    seen: set[str] = set()
+    for raw in raw_units:
+        clean = re.sub(r"\s+", " ", raw or "").strip()
+        while clean:
+            if len(clean) <= 600:
+                piece, clean = clean, ""
+            else:
+                boundary = clean.rfind(" ", 0, 600)
+                boundary = boundary if boundary >= 300 else 600
+                piece, clean = clean[:boundary].strip(), clean[boundary:].strip()
+            key = piece.lower()
+            if piece and key not in seen:
+                seen.add(key)
+                units.append(piece)
+
+    def signal_score(item: tuple[int, str]) -> tuple[int, int]:
+        index, text = item
+        lower = text.lower()
+        score = sum(1 for term in _CONTEXTUAL_EVIDENCE_TERMS if term in lower)
+        return (-score, index)
+
+    selected: List[str] = []
+    selected_chars = 0
+    for _, text in sorted(enumerate(units), key=signal_score):
+        if len(selected) >= 24 or selected_chars + len(text) > 8000:
+            continue
+        selected.append(text)
+        selected_chars += len(text)
+
+    if exc is None:
+        log.info(
+            "Prepared contextual evidence locally: document=%r chunk=%s chars=%d "
+            "excerpts=%d",
+            chunk.document.name,
+            chunk.chunk_id,
+            len(chunk.text or ""),
+            len(selected),
+        )
+    else:
+        warning = (
+            f"LLM evidence extraction failed for contextual chunk {chunk.chunk_id}; "
+            f"preserved {len(selected)} bounded source excerpts instead and continued "
+            "without inferring authoritative requirements."
+        )
+        if warning not in chunk.document.warnings:
+            chunk.document.warnings.append(warning)
+        log.warning(
+            "Recovered contextual evidence without LLM; proposal generation will continue: "
+            "document=%r chunk=%s chars=%d excerpts=%d cause=%s",
+            chunk.document.name,
+            chunk.chunk_id,
+            len(chunk.text or ""),
+            len(selected),
+            type(exc).__name__,
+        )
+    return SourceEvidenceBatch(
+        source_document_id=chunk.document.document_id,
+        chunk_id=chunk.chunk_id,
+        context_facts=selected,
+        summary_points=selected[:6],
+    )
+
+
+def _build_contextual_reference_context(
+    documents: List[SourceDocument],
+    max_chars: int | None = None,
+) -> str:
+    """Keep supporting architecture research available to downstream agents.
+
+    Supporting references are intentionally not promoted to requirements.  The
+    ordinary understanding reduction can therefore omit their design detail;
+    this separate, labelled channel preserves bounded architecture excerpts for
+    visual and technology decisions in both the direct and chunked paths.
+    """
+    references = [document for document in documents if _is_contextual_document(document)]
+    if not references:
+        return ""
+    budget = max(4000, int(max_chars or getattr(settings, "contextual_reference_max_chars", 18000)))
+    lines = [
+        "ADVISORY SUPPORTING REFERENCE CONTEXT - use for architecture options and rationale only; "
+        "do not convert it into customer scope, a mandate, or a factual current-state claim."
+    ]
+    seen: set[str] = set()
+    used = len(lines[0])
+    for document in references:
+        heading = f"Supporting reference: {document.name}"
+        if used + len(heading) + 2 > budget:
+            break
+        lines.append(heading)
+        used += len(heading) + 1
+        for chunk in split_source_document(document, 16000):
+            evidence = _contextual_evidence_from_source(chunk)
+            for fact in evidence.context_facts:
+                clean = re.sub(r"\s+", " ", fact or "").strip()
+                key = clean.lower()
+                if not clean or key in seen:
+                    continue
+                item = "- " + clean
+                if used + len(item) + 1 > budget:
+                    return "\n".join(lines)
+                seen.add(key)
+                lines.append(item)
+                used += len(item) + 1
+    return "\n".join(lines)
 
 
 def _append_unique(items: List[str], item: str, limit: int = 8) -> None:
@@ -233,6 +401,10 @@ def enrich_understanding_risks(understanding: RFPUnderstanding) -> RFPUnderstand
 def extract_source_evidence(state: AgentState) -> Dict[str, Any]:
     """Reduce large RFP packages through bounded, source-aware extraction."""
     source_chars = len(state.rfp_text or "")
+    contextual_reference_context = _build_contextual_reference_context(
+        list(state.source_documents)
+    )
+    state.contextual_reference_context = contextual_reference_context
     if source_chars <= settings.understanding_direct_max_chars:
         log.info(
             "RFP package fits direct understanding budget (%d <= %d chars)",
@@ -241,7 +413,11 @@ def extract_source_evidence(state: AgentState) -> Dict[str, Any]:
         )
         state.source_evidence = []
         state.evidence_text = None
-        return {"source_evidence": [], "evidence_text": None}
+        return {
+            "source_evidence": [],
+            "evidence_text": None,
+            "contextual_reference_context": contextual_reference_context,
+        }
 
     documents = list(state.source_documents)
     if not documents:
@@ -283,6 +459,9 @@ def extract_source_evidence(state: AgentState) -> Dict[str, Any]:
             try:
                 indexed_results[index] = future.result()
             except Exception as exc:
+                if _is_contextual_document(chunk.document):
+                    indexed_results[index] = _contextual_evidence_from_source(chunk, exc)
+                    continue
                 raise RuntimeError(
                     "Evidence extraction failed for "
                     f"{chunk.document.name} ({chunk.chunk_id}, {len(chunk.text)} chars)"
@@ -305,7 +484,11 @@ def extract_source_evidence(state: AgentState) -> Dict[str, Any]:
     )
     state.source_evidence = evidence_batches
     state.evidence_text = evidence_text
-    return {"source_evidence": evidence_batches, "evidence_text": evidence_text}
+    return {
+        "source_evidence": evidence_batches,
+        "evidence_text": evidence_text,
+        "contextual_reference_context": contextual_reference_context,
+    }
 
 
 @_logged_node
@@ -369,7 +552,11 @@ def classify_sections(state: AgentState) -> Dict[str, Any]:
         rfp_focus_guide=rfp_focus_guide,
     )
     section_map = response_as_schema(
-        prompt, SectionTaxonomy, reasoning_effort=settings.reasoning_effort_medium
+        prompt,
+        SectionTaxonomy,
+        model=settings.model_fast,
+        reasoning_effort=settings.reasoning_effort_low,
+        background=False,
     )
     state.section_map = section_map.model_dump()
     return {"section_map": state.section_map}
@@ -383,10 +570,737 @@ def build_narrative(state: AgentState) -> Dict[str, Any]:
         rag_context=state.rag_context or "",
     )
     narrative = response_as_schema(
-        prompt, ExecutiveNarrative, reasoning_effort=settings.reasoning_effort_high
+        prompt,
+        ExecutiveNarrative,
+        reasoning_effort=settings.reasoning_effort_high,
+        background=False,
     )
     state.narrative = narrative
     return {"narrative": narrative}
+
+
+def _diagram_brief_input(
+    understanding: RFPUnderstanding | None,
+    narrative: ExecutiveNarrative | None,
+    section_map: Dict[str, Any] | None,
+    customer_technology_context: Dict[str, Any] | None = None,
+    contextual_reference_context: str = "",
+) -> Dict[str, Any]:
+    return {
+        "understanding": _compact_understanding_for_plan(understanding),
+        "narrative": narrative.model_dump() if narrative else {},
+        "sections": section_map or {},
+        "proposal_skeleton": _proposal_section_skeleton(understanding),
+        "customer_technology_context": customer_technology_context or {},
+        "contextual_reference_context": contextual_reference_context,
+    }
+
+
+def _technology_recommendation_input(
+    understanding: RFPUnderstanding | None,
+    customer_technology_context: Dict[str, Any] | None = None,
+    contextual_reference_context: str = "",
+) -> Dict[str, Any]:
+    """Keep the technology decision call grounded without unrelated narrative payload."""
+    relevant_section_ids = {
+        "sk_solution", "sk_arch", "sk_technical_arch", "sk_integration",
+        "sk_data_model", "sk_reporting", "sk_security", "sk_deployment", "sk_tech",
+    }
+    return {
+        "understanding": _compact_understanding_for_plan(understanding),
+        "proposal_architecture_sections": [
+            section for section in _proposal_section_skeleton(understanding)
+            if str(section.get("slide_id", "")) in relevant_section_ids
+        ],
+        "customer_technology_context": customer_technology_context or {},
+        "contextual_reference_context": contextual_reference_context,
+    }
+
+
+_INTERNAL_SOURCE_NOTE_TERMS = (
+    "for this run",
+    "bounded merged extract",
+    "blank or truncated",
+    "no customer addendum",
+    "no addendum",
+    "provided evidence",
+    "evidence extract",
+    "base brd-style source",
+    "effective authority",
+    "detail exists outside",
+    "extracted evidence",
+)
+
+
+def _is_internal_source_note(text: str | None) -> bool:
+    clean = re.sub(r"\s+", " ", (text or "").strip()).lower()
+    return bool(clean and any(term in clean for term in _INTERNAL_SOURCE_NOTE_TERMS))
+
+
+def _visible_assumptions(understanding: RFPUnderstanding | None) -> List[str]:
+    return [
+        item.strip()
+        for item in (getattr(understanding, "assumptions", []) or [])
+        if (item or "").strip() and not _is_internal_source_note(item)
+    ]
+
+
+_OPEN_VISUAL_DECISION_RE = re.compile(
+    r"\b(?:tbc|tbd|to be confirmed|to be agreed|subject to confirmation|"
+    r"unknown|unspecified)\b",
+    flags=re.I,
+)
+
+
+def _is_open_visual_decision(text: str | None) -> bool:
+    """Return True for unresolved wording that belongs outside a diagram."""
+    return bool(_OPEN_VISUAL_DECISION_RE.search(text or ""))
+
+
+def _source_grounded_technical_architecture_elements(
+    understanding: RFPUnderstanding | None,
+) -> tuple[List[str], List[str]]:
+    """Build a non-inferential fallback from exact source-derived content.
+
+    The visual-brief agent owns the layer taxonomy.  If that LLM call fails, this
+    helper supplies named technologies and scope statements only; it deliberately
+    does not substitute a standard Experience/API/Services/Data/Cloud hierarchy.
+    """
+    entities: List[str] = []
+    flows: List[str] = []
+    seen_entities: set[str] = set()
+    seen_flows: set[str] = set()
+
+    def add_entity(value: str | None) -> None:
+        clean = _clip(re.sub(r"\s+", " ", value or "").strip(), 110)
+        key = clean.lower()
+        if clean and key not in seen_entities:
+            seen_entities.add(key)
+            entities.append(clean)
+
+    def add_flow(value: str | None) -> None:
+        clean = _clip(re.sub(r"\s+", " ", value or "").strip(), 150)
+        key = clean.lower()
+        if clean and key not in seen_flows:
+            seen_flows.add(key)
+            flows.append(clean)
+
+    for item in (getattr(understanding, "software_bill_of_materials", []) or []):
+        component = (getattr(item, "component", "") or "").strip()
+        category = (getattr(item, "category", "") or "").strip()
+        if component and not _is_excluded_solution_tool(component, understanding):
+            add_entity(f"{category}: {component}" if category else component)
+    for technology in (
+        list(getattr(understanding, "solution_technologies", []) or [])
+        + list(getattr(understanding, "key_technologies", []) or [])
+    ):
+        if not _is_excluded_solution_tool(technology, understanding):
+            add_entity(technology)
+    for item in (getattr(understanding, "in_scope_work", []) or []):
+        add_entity(item)
+    for requirement in (getattr(understanding, "requirements", []) or []):
+        text = (getattr(requirement, "text", "") or "").strip()
+        if any(
+            signal in text.lower()
+            for signal in (
+                "source", "interface", "integration", "api", "event", "file",
+                "workflow", "data", "document", "report", "security", "identity",
+                "deploy", "hosting", "cloud", "availability", "recovery",
+            )
+        ):
+            add_flow(text)
+    if len(entities) < 4:
+        add_entity(getattr(understanding, "project_scope", ""))
+        add_entity(getattr(understanding, "summary", ""))
+    return entities[:8], flows[:5]
+
+
+def _fallback_visual_briefs(understanding: RFPUnderstanding | None) -> List[DiagramBrief]:
+    """Build exact, type-safe briefs for required proposal visuals."""
+    if understanding is None:
+        return []
+    customer = _customer_label(understanding)
+    techs = _extract_tech_terms(understanding, limit=8)
+    scope = [item for item in (getattr(understanding, "in_scope_work", []) or []) if item][:5]
+    requirements = [r for r in (getattr(understanding, "requirements", []) or []) if getattr(r, "text", "")]
+    req_refs = [
+        getattr(r, "source_ref", None) or getattr(r, "id", "")
+        for r in requirements[:6]
+        if (getattr(r, "source_ref", None) or getattr(r, "id", ""))
+    ]
+    entities = [customer] + techs + [_clip(item, 70) for item in scope[:4]]
+    flows = [
+        _clip(r.text, 120)
+        for r in requirements
+        if any(t in r.text.lower() for t in ("integration", "interface", "data", "api", "file", "report"))
+    ][:5]
+    controls = [
+        _clip(r.text, 120)
+        for r in requirements
+        if any(t in r.text.lower() for t in ("security", "audit", "monitor", "availability", "backup", "access"))
+    ][:5]
+    base_entities = [e for e in entities if e][:8]
+    for label in ("Customer users", "Solution services", "Governed data", "Approved outputs"):
+        if len(base_entities) >= 4:
+            break
+        base_entities.append(label)
+    base_flows = flows[:5] or [
+        "Source inputs -> validation and business rules -> governed data",
+        "Governed data -> application/API services -> approved outputs",
+    ]
+    if len(base_flows) == 1:
+        base_flows.append("Operational events -> monitoring and support -> controlled resolution")
+    assumptions = _visible_assumptions(understanding)[:4]
+    common = dict(
+        evidence_refs=req_refs,
+        open_assumptions=assumptions,
+        must_not_show=["generic stock diagram", "procurement or submission portals", "invented technologies"],
+    )
+    separate_hadr = _has_explicit_hadr_need(understanding)
+    deployment_entities = [
+        "Build and release pipeline", "Development/test environment", "UAT environment",
+        "Production application runtime", "Production integration/API runtime",
+        "Production data services", "Identity boundary", "Monitoring and support",
+    ]
+    deployment_flows = [
+        "Versioned artifact -> automated assurance -> controlled promotion -> production",
+        "Users and source systems -> secured ingress -> application/API runtime -> data services",
+        "Runtime and data services -> logs, metrics and audit events -> monitoring and support",
+    ]
+    if not separate_hadr:
+        deployment_entities.extend(["Backup repository", "Recovery environment"])
+        deployment_flows.append("Production data -> verified backup -> restore or recovery environment")
+    scope_text = " ".join([
+        getattr(understanding, "summary", "") or "",
+        getattr(understanding, "project_scope", "") or "",
+        " ".join(getattr(understanding, "in_scope_work", []) or []),
+        " ".join(getattr(requirement, "text", "") or "" for requirement in requirements),
+    ]).lower()
+    if any(token in scope_text for token in ("catalogue", "catalog ", "product", "sku")):
+        data_model_entities = [
+            "Product, service and SKU catalogue",
+            "Customer requirements and briefs",
+            "Solution packages and shortlists",
+            "Validation and compliance outcomes",
+            "Pricing and commercial decisions",
+            "Approved content and enquiries",
+            "Domain owners and stewards",
+            "Data quality, lineage and audit",
+        ]
+        data_model_flows = [
+            "Regional and business-unit records -> validation and mapping -> mastered catalogue",
+            "Customer brief -> matching and shortlisting -> solution package",
+            "Solution package -> compliance, feasibility and pricing -> approved outcome",
+            "Domain change -> owner and steward approval -> versioned publication",
+        ]
+    else:
+        data_model_entities = [
+            "Authoritative source records",
+            "Master and reference domains",
+            "Operational transaction and event domains",
+            "Decision and validation evidence",
+            "Governed analytical and consumer products",
+            "Domain owners and stewards",
+            "Data quality, lineage and audit",
+        ]
+    data_model_flows = [
+            "Authoritative sources -> validation and mapping -> canonical domains",
+            "Canonical domains -> operational decisions and evidence -> governed outputs",
+            "Domain change -> owner and steward approval -> versioned publication",
+        ]
+    technical_architecture_entities, technical_architecture_flows = (
+        _source_grounded_technical_architecture_elements(understanding)
+    )
+    briefs: List[DiagramBrief] = [
+        DiagramBrief(
+            slide_id="sk_solution", title="Proposed solution at a glance", visual_type="generic",
+            purpose="Summarise the proposal-specific solution building blocks and value flow.",
+            entities=base_entities, flows=base_flows[:3], controls=controls[:4], must_show=scope[:4], **common,
+        ),
+        DiagramBrief(
+            slide_id="sk_flow", title="End-to-end solution flow", visual_type="process",
+            purpose="Show the proposal-specific journey from source inputs through controls to approved outcomes.",
+            entities=base_entities, flows=base_flows, controls=controls[:4], must_show=scope[:4], **common,
+        ),
+        DiagramBrief(
+            slide_id="sk_arch", title="Concrete solution architecture", visual_type="architecture",
+            purpose="Show how proposal capabilities, systems, data and controls form the target solution.",
+            entities=base_entities, flows=base_flows, controls=controls[:6], must_show=scope[:4], **common,
+        ),
+        DiagramBrief(
+            slide_id="sk_technical_arch",
+            title="Layered technical architecture connects systems, products and custom services",
+            visual_type="technical_architecture",
+            purpose=(
+                "Show the proposed technical layers, external systems and their data, COTS/build/integrate "
+                "boundaries, platform services and cross-cutting controls."
+            ),
+            entities=technical_architecture_entities,
+            flows=technical_architecture_flows,
+            controls=(controls[:4] or ["Identity and access", "Audit and lineage", "Monitoring and support"]),
+            must_show=scope[:4],
+            **common,
+        ),
+        DiagramBrief(
+            slide_id="sk_integration", title="Integration architecture connects source and consumer systems", visual_type="architecture",
+            purpose="Show named interfaces, source/consumer boundaries, validation, error handling and directional exchange.",
+            entities=base_entities, flows=base_flows, controls=(controls[:4] or ["Authentication and authorization", "Audit and error handling"]), **common,
+        ),
+        DiagramBrief(
+            slide_id="sk_data_model", title="Core data domains and ownership", visual_type="data_model",
+            purpose="Show the canonical data domains, their relationships, and accountable ownership and stewardship boundaries.",
+            entities=data_model_entities,
+            flows=data_model_flows,
+            controls=["Authoritative source", "Named domain owner", "Steward approval", "Quality, lineage and audit"],
+            **common,
+        ),
+        DiagramBrief(
+            slide_id="sk_reporting",
+            title="One governed semantic layer serves decision-ready reporting",
+            visual_type="process",
+            purpose=(
+                "Show a simple lineage from trusted catalogue and operational data through governed measures "
+                "to four decision audiences; make the business message obvious without a dense report matrix."
+            ),
+            entities=[
+                "Trusted catalogue, pricing, availability and workflow data",
+                "Quality and reconciliation controls",
+                "Governed semantic measures",
+                "Operational dashboards",
+                "Commercial and pricing insights",
+                "Compliance and data-quality evidence",
+                "Executive outcome reporting",
+            ],
+            flows=[
+                "Trusted domain data -> quality controls -> governed semantic measures",
+                "Governed semantic measures -> role-based dashboards and evidence",
+                "Reporting insight -> owner action -> corrected governed data",
+            ],
+            controls=["Metric ownership", "Role-based access", "Lineage and refresh monitoring"],
+            **common,
+        ),
+        DiagramBrief(
+            slide_id="sk_deployment", title="Deployment and resilience protect operations", visual_type="deployment",
+            purpose="Show environment separation, production runtime topology, controlled promotion, secured access, telemetry and support boundaries.",
+            entities=deployment_entities,
+            flows=deployment_flows,
+            controls=(controls[:5] or ["Identity and access", "Release approval", "Monitoring and audit"]), **common,
+        ),
+        DiagramBrief(
+            slide_id="sk_roadmap", title="Agile roadmap releases value through increments", visual_type="timeline",
+            purpose="Show proposed increments, feedback, assurance and release-readiness gates.",
+            entities=["Mobilisation and backlog", "Architecture runway", "Incremental releases", "Integrated assurance", "Transition and improvement"],
+            flows=["Mobilisation -> thin end-to-end increment -> customer demonstration", "Feedback -> reprioritised backlog -> next release", "Assurance evidence -> release decision"],
+            controls=["Customer feedback", "Security/testing gates", "Operational readiness"], **common,
+        ),
+        DiagramBrief(
+            slide_id="sk_testing",
+            title="Acceptance evidence proves the solution is ready",
+            visual_type="testing",
+            purpose="Show requirement-led evidence streams converging on customer acceptance and release readiness.",
+            entities=[
+                "Requirement and acceptance traceability",
+                "Unit, API and contract evidence",
+                "Interface and data reconciliation evidence",
+                "End-to-end, performance and security evidence",
+                "Customer UAT evidence",
+                "Operational-readiness and cutover evidence",
+                "Release decision and evidence pack",
+            ],
+            flows=[
+                "Acceptance criteria -> automated and integrated evidence streams",
+                "Evidence streams -> defect/retest feedback -> accepted evidence pack",
+                "Accepted evidence pack -> customer release decision",
+            ],
+            controls=["Named acceptance owner", "Defect and retest traceability", "No release without agreed evidence"],
+            **common,
+        ),
+        DiagramBrief(
+            slide_id="sk_governance", title="Product-aligned squads combine business and engineering ownership", visual_type="org",
+            purpose="Show proposed decision rights and collaboration between customer ownership, delivery and enabling governance.",
+            entities=["Customer Product Owner", "Business SMEs", "Cross-functional product squad", "Architecture/security/data chapters", "Steering forum"],
+            flows=["Product Owner and SMEs -> prioritised outcomes -> product squad", "Product squad -> demonstrations and evidence -> customer feedback", "Escalated decisions -> steering forum -> resolved dependencies"],
+            controls=["Architecture and security standards", "RAID and dependency decisions", "Outcome reporting"], **common,
+        ),
+    ]
+    if _has_explicit_hadr_need(understanding):
+        briefs.append(DiagramBrief(
+            slide_id="auto_ha_and_dr_protect_business_continuity",
+            title="HA and DR protect business continuity",
+            visual_type="hadr",
+            purpose="Show availability, replication, backup, failover and recovery responsibilities without inventing RTO/RPO values.",
+            entities=["Primary application/runtime", "Redundant runtime", "Primary data store", "Replicated/backup data", "Monitoring and operations"],
+            flows=["Primary runtime -> redundant runtime failover", "Primary data -> replication/backup -> restore or DR", "Health event -> alert -> controlled failover and recovery"],
+            controls=(controls[:5] or ["Health monitoring", "Backup verification", "Recovery testing"]),
+            must_not_show=["data model", "business process flow", "invented RTO/RPO commitments"],
+            evidence_refs=req_refs,
+            open_assumptions=assumptions,
+        ))
+    return briefs
+
+
+@_logged_node
+def derive_visual_briefs(state: AgentState) -> Dict[str, Any]:
+    """Analyze the proposal and decide which visuals are genuinely grounded."""
+    input_json = json.dumps(
+        _diagram_brief_input(
+            state.understanding,
+            state.narrative,
+            state.section_map,
+            state.customer_technology_context,
+            state.contextual_reference_context,
+        ),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    prompt = VISUAL_BRIEF_PROMPT.format(input_json=input_json)
+    try:
+        brief_set = response_as_schema(
+            prompt,
+            DiagramBriefSet,
+            reasoning_effort=settings.reasoning_effort_medium,
+            timeout_seconds=float(getattr(settings, "deck_plan_timeout_s", 600.0) or 600.0),
+            background=False,
+        )
+        briefs = list(brief_set.briefs)
+        supplements = _fallback_visual_briefs(state.understanding)
+        existing = {
+            (re.sub(r"^(sk|auto|fallback)_", "", (brief.slide_id or "").lower()), brief.visual_type)
+            for brief in briefs
+        }
+        for brief in supplements:
+            key = (re.sub(r"^(sk|auto|fallback)_", "", (brief.slide_id or "").lower()), brief.visual_type)
+            if key not in existing:
+                briefs.append(brief)
+                existing.add(key)
+    except Exception:
+        log.warning("Visual brief LLM call failed; using deterministic visual briefs.", exc_info=True)
+        briefs = _fallback_visual_briefs(state.understanding)
+    state.visual_briefs = briefs
+    return {"visual_briefs": briefs}
+
+
+def _align_recommendations_to_customer_platform(
+    recommendations: TechnologyRecommendationSet,
+    customer_technology_context: Dict[str, Any] | None,
+) -> TechnologyRecommendationSet:
+    """Apply an explicit customer platform choice as the final provider guard."""
+    context = customer_technology_context or {}
+    platform = str(context.get("platform") or "").strip()
+    status = str(context.get("status") or "").strip().lower()
+    customer_provider = _selected_provider_family(platform)
+    if (
+        not customer_provider
+        or status not in {"customer-preferred", "customer-mandated", "existing estate"}
+    ):
+        return recommendations
+
+    prior_platform = recommendations.selected_platform
+    recommendations.selected_platform = platform
+    if recommendations.hosting_model == "customer-decision":
+        recommendations.hosting_model = "public-cloud"
+    recommendations.recommendations = [
+        item for item in recommendations.recommendations
+        if not _conflicts_with_selected_provider(
+            f"{item.proposed_technology} {item.technology_category}",
+            customer_provider,
+        )
+    ]
+    recommendations.component_decisions = [
+        item for item in recommendations.component_decisions
+        if not _conflicts_with_selected_provider(
+            f"{item.recommendation} {item.role}",
+            customer_provider,
+        )
+    ]
+    recommendations.platform_assumptions = [
+        item for item in recommendations.platform_assumptions
+        if not _conflicts_with_selected_provider(item, customer_provider)
+    ]
+    if _conflicts_with_selected_provider(
+        recommendations.deployment_rationale,
+        customer_provider,
+    ) or _selected_provider_family(prior_platform) not in {"", customer_provider}:
+        recommendations.deployment_rationale = (
+            f"{platform} is the {status.replace('-', ' ')} platform supplied by the customer."
+        )
+    if _conflicts_with_selected_provider(
+        recommendations.primary_region_strategy,
+        customer_provider,
+    ):
+        recommendations.primary_region_strategy = ""
+    return recommendations
+
+
+def _source_grounded_region_strategy(
+    customer_technology_context: Dict[str, Any] | None,
+    contextual_reference_context: str = "",
+) -> str:
+    """Preserve an explicit primary/recovery region statement without inferring one."""
+    details = str((customer_technology_context or {}).get("details") or "").strip()
+    # Supporting research may inform the LLM recommendation, but the emergency
+    # fallback must not elevate an advisory example into a selected topology.
+    source = details
+    if not source:
+        return ""
+    sentences = [
+        re.sub(r"\s+", " ", item).strip()
+        for item in re.split(r"(?<=[.!?])\s+|[\r\n]+", source)
+        if (item or "").strip()
+    ]
+    explicit = [
+        sentence for sentence in sentences
+        if re.search(r"\bprimary\b", sentence, flags=re.I)
+        and re.search(r"\b(?:secondary|recovery|dr)\b", sentence, flags=re.I)
+        and re.search(r"\b(?:region|location|geograph)\w*\b", sentence, flags=re.I)
+    ]
+    return _clip(" ".join(explicit[:2]), 320) if explicit else ""
+
+
+def _source_grounded_technology_fallback(
+    understanding: RFPUnderstanding | None,
+    customer_technology_context: Dict[str, Any] | None,
+    contextual_reference_context: str = "",
+) -> TechnologyRecommendationSet:
+    """Degrade safely to named source technologies; never select a default stack."""
+    context = customer_technology_context or {}
+    platform = str(context.get("platform") or "").strip()
+    if platform.lower() == "not specified":
+        platform = ""
+    provider = _selected_provider_family(platform)
+    if not platform:
+        source_techs = list(getattr(understanding, "solution_technologies", []) or [])
+        provider = _cloud_signal(" ".join(source_techs))
+        platform = {
+            "azure": "Microsoft Azure",
+            "aws": "Amazon Web Services (AWS)",
+            "gcp": "Google Cloud Platform",
+        }.get(provider, "")
+
+    hosting_model = "customer-decision"
+    normalized_platform = platform.lower()
+    if provider:
+        hosting_model = "public-cloud"
+    elif "private cloud" in normalized_platform or "on-prem" in normalized_platform:
+        hosting_model = "private-cloud" if "private cloud" in normalized_platform else "on-premises"
+    elif "hybrid" in normalized_platform:
+        hosting_model = "hybrid"
+
+    recommendations: List[TechnologyRecommendation] = []
+    seen: set[str] = set()
+    for item in (getattr(understanding, "software_bill_of_materials", []) or []):
+        technology = (getattr(item, "component", "") or "").strip()
+        if not technology or _is_excluded_solution_tool(technology, understanding):
+            continue
+        category = (getattr(item, "category", "") or "Source-referenced technology").strip()
+        role = (getattr(item, "purpose", "") or "Role described in the supplied proposal material").strip()
+        basis = (getattr(item, "source_or_basis", "") or "Named in supplied material; authority and fit require validation").strip()
+        basis_lower = basis.lower()
+        status = (
+            "RFP-mandated" if any(term in basis_lower for term in ("mandat", "required", "must"))
+            else "RFP-referenced" if "rfp" in basis_lower
+            else "customer-decision"
+        )
+        sourcing_model = (
+            "COTS/SaaS" if any(term in category.lower() for term in ("cots", "saas", "product"))
+            else "customer-decision"
+        )
+        recommendations.append(TechnologyRecommendation(
+            architecture_layer=category,
+            proposed_technology=technology,
+            technology_category=category,
+            role=role,
+            status=status,
+            rationale=basis,
+            sourcing_model=sourcing_model,
+            build_vs_buy_rationale="Preserve the named source technology until the architecture agent validates its role and sourcing decision.",
+        ))
+        seen.add(technology.lower())
+
+    for technology in (
+        list(getattr(understanding, "solution_technologies", []) or [])
+        + list(getattr(understanding, "key_technologies", []) or [])
+    ):
+        technology = (technology or "").strip()
+        if (
+            not technology
+            or technology.lower() in seen
+            or _is_excluded_solution_tool(technology, understanding)
+        ):
+            continue
+        recommendations.append(TechnologyRecommendation(
+            architecture_layer="Source-referenced technology",
+            proposed_technology=technology,
+            technology_category="Named technology requiring role classification",
+            role="Role and architecture layer must be derived from the supplied requirements before proposal use",
+            status="RFP-referenced",
+            rationale="The technology is present in the structured proposal understanding; no additional product choice is inferred.",
+            sourcing_model="customer-decision",
+            build_vs_buy_rationale="No sourcing decision is inferred by the fallback path.",
+        ))
+        seen.add(technology.lower())
+
+    status = str(context.get("status") or "").strip().lower()
+    details = str(context.get("details") or "").strip()
+    deployment_rationale = ""
+    if platform:
+        deployment_rationale = (
+            f"{platform} was supplied before Step 1 as {status.replace('-', ' ') or 'customer technology context'}."
+            + (f" Customer detail: {_clip(details, 180)}." if details else "")
+        )
+    return TechnologyRecommendationSet(
+        recommendations=recommendations,
+        component_decisions=[],
+        hosting_model=hosting_model,
+        selected_platform=platform,
+        deployment_rationale=deployment_rationale,
+        primary_region_strategy=_source_grounded_region_strategy(
+            customer_technology_context,
+            contextual_reference_context,
+        ),
+    )
+
+
+def _complete_technology_recommendations(
+    recommendations: TechnologyRecommendationSet,
+    fallback: TechnologyRecommendationSet,
+) -> TechnologyRecommendationSet:
+    """Merge source-named items and explicit context without adding default products."""
+    existing = " ".join(
+        f"{item.architecture_layer} {item.technology_category} {item.proposed_technology}"
+        for item in recommendations.recommendations
+    ).lower()
+    for item in fallback.recommendations:
+        item_text = f"{item.architecture_layer} {item.technology_category} {item.proposed_technology}".lower()
+        if (item.proposed_technology or "").strip().lower() in existing:
+            continue
+        recommendations.recommendations.append(item)
+        existing += " " + item_text
+    if not recommendations.component_decisions:
+        recommendations.component_decisions = fallback.component_decisions
+    if not recommendations.selected_platform:
+        recommendations.selected_platform = fallback.selected_platform
+    if recommendations.hosting_model == "customer-decision":
+        recommendations.hosting_model = fallback.hosting_model
+    if not recommendations.deployment_rationale:
+        recommendations.deployment_rationale = fallback.deployment_rationale
+    if not recommendations.primary_region_strategy:
+        recommendations.primary_region_strategy = fallback.primary_region_strategy
+    return recommendations
+
+
+def _technology_recommendation_quality_issues(
+    recommendations: TechnologyRecommendationSet,
+    understanding: RFPUnderstanding | None,
+) -> List[str]:
+    """Identify missing proposal-relevant decisions without prescribing products."""
+    usable = [
+        item for item in (recommendations.recommendations or [])
+        if (item.proposed_technology or "").strip()
+        and "no product selected" not in item.proposed_technology.lower()
+        and item.proposed_technology.lower() not in {
+            "application service", "database capability", "cloud service",
+            "catalogue platform", "integration capability",
+        }
+    ]
+    issues: List[str] = []
+    if len(usable) < 5:
+        issues.append("fewer than five concrete technology/product decisions")
+    scope = _understanding_text(understanding).lower()
+    recommendation_text = " ".join(
+        f"{item.architecture_layer} {item.technology_category} {item.role}"
+        for item in usable
+    ).lower()
+    expected = [
+        (("portal", "web", "mobile", "user experience", "ui "), ("frontend", "web ui", "experience", "user interface"), "required user-experience technology"),
+        (("api", "workflow", "application", "business service"), ("backend", "api", "application framework", "service runtime"), "required API/application implementation technology"),
+        (("integration", "interface", "sftp", "event", "message"), ("integration", "api management", "message", "event", "connector"), "required integration technology"),
+        (("data", "database", "catalog", "repository", "master data"), ("database", "data store", "repository", "lake", "master data"), "required data technology"),
+        (("test", "uat", "quality", "acceptance"), ("test", "quality"), "required quality-engineering toolchain"),
+        (("deploy", "release", "devops", "pipeline", "infrastructure"), ("deploy", "ci/cd", "devops", "infrastructure as code", "runtime"), "required deployment/DevSecOps technology"),
+    ]
+    for scope_signals, recommendation_signals, label in expected:
+        if any(signal in scope for signal in scope_signals) and not any(
+            signal in recommendation_text for signal in recommendation_signals
+        ):
+            issues.append(label)
+    return issues
+
+
+@_logged_node
+def derive_technology_recommendations(state: AgentState) -> Dict[str, Any]:
+    """Select a concrete stack independently from proposal constraints."""
+    input_json = json.dumps(
+        _technology_recommendation_input(
+            state.understanding,
+            state.customer_technology_context,
+            state.contextual_reference_context,
+        ),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    llm_completed = False
+    try:
+        recommendations = response_as_schema(
+            TECHNOLOGY_RECOMMENDATION_PROMPT.format(input_json=input_json),
+            TechnologyRecommendationSet,
+            reasoning_effort=settings.reasoning_effort_medium,
+            timeout_seconds=float(getattr(settings, "deck_plan_timeout_s", 600.0) or 600.0),
+            background=True,
+        )
+        llm_completed = True
+    except Exception:
+        log.warning(
+            "Technology recommendation LLM call failed; preserving only source-named technologies and customer context.",
+            exc_info=True,
+        )
+        recommendations = TechnologyRecommendationSet()
+    recommendations = _align_recommendations_to_customer_platform(
+        recommendations,
+        state.customer_technology_context,
+    )
+    issues = _technology_recommendation_quality_issues(
+        recommendations,
+        state.understanding,
+    )
+    if llm_completed and issues:
+        repair_prompt = (
+            TECHNOLOGY_RECOMMENDATION_PROMPT.format(input_json=input_json)
+            + "\n\nREPAIR REQUIRED:\nThe previous result was incomplete for this proposal: "
+            + "; ".join(issues)
+            + ". Re-derive the complete stack and applicable architecture layers from INPUT_JSON. "
+            "Do not fill the gaps with a familiar default stack. Preserve justified prior decisions and return a complete replacement object.\n"
+            + json.dumps(recommendations.model_dump(), ensure_ascii=False, separators=(",", ":"))
+        )
+        try:
+            repaired = response_as_schema(
+                repair_prompt,
+                TechnologyRecommendationSet,
+                reasoning_effort=settings.reasoning_effort_medium,
+                timeout_seconds=float(getattr(settings, "deck_plan_timeout_s", 600.0) or 600.0),
+                background=True,
+            )
+            recommendations = _align_recommendations_to_customer_platform(
+                repaired,
+                state.customer_technology_context,
+            )
+        except Exception:
+            log.warning(
+                "Technology recommendation repair call failed; retaining the source-grounded initial result.",
+                exc_info=True,
+            )
+    fallback = _source_grounded_technology_fallback(
+        state.understanding,
+        state.customer_technology_context,
+        state.contextual_reference_context,
+    )
+    recommendations = _complete_technology_recommendations(recommendations, fallback)
+    recommendations = _align_recommendations_to_customer_platform(
+        recommendations,
+        state.customer_technology_context,
+    )
+    state.technology_recommendations = recommendations
+    return {"technology_recommendations": recommendations}
 
 
 def derive_sections(state: AgentState) -> Dict[str, Any]:
@@ -575,49 +1489,30 @@ def _extract_tech_terms(understanding: Optional[RFPUnderstanding], limit: int = 
 
 
 def _recommended_architecture_tech_terms(understanding: Optional[RFPUnderstanding]) -> List[str]:
-    """Fill implementation gaps with a qualified ecosystem-aligned reference stack."""
-    if understanding is None:
-        return []
-    explicit = _extract_tech_terms(understanding, limit=20)
-    corpus = " ".join(explicit + [_understanding_text(understanding)]).lower()
-    cloud = _cloud_signal(corpus)
-    is_data = _is_data_platform_engagement(understanding)
-    if is_data:
-        if cloud == "aws":
-            return ["AWS Glue/Step Functions", "AWS Lambda/ECS", "API Gateway/EventBridge/SQS", "S3/Lake Formation/Redshift", "CloudWatch/Security Hub"]
-        if cloud == "gcp":
-            return ["Cloud Data Fusion/Dataflow", "Cloud Run/Cloud Functions", "Apigee/Pub/Sub", "Cloud Storage/BigQuery", "Cloud Logging/Monitoring"]
-        if cloud == "azure":
-            return [
-                "Fabric Data Factory pipelines",
-                "Fabric OneLake Lakehouse/Warehouse",
-                "Fabric Dataflow Gen2/notebooks",
-                "Azure Functions/Logic Apps",
-                "Azure API Management/Service Bus",
-                "Power BI",
-                "Microsoft Entra ID/Key Vault",
-                "Azure Monitor/Application Insights/Sentinel",
-            ]
-        return []
-    # Application / platform engagement: container, data store, messaging, delivery.
-    if cloud == "azure":
-        return ["Azure Kubernetes Service (AKS)", "Azure Database for PostgreSQL", "Azure Service Bus/Event Hubs", "Azure Cache for Redis", "Azure Blob Storage/Front Door", "Microsoft Entra ID/Key Vault", "Azure Monitor or Datadog", "GitHub Actions/Terraform"]
-    if cloud == "aws":
-        return ["Amazon EKS", "Amazon RDS/Aurora PostgreSQL", "Amazon MSK/SNS/SQS", "Amazon ElastiCache (Redis)", "Amazon S3/CloudFront", "IAM/Secrets Manager/KMS", "CloudWatch or Datadog", "GitHub Actions/Terraform"]
-    if cloud == "gcp":
-        return ["Google Kubernetes Engine (GKE)", "Cloud SQL for PostgreSQL", "Pub/Sub", "Memorystore (Redis)", "Cloud Storage/Cloud CDN", "Cloud IAM/Secret Manager", "Cloud Monitoring or Datadog", "Cloud Build/Terraform"]
+    """Do not inject a preselected stack into proposal-grounded diagrams.
+
+    Technology recommendations belong to the LLM deck-planning decision, where
+    the complete requirements and trade-offs are available. Diagram grounding
+    uses only technologies extracted from authoritative proposal content.
+    """
     return []
 
 
-def _diagram_context(understanding: Optional[RFPUnderstanding]) -> str:
+def _diagram_context(
+    understanding: Optional[RFPUnderstanding],
+    *,
+    include_technologies: bool = True,
+) -> str:
     """Build a short, grounded context string for diagram prompts."""
     if understanding is None:
         return ""
     customer = getattr(understanding, "customer_name", None) or "the client"
-    techs = _extract_tech_terms(understanding, limit=10)
-    for proposed in _recommended_architecture_tech_terms(understanding):
-        if proposed.lower() not in {item.lower() for item in techs}:
-            techs.append(proposed)
+    techs: List[str] = []
+    if include_technologies:
+        techs = _extract_tech_terms(understanding, limit=10)
+        for proposed in _recommended_architecture_tech_terms(understanding):
+            if proposed.lower() not in {item.lower() for item in techs}:
+                techs.append(proposed)
     techs = techs[:10]
     parts = [f"Client: {customer}."]
     scope = (getattr(understanding, "project_scope", "") or "").strip()
@@ -636,12 +1531,21 @@ def _diagram_context(understanding: Optional[RFPUnderstanding]) -> str:
 
 
 _SAFE_MARGIN_NOTE = (
-    "This diagram will be displayed at roughly 7.5 by 5 inches on a 16:9 slide. "
+    "This diagram will be displayed at roughly 12 by 5.5 inches on a 16:9 slide. "
     "Style: consulting-grade, white background, readable 18pt+ labels, minimal clutter, "
-    "no logos, no gradients, no sketch effects. Use at most 12 primary nodes, no more than "
-    "two text lines per node, and no descriptive paragraphs, footnotes, or tiny legends. "
+    "no logos, no gradients, no sketch effects. Use at most 8 primary groups and 10 labeled "
+    "boxes in total, with no more than two short text lines per box. Do not add an internal "
+    "diagram title, descriptive paragraphs, footnotes, citations, evidence references, reviewer "
+    "context, source-processing notes, assumption sidebars, or legends unless essential. "
+    "Translate requirements into confident proposed-solution labels. Never reproduce 'the platform "
+    "shall', 'the system shall', 'should', or 'must' statements, and never show requirement text as "
+    "input panels. Use active target-state wording such as 'Catalogue consolidation' or 'The solution "
+    "consolidates'. The image is unacceptable if it contains more than 10 labeled boxes. "
+    "Show the proposed solution only. Keep open decisions, assumptions, dependencies, placeholder "
+    "labels, and customer-confirmation qualifiers out of the image; place them on the Assumptions "
+    "and Dependencies slide instead. "
     "Keep labels to five words where possible. Use labeled boxes with directional arrows. "
-    "Keep all text and shapes inside a 5–8% safe margin; do not place content at the edges."
+    "Keep all text and shapes inside a 5-8% safe margin; do not place content at the edges."
 )
 
 
@@ -660,7 +1564,7 @@ def _matched_requirement_texts(
     for text in candidates:
         clean = re.sub(r"\s+", " ", (text or "").strip())
         if clean and any(term in clean.lower() for term in terms) and clean not in result:
-            result.append(_clip(clean, 165))
+            result.append(clean)
         if len(result) >= limit:
             break
     return result
@@ -675,12 +1579,12 @@ def _testing_proposal_points(understanding: Optional[RFPUnderstanding]) -> List[
     )
     functionality = _matched_requirement_texts(
         understanding,
-        ("iccms", "functional", "pre-set", "workflow", "operational process", "milestone", "sla"),
+        ("testing", "test ", "acceptance", "uat", "sit", "functional parity", "regression", "cutover", "cut over", "replace "),
         3,
     )
     controls = _matched_requirement_texts(
         understanding,
-        ("security", "access", "audit", "performance", "availability", "accuracy", "reconciliation", "retention"),
+        ("security", "access", "audit", "performance", "high availability", "uptime", "resilience", "recovery", "accuracy", "reconciliation", "retention"),
         3,
     )
     return [
@@ -750,17 +1654,50 @@ def _ams_proposal_points(understanding: Optional[RFPUnderstanding]) -> List[Bull
     ]
 
 
-def _build_diagram_prompt(kind: str, understanding: Optional[RFPUnderstanding]) -> str:
+def _build_diagram_prompt(
+    kind: str,
+    understanding: Optional[RFPUnderstanding],
+    technology_recommendations: TechnologyRecommendationSet | None = None,
+) -> str:
     """Create a context-rich diagram prompt grounded in the RFP.
 
-    `kind` is one of: architecture, delivery, timeline, team, solution, testing, ams.
+    `kind` is one of: architecture, technical_architecture, data_model,
+    delivery, timeline, team, solution, testing, ams.
     """
-    ctx = _diagram_context(understanding)
-    techs = _extract_tech_terms(understanding)
+    has_authoritative_platform = bool(
+        technology_recommendations is not None
+        and (technology_recommendations.selected_platform or "").strip()
+        and kind in {"technical_architecture", "deployment", "hadr"}
+    )
+    ctx = _diagram_context(
+        understanding,
+        include_technologies=not has_authoritative_platform,
+    )
+    techs = [] if has_authoritative_platform else _extract_tech_terms(understanding)
     tech_clause = (" featuring " + ", ".join(techs)) if techs else ""
     ai_clause = _ai_ml_architecture_clause(understanding)
 
-    if kind == "architecture":
+    if kind == "integration":
+        interface_details = _matched_requirement_texts(
+            understanding,
+            ("integration", "interface", "api", "rest", "soap", "sftp", "file", "csv", "xlsx", "webhook", "event", "queue", "source", "external"),
+            8,
+        )
+        grounded = "\nGrounded interface requirements:\n- " + "\n- ".join(interface_details) if interface_details else ""
+        body = (
+            "Create a concrete integration architecture, not a capability map. Lay it out left to right as "
+            "named internal and external source systems -> labelled interface channels and protocols -> secured "
+            "ingress and integration services -> validation, transformation, orchestration, retry/dead-letter and "
+            "reconciliation controls -> catalogue/core services -> named consumers and external systems. Label every "
+            "connection with direction and the protocol or exchange mechanism where known, and distinguish inbound, "
+            "outbound and bidirectional flows. Show API management, file/SFTP intake, messaging/events, identity, "
+            "monitoring and error handling only when relevant. Never invent source-system names, protocols, frequencies "
+            "or products. When a system or protocol is unnamed, use a role-based label such as "
+            "'Source system' or 'Approved interface' instead of an unresolved-status placeholder. "
+            "Do not use business capabilities as source systems."
+            + grounded
+        )
+    elif kind == "architecture":
         body = (
             f"Create a concrete solution architecture diagram{tech_clause}. Show source systems "
             "and document inputs, ingestion/extraction, validation and business rules, operational "
@@ -768,29 +1705,104 @@ def _build_diagram_prompt(kind: str, understanding: Optional[RFPUnderstanding]) 
             "reporting/BI, security, monitoring, and support boundaries. For a data hub, make the "
             "data pipeline explicit: capture -> validate -> curate -> serve -> report. Show key "
             "integrations and primary data flows with directional arrows. Group related services "
-            f"and label each box clearly.{ai_clause}"
+            "and label each box clearly. Keep AI as one bounded component only when it is explicitly "
+            "part of the proposed architecture; do not add a separate AI sidecar or repeat AI controls."
+        )
+    elif kind == "technical_architecture":
+        source_requirements = _matched_requirement_texts(
+            understanding,
+            (
+                "source system", "system of record", "integration", "interface", "api", "file",
+                "catalogue", "catalog", "master data", "product", "pricing", "cost", "inventory",
+                "warehouse", "availability", "document", "image", "content", "analytics", "report",
+            ),
+            10,
+        )
+        grounded = (
+            "\nGrounded system and data requirements:\n- " + "\n- ".join(source_requirements)
+            if source_requirements else ""
+        )
+        body = (
+            "Create a layered technical architecture that is clearly distinct from a logical capability map "
+            "and the solution-architecture overview. Derive the layer sequence from the proposal's channels, "
+            "interfaces, domain behavior, selected enterprise/COTS products, information shapes, hosting constraints, "
+            "and operating requirements. Do not start from a standard Experience/API/Services/Data/Cloud template: "
+            "include, omit, split, merge or rename layers according to the supplied requirements and authoritative "
+            "technology decisions. Show external systems and source-system roles only when grounded, and label the "
+            "data each supplies. Show identity, security, governance, observability, DevSecOps and support only where "
+            "the proposal requires them, either in the applicable layer or as cross-cutting controls. Label directional flows with the business data being "
+            "exchanged and identify the system-of-record role wherever proposal evidence supports it. Distinguish "
+            "customer-existing, COTS/SaaS, managed-cloud, maintained open-source, custom-build and integration-only "
+            "components using a small legend. Do not invent customer system names or imply that one product owns "
+            "master data, binary content, pricing, inventory and analytics unless the recommendation explicitly "
+            "supports that consolidation. Do not print rejected alternatives, open decisions, assumptions, "
+            "dependencies, TBC/TBD wording or customer-confirmation qualifiers inside the visual."
+            + grounded
+        )
+    elif kind == "data_model":
+        domain_requirements = _matched_requirement_texts(
+            understanding,
+            (
+                "catalogue", "catalog", "product", "service", "sku", "ingredient",
+                "customer", "solution", "shortlist", "validation", "compliance",
+                "pricing", "content", "enquiry", "availability", "facility", "market",
+                "master data", "reference data", "transaction", "event", "reporting",
+            ),
+            8,
+        )
+        grounded = (
+            "\nGrounded domain requirements:\n- " + "\n- ".join(domain_requirements)
+            if domain_requirements else ""
+        )
+        body = (
+            "Create a conceptual core data-domain and ownership map, not a physical database schema or field-level ERD. "
+            "Place the canonical data model at the centre. Group no more than seven proposal-supported domains around it, "
+            "such as master/reference data, customer or demand inputs, operational transactions, solution or decision records, "
+            "validation/control evidence, commercial data, and governed outputs only when grounded below. Show directional "
+            "relationships from authoritative sources through canonical domains to decisions/evidence and approved consumption. "
+            "Add a concise ownership band that distinguishes source owner, accountable domain owner, data steward, control owner, "
+            "and authorised consumer without inventing named roles. Show quality, lineage, versioning and audit as cross-domain "
+            "controls. Do not invent table names, attributes, keys, cardinalities, systems, or ownership assignments."
+            + grounded
+        )
+    elif kind == "reporting":
+        body = (
+            "Create a simple reporting value-flow diagram with one clear message: trusted governed data is reused "
+            "through a semantic layer for consistent decisions. Use at most seven boxes in a left-to-right flow: "
+            "trusted catalogue/pricing/availability/workflow data -> quality and reconciliation -> governed semantic "
+            "measures -> four concise audience outcomes (operational, commercial, compliance/data quality, executive). "
+            "Add a small feedback arrow from insight to the accountable data owner. Keep labels to short noun phrases. "
+            "Do not create a 4x4 matrix, dashboard mock-up, report inventory, miniature charts, paragraph text, or more "
+            "than four outcome boxes. The audience should understand what is governed, who consumes it, and why it matters "
+            "within five seconds."
         )
     elif kind == "deployment":
+        separate_hadr = _has_explicit_hadr_need(understanding)
         body = (
-            f"Create one combined deployment and resilience architecture diagram{tech_clause}. "
-            "Show production, test/UAT, and DR/backup only when relevant; hosting boundary or "
-            "hosting-to-confirm assumption; network/security zones; identity and access controls; "
-            "source-system connectivity; release path; monitoring/SIEM; backup/restore; failover; "
-            "and support touchpoints. Keep this specific to the proposal and avoid generic cloud "
-            "tutorial elements."
+            f"Create a deployment topology diagram{tech_clause}. Show environment separation, the "
+            "build/artifact and controlled promotion path, production application/API/data runtime "
+            "boundaries, secured user and source-system ingress, identity/secrets, telemetry, alerting, "
+            "and support ownership. Make runtime placement and directional connections the dominant visual. "
+            "Do not show business-process steps, functional modules, AI use cases, requirement text, evidence "
+            "references, or reviewer notes. "
             + (
-                " If AI-assisted capabilities are proposed, show managed consumption, usage budgets, "
-                "model monitoring, and scale-to-zero or scheduled batch processing; do not show GPU clusters."
-                if ai_clause else ""
+                "A separate HA/DR diagram exists, so include only a small continuity boundary marker; do not "
+                "show backup, replication, failover, restore procedures, RTO or RPO on this deployment diagram."
+                if separate_hadr else
+                "Include backup/recovery placement only where supported, without inventing RTO/RPO targets."
             )
         )
     elif kind == "hadr":
         body = (
-            "Create a high availability and disaster recovery topology. Show active/standby or "
-            "active/active options as appropriate, redundant application/integration tiers, replicated "
-            "data repository, backup/restore flow, monitoring and alerting, incident/failover flow, "
-            "RTO/RPO callouts marked as 'not specified in RFP' when not provided, and operations "
-            "handover/support boundaries."
+            "Create a focused high availability and disaster recovery topology, not a deployment architecture. "
+            "Show a primary region/failure domain with multi-zone redundant runtime and data paths, health probes "
+            "and failover; then a clearly separate recovery region/failure domain with replication direction, "
+            "backup and restore validation, controlled regional failover, recovery validation and failback. Show "
+            "operations ownership. Do not display uncommitted RTO/RPO values or qualifier labels; "
+            "capture those decisions on the Assumptions and Dependencies slide. "
+            "Do not show functional requirements, business capabilities, data models, delivery environments, "
+            "the full application-layer inventory, AI use cases, source-document assumptions, paragraph references, evidence IDs, reviewer context, "
+            "or document-processing notes."
         )
     elif kind == "delivery":
         body = (
@@ -848,7 +1860,8 @@ def _build_diagram_prompt(kind: str, understanding: Optional[RFPUnderstanding]) 
             "Show the live-service boundary and named integrations feeding business-flow observability; connect "
             "alerts and user-reported issues to accountable resolution paths, runbooks, correction/replay, and "
             "service evidence. Show warranty-to-AMS transition, knowledge acceptance, known errors, and the minor-"
-            "enhancement backlog. Label service levels as 'to be agreed' unless grounded in the RFP. Do not use a "
+            "enhancement backlog. Do not display uncommitted service levels or qualifier labels; keep "
+            "those decisions on the Assumptions and Dependencies slide. Do not use a "
             "generic L1/L2/L3 pyramid, Agile squad diagram, or steering committee as the main image."
         )
     elif kind == "team":
@@ -871,11 +1884,30 @@ def _build_diagram_prompt(kind: str, understanding: Optional[RFPUnderstanding]) 
     else:
         body = "Create a clear, professional consulting diagram with labeled boxes and directional arrows."
 
-    return f"{ctx}\n{body}\n{_SAFE_MARGIN_NOTE}".strip()
+    prompt = f"{ctx}\n{body}\n{_SAFE_MARGIN_NOTE}".strip()
+    if kind == "technical_architecture":
+        technology_context = _technical_architecture_context(technology_recommendations)
+        if technology_context:
+            prompt = f"{prompt}\n\n{technology_context}".strip()
+    elif kind == "deployment":
+        technology_context = _deployment_technology_context(technology_recommendations)
+        if technology_context:
+            prompt = f"{prompt}\n\n{technology_context}".strip()
+    elif kind == "hadr":
+        technology_context = _hadr_technology_context(technology_recommendations)
+        if technology_context:
+            prompt = f"{prompt}\n\n{technology_context}".strip()
+    return prompt
 
 
-def _deployment_bullets(understanding: RFPUnderstanding | None) -> List[str]:
+def _deployment_bullets(
+    understanding: RFPUnderstanding | None,
+    technology_recommendations: TechnologyRecommendationSet | None = None,
+) -> List[str]:
     """Grounded deployment/release defaults for the deployment architecture slide."""
+    technology_points = _deployment_recommendation_points(technology_recommendations)
+    if technology_points:
+        return technology_points
     scope = (getattr(understanding, "project_scope", "") or "").lower() if understanding else ""
     req_text = " ".join(
         (getattr(r, "text", "") or "") for r in (getattr(understanding, "requirements", []) or [])
@@ -1111,145 +2143,414 @@ def _sbom_table(understanding: RFPUnderstanding | None) -> Dict[str, Any]:
     return {"headers": headers, "rows": rows[:14]}
 
 
-def _sdlc_technology_table(understanding: RFPUnderstanding | None) -> Dict[str, Any]:
-    """Build an implementable, qualified solution stack by architecture layer."""
-    sbom = getattr(understanding, "software_bill_of_materials", []) or [] if understanding else []
-    techs = [
-        (getattr(item, "component", "") or "").strip()
-        for item in sbom
-        if (getattr(item, "component", "") or "").strip()
-        and not _is_excluded_solution_tool(getattr(item, "component", ""), understanding)
-    ]
-    for tech in (getattr(understanding, "solution_technologies", []) or []) if understanding else []:
-        if tech and not _is_excluded_solution_tool(tech, understanding) and tech not in techs:
-            techs.append(tech)
+def _source_grounded_technology_table(
+    understanding: RFPUnderstanding | None,
+) -> Dict[str, Any]:
+    """Fallback table containing source facts only.
 
-    corpus = " ".join(techs + [_understanding_text(understanding)]).lower()
-    cloud = _cloud_signal(corpus)
-    is_data_platform = _is_data_platform_engagement(understanding)
+    Product selection belongs to the technology-recommendation agent. This
+    table is used only when that agent cannot provide a complete result, so it
+    must never inject a cloud ecosystem, framework, database, toolchain or
+    region merely because a platform was selected.
+    """
+    rows: List[List[str]] = []
+    seen: set[str] = set()
+    for item in (getattr(understanding, "software_bill_of_materials", []) or []):
+        technology = (getattr(item, "component", "") or "").strip()
+        if not technology or _is_excluded_solution_tool(technology, understanding):
+            continue
+        rows.append([
+            (getattr(item, "category", "") or "Source-referenced technology").strip(),
+            technology,
+            (getattr(item, "purpose", "") or "Role described in the supplied material").strip(),
+            (getattr(item, "source_or_basis", "") or "Named in supplied material; validate authority and fit").strip(),
+        ])
+        seen.add(technology.lower())
+    for technology in (
+        list(getattr(understanding, "solution_technologies", []) or [])
+        + list(getattr(understanding, "key_technologies", []) or [])
+    ):
+        technology = (technology or "").strip()
+        if (
+            not technology
+            or technology.lower() in seen
+            or _is_excluded_solution_tool(technology, understanding)
+        ):
+            continue
+        rows.append([
+            "Source-referenced technology",
+            technology,
+            "Architecture role must be derived from the proposal requirements",
+            "Named in supplied material; no product or layer inference applied",
+        ])
+        seen.add(technology.lower())
 
-    def basis(products: str, proposed: str) -> str:
-        product_names = [part.strip().lower() for part in re.split(r"[,/]", products) if part.strip()]
-        if any(any(name in tech.lower() or tech.lower() in name for tech in techs) for name in product_names):
-            return "RFP-required or referenced solution technology"
-        return proposed
-
-    cloud_label = {"azure": "Azure", "aws": "AWS", "gcp": "Google Cloud"}.get(cloud, "")
-    pb = (
-        f"Proposed {cloud_label}-aligned option; confirm with customer architecture"
-        if cloud_label
-        else "Recommended cloud-neutral option; confirm platform standards"
-    )
-
-    if is_data_platform:
-        # Data / analytics platform build: layers reflect ingestion → curation →
-        # serving → reporting.
-        if cloud == "aws":
-            rows = [
-                ["Ingestion and orchestration", "AWS Glue; Step Functions; Transfer Family", "Ingest and orchestrate file, API, and database feeds", pb],
-                ["Validation and services", "AWS Lambda; ECS/Fargate", "Run validation, canonical transformations, APIs, and operational services", pb],
-                ["Integration", "Amazon API Gateway; EventBridge; SQS", "Secure and decouple synchronous and asynchronous interfaces", pb],
-                ["Data repository", "Amazon S3; Lake Formation; Redshift or Aurora", "Store governed lake, analytical, and transactional data", pb],
-                ["Reporting", "Amazon QuickSight or RFP-referenced BI tooling", "Serve governed operational dashboards and analytics", pb],
-                ["Security and observability", "IAM; KMS; Secrets Manager; CloudWatch; Security Hub", "Protect identities/data and monitor the live service", pb],
-                ["DevSecOps", "CodePipeline/CodeBuild or GitHub Actions; Terraform", "Automate quality, security, infrastructure, and releases", pb],
-            ]
-        elif cloud == "gcp":
-            rows = [
-                ["Ingestion and orchestration", "Cloud Data Fusion/Dataflow; Cloud Composer", "Ingest and orchestrate file, API, stream, and database feeds", pb],
-                ["Validation and services", "Cloud Run; Cloud Functions", "Run validation, canonical transformations, APIs, and operational services", pb],
-                ["Integration", "Apigee; Pub/Sub", "Secure APIs and decouple asynchronous interfaces", pb],
-                ["Data repository", "Cloud Storage; BigQuery", "Store governed raw, curated, and analytical data", pb],
-                ["Reporting", "Looker or RFP-referenced BI tooling", "Serve governed operational dashboards and analytics", pb],
-                ["Security and observability", "Cloud IAM; Secret Manager; Cloud Logging/Monitoring; Security Command Center", "Protect identities/data and monitor the live service", pb],
-                ["DevSecOps", "Cloud Build or GitHub Actions; Terraform", "Automate quality, security, infrastructure, and releases", pb],
-            ]
-        else:  # Azure, or cloud not stated -> Azure-shaped data reference stack
-            data_pb = pb if cloud == "azure" else "Recommended managed reference stack; platform decision required"
-            rows = [
-                ["Source connectivity", "Fabric Data Factory pipelines; SFTP/REST connectors", "Ingest files, APIs, databases, and scheduled source extracts", basis("Fabric Data Factory", data_pb)],
-                ["Orchestration", "Fabric Data Factory pipelines; Azure Logic Apps", "Coordinate schedules, dependencies, routing, retries, and exception workflows", basis("Azure Logic Apps", data_pb)],
-                ["Validation and canonical transformation", "Fabric Dataflow Gen2 / notebooks; Azure Functions", "Validate, standardise, enrich, and transform source records into canonical structures", basis("Azure Functions", data_pb)],
-                ["Integration services", "Azure API Management; Azure Service Bus", "Secure APIs, decouple interfaces, manage asynchronous exchange, and control consumers", basis("Azure API Management", data_pb)],
-                ["Central data repository", "Microsoft Fabric OneLake Lakehouse/Warehouse; Azure SQL where transactional semantics are required", "Retain raw, curated, reference, and serving data with governed access", basis("Microsoft Fabric OneLake", data_pb)],
-                ["Analytics and reporting", "Fabric semantic models; Power BI", "Provide governed operational reporting, KPI analysis, and reusable analytical views", basis("Power BI", data_pb)],
-                ["Identity and secrets", "Microsoft Entra ID; Azure Key Vault; managed identities", "Apply role-based access, service identity, secret protection, and least privilege", basis("Microsoft Entra ID", data_pb)],
-                ["Observability and security operations", "Azure Monitor; Application Insights; Log Analytics; Microsoft Sentinel", "Monitor applications, pipelines, interfaces, audit events, alerts, and support signals", basis("Microsoft Sentinel", data_pb)],
-                ["DevSecOps and infrastructure", "Azure DevOps or GitHub Actions; Bicep/Terraform", "Automate build, test, security checks, environment provisioning, and controlled releases", data_pb],
-            ]
-    else:
-        # Application / platform build (e.g. containerised app, migration,
-        # modernization): layers reflect compute, data, messaging, and delivery.
-        if cloud == "azure":
-            rows = [
-                ["Compute and orchestration", "Azure Kubernetes Service (AKS); Azure Container Apps", "Run containerised web, worker, and background services", basis("Azure Kubernetes Service, AKS", pb)],
-                ["Application services", "Containerised .NET/Java/Node/Python services", "Host application workloads and APIs with portable packaging", pb],
-                ["Database", "Azure Database for PostgreSQL; Azure SQL where required", "Provide the primary transactional data store", basis("Azure Database for PostgreSQL, PostgreSQL", pb)],
-                ["Messaging and streaming", "Azure Service Bus / Event Hubs; Kafka on AKS where portability is required", "Decouple services and process asynchronous events", basis("Kafka, Pulsar", pb)],
-                ["Caching", "Azure Cache for Redis", "Provide low-latency caching and session state", basis("Redis", pb)],
-                ["Object storage and CDN", "Azure Blob Storage; Azure Front Door / CDN", "Store objects and accelerate content delivery", basis("CDN, CloudFront, S3", pb)],
-                ["Search", "Azure AI Search or self-managed Elasticsearch/OpenSearch", "Provide search and indexing", basis("Elasticsearch", pb)],
-                ["Identity and secrets", "Microsoft Entra ID; Azure Key Vault; managed identities", "Apply access control, service identity, and secret protection", basis("Microsoft Entra ID, OAuth, SAML", pb)],
-                ["Observability", "Datadog or Azure Monitor / Application Insights / Log Analytics", "Metrics, logs, tracing, and alerting across the estate", basis("Datadog", pb)],
-                ["DevSecOps and infrastructure", "Azure DevOps or GitHub Actions; Terraform/Bicep", "Automate build, test, security, provisioning, and controlled releases", basis("Terraform", pb)],
-            ]
-        elif cloud == "aws":
-            rows = [
-                ["Compute and orchestration", "Amazon EKS; ECS/Fargate", "Run containerised web, worker, and background services", basis("Amazon EKS, EKS, Kubernetes", pb)],
-                ["Application services", "Containerised .NET/Java/Node/Python services", "Host application workloads and APIs with portable packaging", pb],
-                ["Database", "Amazon RDS / Aurora PostgreSQL", "Provide the primary transactional data store", basis("PostgreSQL, RDS", pb)],
-                ["Messaging and streaming", "Amazon MSK (Kafka); SNS/SQS", "Decouple services and process asynchronous events", basis("Kafka, Pulsar", pb)],
-                ["Caching", "Amazon ElastiCache for Redis", "Provide low-latency caching and session state", basis("Redis", pb)],
-                ["Object storage and CDN", "Amazon S3; CloudFront", "Store objects and accelerate content delivery", basis("S3, CloudFront", pb)],
-                ["Search", "Amazon OpenSearch or self-managed Elasticsearch", "Provide search and indexing", basis("Elasticsearch, OpenSearch", pb)],
-                ["Identity and secrets", "IAM/Cognito; Secrets Manager; KMS", "Apply access control, service identity, and secret protection", basis("OAuth, SAML", pb)],
-                ["Observability", "Datadog or Amazon CloudWatch", "Metrics, logs, tracing, and alerting across the estate", basis("Datadog", pb)],
-                ["DevSecOps and infrastructure", "CodePipeline/CodeBuild or GitHub Actions; Terraform", "Automate build, test, security, provisioning, and controlled releases", basis("Terraform", pb)],
-            ]
-        elif cloud == "gcp":
-            rows = [
-                ["Compute and orchestration", "Google Kubernetes Engine (GKE); Cloud Run", "Run containerised web, worker, and background services", basis("GKE, Kubernetes", pb)],
-                ["Application services", "Containerised .NET/Java/Node/Python services", "Host application workloads and APIs with portable packaging", pb],
-                ["Database", "Cloud SQL for PostgreSQL", "Provide the primary transactional data store", basis("PostgreSQL", pb)],
-                ["Messaging and streaming", "Pub/Sub; Kafka on GKE where portability is required", "Decouple services and process asynchronous events", basis("Kafka, Pulsar", pb)],
-                ["Caching", "Memorystore for Redis", "Provide low-latency caching and session state", basis("Redis", pb)],
-                ["Object storage and CDN", "Cloud Storage; Cloud CDN", "Store objects and accelerate content delivery", pb],
-                ["Search", "Self-managed Elasticsearch/OpenSearch", "Provide search and indexing", basis("Elasticsearch", pb)],
-                ["Identity and secrets", "Cloud IAM; Secret Manager", "Apply access control, service identity, and secret protection", pb],
-                ["Observability", "Datadog or Cloud Logging/Monitoring", "Metrics, logs, tracing, and alerting across the estate", basis("Datadog", pb)],
-                ["DevSecOps and infrastructure", "Cloud Build or GitHub Actions; Terraform", "Automate build, test, security, provisioning, and controlled releases", basis("Terraform", pb)],
-            ]
-        else:
-            rows = [
-                ["Compute and orchestration", "Managed Kubernetes; container runtime", "Run containerised web, worker, and background services", basis("Kubernetes", pb)],
-                ["Application services", "Containerised .NET/Java/Node/Python services", "Host application workloads and APIs with portable packaging", pb],
-                ["Database", "PostgreSQL (managed)", "Provide the primary transactional data store", basis("PostgreSQL", pb)],
-                ["Messaging and streaming", "Apache Kafka or cloud-native messaging", "Decouple services and process asynchronous events", basis("Kafka, Pulsar", pb)],
-                ["Caching", "Redis", "Provide low-latency caching and session state", basis("Redis", pb)],
-                ["Object storage and CDN", "Object storage; CDN", "Store objects and accelerate content delivery", pb],
-                ["Search", "Elasticsearch/OpenSearch", "Provide search and indexing", basis("Elasticsearch", pb)],
-                ["Identity and secrets", "OIDC/OAuth2; managed secrets/KMS", "Apply access control, service identity, and secret protection", basis("OAuth, SAML", pb)],
-                ["Observability", "OpenTelemetry; Prometheus/Grafana or customer standard", "Metrics, logs, tracing, and alerting across the estate", basis("Datadog", pb)],
-                ["DevSecOps and infrastructure", "GitHub Actions/GitLab CI; Terraform", "Automate build, test, security, provisioning, and controlled releases", basis("Terraform", pb)],
-            ]
-    if _ai_ml_is_applicable(understanding):
-        ai_tech = {
-            "azure": "Azure AI / Document Intelligence, or managed models",
-            "aws": "Amazon Bedrock / SageMaker, or managed models",
-            "gcp": "Vertex AI, or managed models",
-        }.get(cloud, "Managed AI service or small models")
-        rows.append(
-            [
-                "AI-assisted capabilities",
-                ai_tech,
-                "Support classification, anomaly detection, forecasting, and governed assistance",
-                "Optional; requires customer approval, plus validation of value, data readiness, accuracy, and run cost before scale",
-            ]
-        )
+    if not rows:
+        rows.append([
+            "Agent recommendation unavailable",
+            "No product selected by fallback",
+            "Regenerate so the architecture agent can derive the applicable layers and products from proposal-specific inputs",
+            "No source-named technology was available for a safe fallback",
+        ])
     return {
-        "headers": ["Architecture layer", "Proposed technology / service", "Role in the solution", "Status / basis"],
+        "headers": ["Source classification", "Named technology", "Source-described role", "Source / decision status"],
+        "rows": rows[:15],
+    }
+
+
+def _is_usable_technology_table(table: Dict[str, Any] | None) -> bool:
+    """Accept a substantive planner recommendation without vendor allowlists."""
+    if not table or len(table.get("headers") or []) < 3:
+        return False
+    rows = table.get("rows") or []
+    if len(rows) < 4 or not all(isinstance(row, (list, tuple)) and len(row) >= 3 for row in rows):
+        return False
+    headers_text = " ".join(str(value) for value in table["headers"]).lower()
+    table_text = " ".join(str(cell) for row in rows for cell in row).lower()
+    if "sdlc phase" in headers_text:
+        return False
+    capability_signals = (
+        "develop", "test", "build", "deploy", "ci/cd", "devsecops",
+        "ingest", "integration", "database", "data", "runtime", "compute",
+        "security", "identity", "observability", "monitor", "report",
+    )
+    return sum(signal in table_text for signal in capability_signals) >= 3
+
+
+def _technology_recommendation_table(
+    recommendation_set: TechnologyRecommendationSet | None,
+) -> Dict[str, Any] | None:
+    recommendations = list(getattr(recommendation_set, "recommendations", None) or [])
+    if len(recommendations) < 4:
+        return None
+    generic_only = (
+        "digital catalogue", "catalogue platform", "ai-enabled engine",
+        "compliance module", "pricing module", "customer portal",
+        "application service", "database capability", "cloud service",
+    )
+    rows = []
+    for item in recommendations:
+        technology = (item.proposed_technology or "").strip()
+        if not technology or technology.lower() in generic_only:
+            continue
+        category = (item.technology_category or "").strip()
+        proposed = f"{technology} ({category})" if category and category.lower() not in technology.lower() else technology
+        rationale = _clip(
+            (item.build_vs_buy_rationale or item.rationale or "").strip(),
+            105,
+        )
+        sourcing = (
+            (item.sourcing_model or "").replace("-", " ")
+            if item.sourcing_model != "customer-decision" else ""
+        )
+        basis_parts = [item.status.title(), sourcing, rationale]
+        rows.append([
+            _clip(item.architecture_layer, 55),
+            proposed,
+            _clip(item.role, 105),
+            ": ".join(part for part in basis_parts if part),
+        ])
+    if len(rows) < 4:
+        return None
+    return {
+        "headers": ["Architecture layer", "Proposed technology / service", "Role in the solution", "Status / rationale"],
         "rows": rows,
     }
+
+
+def _selected_provider_family(platform: str | None) -> str:
+    value = (platform or "").strip().lower()
+    if "azure" in value:
+        return "azure"
+    if "amazon web services" in value or re.search(r"\baws\b", value):
+        return "aws"
+    if "google cloud" in value or re.search(r"\bgcp\b", value):
+        return "gcp"
+    return ""
+
+
+_PROVIDER_PRODUCT_SIGNALS = {
+    "azure": (
+        "azure", "entra id", "cosmos db", "microsoft sentinel",
+    ),
+    "aws": (
+        "amazon web services", "aws ", "amazon s3", "amazon ecs", "amazon eks",
+        "route 53", "fargate", "cloudfront", "dynamodb", "elasticache",
+        "amazon aurora", "amazon rds", "cloudwatch", "amazon cognito",
+    ),
+    "gcp": (
+        "google cloud", "gcp ", "bigquery", "cloud run", "cloud sql", "gke",
+        "pub/sub", "firestore", "cloud spanner", "google kubernetes engine",
+    ),
+}
+
+
+def _conflicts_with_selected_provider(text: str, selected_provider: str) -> bool:
+    if not selected_provider:
+        return False
+    value = f" {(text or '').lower()} "
+    return any(
+        signal in value
+        for provider, signals in _PROVIDER_PRODUCT_SIGNALS.items()
+        if provider != selected_provider
+        for signal in signals
+    )
+
+
+def _deployment_recommendations(
+    recommendation_set: TechnologyRecommendationSet | None,
+) -> List[TechnologyRecommendation]:
+    deployment_terms = (
+        "host", "cloud", "region", "network", "vnet", "vpc", "subnet", "dns",
+        "edge", "ingress", "gateway", "firewall", "waf", "load balanc", "runtime",
+        "compute", "container", "kubernetes", "function", "application", "api",
+        "integration", "messag", "event", "database", "data store", "storage",
+        "search", "cache", "identity", "secret", "key", "certificate", "security",
+        "siem", "monitor", "observ", "logging", "backup", "recovery", "availability",
+        "ci/cd", "pipeline", "artifact", "infrastructure as code", "iac", "deploy",
+    )
+    recommendations = list(getattr(recommendation_set, "recommendations", None) or [])
+    selected_provider = _selected_provider_family(
+        getattr(recommendation_set, "selected_platform", "")
+    )
+    selected = [
+        item for item in recommendations
+        if item.status != "customer-decision"
+        and not _is_open_visual_decision(
+            f"{item.architecture_layer} {item.proposed_technology} {item.role}"
+        )
+        and any(
+            term in f"{item.architecture_layer} {item.technology_category} {item.role}".lower()
+            for term in deployment_terms
+        )
+        and not _conflicts_with_selected_provider(
+            f"{item.proposed_technology} {item.technology_category}",
+            selected_provider,
+        )
+    ]
+    return selected[:16]
+
+
+def _technical_architecture_context(
+    recommendation_set: TechnologyRecommendationSet | None,
+) -> str:
+    """Render authoritative build/buy and technology decisions into one visual context."""
+    if recommendation_set is None:
+        return ""
+    platform = (recommendation_set.selected_platform or "").strip()
+    selected_provider = _selected_provider_family(platform)
+    decisions = [
+        item for item in (recommendation_set.component_decisions or [])
+        if item.decision_status != "customer-decision"
+        and item.sourcing_model != "customer-decision"
+        and (item.capability or "").strip()
+        and (item.recommendation or "").strip()
+        and not _is_open_visual_decision(
+            f"{item.capability} {item.recommendation} {item.role} {item.system_of_record}"
+        )
+        and not _conflicts_with_selected_provider(
+            f"{item.recommendation} {item.role}", selected_provider
+        )
+    ][:10]
+    technologies = [
+        item for item in (recommendation_set.recommendations or [])
+        if item.status != "customer-decision"
+        and (item.proposed_technology or "").strip()
+        and not _is_open_visual_decision(
+            f"{item.architecture_layer} {item.proposed_technology} {item.role}"
+        )
+        and not _conflicts_with_selected_provider(
+            f"{item.proposed_technology} {item.technology_category}", selected_provider
+        )
+    ][:14]
+    if not platform and not decisions and not technologies:
+        return ""
+
+    parts = [
+        "AUTHORITATIVE LAYERED TECHNICAL ARCHITECTURE DECISIONS - these override provisional visual labels:"
+    ]
+    if platform and not _is_open_visual_decision(platform):
+        parts.append(f"Selected hosting platform: {platform}.")
+    if decisions:
+        parts.append("Map these capability sourcing decisions into the relevant technical layers:")
+        for item in decisions:
+            detail = [
+                f"{item.capability}: {item.recommendation}",
+                f"sourcing={item.sourcing_model}",
+                f"status={item.decision_status}",
+            ]
+            if item.system_of_record:
+                detail.append(f"system-of-record={_clip(item.system_of_record, 80)}")
+            if item.data_inputs:
+                detail.append("inputs=" + ", ".join(_clip(value, 55) for value in item.data_inputs[:4]))
+            if item.data_outputs:
+                detail.append("outputs=" + ", ".join(_clip(value, 55) for value in item.data_outputs[:4]))
+            if item.role:
+                detail.append("role=" + _clip(item.role, 100))
+            if item.rationale:
+                detail.append("design rationale=" + _clip(item.rationale, 120))
+            parts.append("- " + "; ".join(detail) + ".")
+    if technologies:
+        parts.append("Use these selected implementation products/services in the corresponding layers:")
+        parts.extend(
+            f"- {item.architecture_layer}: {item.proposed_technology} "
+            f"({item.technology_category}; {item.role}; {item.status}; {item.sourcing_model})."
+            for item in technologies
+        )
+    parts.append(
+        "Draw only selected decisions, not evaluated or rejected alternatives. Use the sourcing model as a compact "
+        "legend/tag and use the rationale only to place the component correctly, not as visible prose. Connect each "
+        "named or role-based system of record to the component it supplies and label the flow with the listed data. "
+        "Do not introduce another hyperscaler's services. Keep customer decisions and open assumptions on the "
+        "Assumptions and Dependencies slide, outside this visual."
+    )
+    return "\n".join(parts)
+
+
+def _deployment_technology_context(
+    recommendation_set: TechnologyRecommendationSet | None,
+) -> str:
+    selected = _deployment_recommendations(recommendation_set)
+    platform = (getattr(recommendation_set, "selected_platform", "") or "").strip()
+    if (
+        recommendation_set is None
+        or not platform
+        or _is_open_visual_decision(platform)
+    ):
+        return ""
+    hosting_model = (recommendation_set.hosting_model or "customer-decision").replace("-", " ")
+    parts = [
+        "AUTHORITATIVE DEPLOYMENT TECHNOLOGY DECISION - this overrides any earlier visual draft:",
+        f"Hosting model: {hosting_model}.",
+        f"Selected platform: {platform}.",
+    ]
+    if recommendation_set.deployment_rationale and not _is_open_visual_decision(
+        recommendation_set.deployment_rationale
+    ):
+        parts.append("Decision rationale: " + _clip(recommendation_set.deployment_rationale, 240) + ".")
+    if recommendation_set.primary_region_strategy and not _is_open_visual_decision(
+        recommendation_set.primary_region_strategy
+    ):
+        parts.append("Region and resilience strategy: " + _clip(recommendation_set.primary_region_strategy, 200) + ".")
+    if selected:
+        parts.append("Map these chosen services to their deployment layers:")
+        for item in selected:
+            parts.append(
+                f"- {item.architecture_layer}: {item.proposed_technology} ({item.role}; {item.status})."
+            )
+    else:
+        parts.append(
+            "Show the application, integration, data, identity, observability, and release capabilities "
+            "inside the selected-platform boundary using role-based labels; do not invent service names."
+        )
+    parts.append(
+        "Group services into no more than 8 deployable layers. Show provider-native service names, "
+        "network boundaries and directional traffic flows. Do not replace the selected services with generic boxes. "
+        "Do not introduce services from another hyperscaler. Do not print open decisions, assumptions, dependencies, "
+        "placeholder labels, or customer-confirmation qualifiers inside the visual."
+    )
+    return "\n".join(parts)
+
+
+def _hadr_technology_context(
+    recommendation_set: TechnologyRecommendationSet | None,
+) -> str:
+    platform = (getattr(recommendation_set, "selected_platform", "") or "").strip()
+    if recommendation_set is None or not platform or _is_open_visual_decision(platform):
+        return ""
+    resilience_terms = (
+        "availability", "zone", "region", "failover", "load balanc", "traffic", "dns",
+        "replication", "backup", "restore", "recovery", "monitor", "health",
+    )
+    selected_provider = _selected_provider_family(platform)
+    selected = [
+        item for item in (recommendation_set.recommendations or [])
+        if item.status != "customer-decision"
+        and not _is_open_visual_decision(
+            f"{item.architecture_layer} {item.proposed_technology} {item.role}"
+        )
+        and any(term in f"{item.architecture_layer} {item.technology_category} {item.role}".lower() for term in resilience_terms)
+        and not _conflicts_with_selected_provider(
+            f"{item.proposed_technology} {item.technology_category}",
+            selected_provider,
+        )
+    ][:10]
+    parts = [
+        "AUTHORITATIVE HA/DR TECHNOLOGY DECISION - use only these resilience services; do not draw the full deployment stack:",
+        f"Selected platform: {platform}.",
+    ]
+    if recommendation_set.primary_region_strategy and not _is_open_visual_decision(
+        recommendation_set.primary_region_strategy
+    ):
+        parts.append(
+            "Named region strategy: "
+            + _clip(recommendation_set.primary_region_strategy, 240)
+            + "."
+        )
+    if selected:
+        parts.extend(f"- {item.architecture_layer}: {item.proposed_technology} ({item.role})." for item in selected)
+    else:
+        parts.append(
+            "Use role-based runtime, data, replication, backup, health, and recovery labels within the "
+            "selected-platform boundary; do not invent service names or recovery commitments."
+        )
+    parts.append(
+        "Do not introduce services from another hyperscaler. Keep open recovery targets, assumptions, "
+        "dependencies, placeholder labels, and customer-confirmation qualifiers outside the visual."
+    )
+    return "\n".join(parts)
+
+
+def _deployment_recommendation_points(
+    recommendation_set: TechnologyRecommendationSet | None,
+) -> List[str]:
+    selected = _deployment_recommendations(recommendation_set)
+    if recommendation_set is None:
+        return []
+    platform = recommendation_set.selected_platform or "the selected platform"
+    hosting = (recommendation_set.hosting_model or "customer-decision").replace("-", " ")
+    points = [f"Use a {hosting} deployment baseline on {platform}"]
+    if not selected:
+        if not (recommendation_set.selected_platform or "").strip():
+            return []
+        return points + [
+            "Separate lower and production environments with controlled promotion",
+            "Secure user and source-system ingress through the customer-approved landing zone",
+            "Centralize runtime, integration, data, security, and operational telemetry",
+        ]
+    buckets = (
+        ("Network and secure ingress", ("network", "vnet", "vpc", "dns", "edge", "gateway", "firewall", "waf", "load balanc")),
+        ("Application and integration runtime", ("runtime", "compute", "container", "kubernetes", "function", "application", "api", "integration", "messag", "event")),
+        ("Data services", ("database", "data store", "storage", "search", "cache")),
+        ("Security and operations", ("identity", "secret", "key", "certificate", "security", "siem", "monitor", "observ", "logging", "backup", "recovery", "ci/cd", "artifact", "iac")),
+    )
+    for heading, terms in buckets:
+        technologies = []
+        for item in selected:
+            haystack = f"{item.architecture_layer} {item.technology_category} {item.role}".lower()
+            if any(term in haystack for term in terms):
+                technologies.append(item.proposed_technology)
+        technologies = list(dict.fromkeys(technologies))[:4]
+        if technologies:
+            points.append(f"{heading}: " + ", ".join(technologies))
+    return points[:5]
+
+
+def _apply_technology_recommendations(
+    deck_plan: DeckPlan,
+    recommendation_set: TechnologyRecommendationSet | None,
+) -> DeckPlan:
+    table = _technology_recommendation_table(recommendation_set)
+    if table is None:
+        return deck_plan
+    for slide in deck_plan.slides:
+        if (slide.archetype or "").strip().lower() == "software bill of materials":
+            slide.table = table
+            slide.title = "Proposed solution stack maps technologies to architecture layers"
+            slide.key_message = (
+                "The proposed stack preserves stated constraints and selects concrete products for unspecified layers using workload, NFR, operability, portability, and cost fit."
+            )
+    return deck_plan
 
 
 def _appendix_arch_diagram(view_name: str, understanding: RFPUnderstanding) -> DiagramSpec:
@@ -1356,21 +2657,21 @@ def _exec_summary_bullets(
     if narrative is not None:
         pts = [p.strip() for p in (getattr(narrative, "executive_summary_points", []) or []) if (p or "").strip()]
         if len(pts) >= 3:
-            return [_clip(p) for p in pts[:3]]
+            return [re.sub(r"\s+", " ", p).strip() for p in pts[:3]]
 
         bullets: List[str] = []
         vp = (getattr(narrative, "value_proposition", "") or "").strip()
         if vp:
-            bullets.append(_clip(vp))
+            bullets.append(re.sub(r"\s+", " ", vp).strip())
         for o in getattr(narrative, "strategic_outcomes", []) or []:
             if (o or "").strip():
-                bullets.append(_clip(o))
+                bullets.append(re.sub(r"\s+", " ", o).strip())
             if len(bullets) >= 3:
                 break
         if len(bullets) < 3:
             for t in getattr(narrative, "solution_themes", []) or []:
                 if (t or "").strip():
-                    bullets.append(_clip(t))
+                    bullets.append(re.sub(r"\s+", " ", t).strip())
                 if len(bullets) >= 3:
                     break
         if len(bullets) >= 3:
@@ -1447,7 +2748,7 @@ def _context_detailed_points(understanding: RFPUnderstanding | None) -> List[Bul
     points: List[BulletPoint] = []
 
     # Current environment & constraints — from stated assumptions, else summary.
-    env_subs = [_clip(a, 120) for a in (getattr(understanding, "assumptions", []) or []) if (a or "").strip()][:3]
+    env_subs = [re.sub(r"\s+", " ", a).strip() for a in _visible_assumptions(understanding)][:3]
     if not env_subs:
         first = _first_sentence(getattr(understanding, "summary", "") or "", 140)
         if first:
@@ -1458,12 +2759,12 @@ def _context_detailed_points(understanding: RFPUnderstanding | None) -> List[Bul
     # Stakeholder needs & pain points — from must/should requirements.
     reqs = getattr(understanding, "requirements", []) or []
     ranked = sorted(reqs, key=lambda r: {"must": 0, "should": 1, "may": 2}.get(getattr(r, "priority", "should"), 1))
-    need_subs = [_clip(getattr(r, "text", ""), 120) for r in ranked if (getattr(r, "text", "") or "").strip()][:4]
+    need_subs = [re.sub(r"\s+", " ", getattr(r, "text", "")).strip() for r in ranked if (getattr(r, "text", "") or "").strip()][:4]
     if need_subs:
         points.append(BulletPoint(text="Stakeholder needs and pain points", sub_points=need_subs))
 
     # Why change now — from stated risks/pressures driving the initiative.
-    why_subs = [_clip(r, 120) for r in (getattr(understanding, "risks", []) or []) if (r or "").strip()][:3]
+    why_subs = [re.sub(r"\s+", " ", r).strip() for r in (getattr(understanding, "risks", []) or []) if (r or "").strip()][:3]
     if why_subs:
         points.append(BulletPoint(text="Why change now", sub_points=why_subs))
 
@@ -1488,7 +2789,7 @@ def _requirements_detailed_points(understanding: RFPUnderstanding | None) -> Lis
         if not text:
             continue
         target = nonfunctional if any(k in text.lower() for k in nf_kw) else functional
-        target.append(_clip(text, 120))
+        target.append(re.sub(r"\s+", " ", text).strip())
 
     points: List[BulletPoint] = []
     if functional:
@@ -1520,7 +2821,7 @@ def _exec_summary_cards(
     # vs response vs outcomes) and are de-duplicated across cards so the summary
     # never repeats the same sentence in every box.
     def _clean(items, limit=3):
-        return [_clip(i.strip(), 130) for i in (items or []) if (i or "").strip()][:limit]
+        return [re.sub(r"\s+", " ", i).strip() for i in (items or []) if (i or "").strip()][:limit]
 
     def _sentences(text, limit=3):
         parts = re.split(r"(?<=[.!?])\s+", re.sub(r"\s+", " ", (text or "").strip()))
@@ -1579,16 +2880,72 @@ def _exec_summary_cards(
     return [card for card in cards if card.bullets]
 
 
+def _technology_dependency_items(
+    recommendation_set: TechnologyRecommendationSet | None,
+) -> List[str]:
+    if recommendation_set is None:
+        return []
+    items = [
+        _clip(item, 180)
+        for item in (recommendation_set.platform_assumptions or [])
+        if (item or "").strip() and not _is_internal_source_note(item)
+    ]
+    for recommendation in recommendation_set.recommendations or []:
+        if recommendation.status != "customer-decision":
+            continue
+        layer = _clip(recommendation.architecture_layer, 60)
+        role = _clip(recommendation.role, 130)
+        decision = f"Confirm {layer}: {role}" if layer and role else (layer or role)
+        if decision:
+            items.append(decision)
+    for component in recommendation_set.component_decisions or []:
+        for assumption in component.open_assumptions or []:
+            if (assumption or "").strip() and not _is_internal_source_note(assumption):
+                items.append(_clip(assumption, 180))
+        if component.decision_status == "customer-decision" or component.sourcing_model == "customer-decision":
+            capability = _clip(component.capability, 70)
+            role = _clip(component.role or component.recommendation, 110)
+            decision = (
+                f"Confirm sourcing and product decision for {capability}: {role}"
+                if capability and role else capability or role
+            )
+            if decision:
+                items.append(decision)
+    return list(dict.fromkeys(item for item in items if item))[:5]
+
+
+def _visual_dependency_items(
+    visual_briefs: List[DiagramBrief] | None,
+    recommendation_set: TechnologyRecommendationSet | None,
+) -> List[str]:
+    selected_provider = _selected_provider_family(
+        getattr(recommendation_set, "selected_platform", "")
+    )
+    items: List[str] = []
+    for brief in visual_briefs or []:
+        if (brief.visual_type or "").lower() not in {
+            "architecture", "technical_architecture", "deployment", "hadr", "topology", "testing", "ams"
+        }:
+            continue
+        for item in brief.open_assumptions or []:
+            clean = _clip(item, 180)
+            if (
+                clean
+                and not _is_internal_source_note(clean)
+                and not _conflicts_with_selected_provider(clean, selected_provider)
+            ):
+                items.append(clean)
+    return list(dict.fromkeys(items))[:8]
+
+
 def _assumptions_dependency_points(
     understanding: RFPUnderstanding | None,
+    technology_recommendations: TechnologyRecommendationSet | None = None,
+    visual_briefs: List[DiagramBrief] | None = None,
 ) -> List[BulletPoint]:
     if understanding is None:
         return []
-    assumptions = [
-        item.strip()
-        for item in (getattr(understanding, "assumptions", []) or [])
-        if (item or "").strip()
-    ][:5]
+    assumptions = _visible_assumptions(understanding)[:5]
     dependency_terms = (
         "access", "availability", "provide", "readiness", "interface", "source",
         "sample", "approval", "hosting", "environment", "third party", "customer",
@@ -1610,6 +2967,7 @@ def _assumptions_dependency_points(
         ("hosting", "cloud", "azure", "environment", "security", "access", "network", "identity"),
         3,
     )
+    technology_dependencies = _technology_dependency_items(technology_recommendations)
     acceptance = _matched_requirement_texts(
         understanding,
         ("acceptance", "uat", "approval", "sign-off", "cutover", "warranty", "support", "sla"),
@@ -1619,6 +2977,27 @@ def _assumptions_dependency_points(
         platform = list(platform[:2]) + [
             "AI-assisted use cases proceed beyond pilot only after data readiness, accuracy, human-control, security, and unit-cost thresholds are accepted."
         ]
+    dependency_candidates = technology_dependencies + _visual_dependency_items(
+        visual_briefs,
+        technology_recommendations,
+    )
+    for item in dependency_candidates:
+        value = item.lower()
+        if any(term in value for term in ("interface", "source system", "source data", "data volume", "access")):
+            dependencies.insert(0, item)
+        elif any(term in value for term in ("recovery", "backup", "rto", "rpo", "support", "service level", "monitoring", "retention")):
+            acceptance.insert(0, item)
+        elif any(term in value for term in (
+            "hosting", "cloud", "landing-zone", "subscription", "connectivity",
+            "environment", "runtime", "release", "deployment", "network", "identity", "security",
+        )):
+            platform.insert(0, item)
+        else:
+            assumptions.insert(0, item)
+    assumptions = list(dict.fromkeys(assumptions))
+    dependencies = list(dict.fromkeys(dependencies))
+    platform = list(dict.fromkeys(platform))
+    acceptance = list(dict.fromkeys(acceptance))
     return [
         BulletPoint(
             text="Scope and design baseline to validate",
@@ -1650,12 +3029,20 @@ def _assumptions_dependency_points(
 def _data_domain_points(understanding: RFPUnderstanding | None) -> List[BulletPoint]:
     source_points = _matched_requirement_texts(
         understanding,
-        ("flight", "fih", "gp4", "elp", "sftp", "email", "source"),
+        (
+            "flight", "fih", "gp4", "elp", "sftp", "email", "source",
+            "catalogue", "catalog", "product", "service", "sku", "ingredient",
+            "dietary", "allergen", "packaging", "facility", "market",
+        ),
         3,
     )
     operational_points = _matched_requirement_texts(
         understanding,
-        ("uplift", "catering", "productivity", "accuracy", "milestone", "sla", "iccms"),
+        (
+            "uplift", "catering", "productivity", "accuracy", "milestone", "sla", "iccms",
+            "customer requirement", "brief", "solution", "shortlist", "matching",
+            "validation", "compliance", "feasibility", "pricing", "enquiry", "availability",
+        ),
         3,
     )
     control_points = _matched_requirement_texts(
@@ -1665,7 +3052,10 @@ def _data_domain_points(understanding: RFPUnderstanding | None) -> List[BulletPo
     )
     consumer_points = _matched_requirement_texts(
         understanding,
-        ("report", "dashboard", "analytics", "output", "consumer", "power bi"),
+        (
+            "report", "dashboard", "analytics", "output", "consumer", "power bi",
+            "approved content", "publish", "customer content", "visualization", "visualisation",
+        ),
         3,
     )
     return [
@@ -2022,7 +3412,7 @@ def ensure_required_slides(
             key_message=(
                 "RFP-mandated technologies are preserved; gaps are completed with qualified ecosystem-aligned recommendations that remain subject to architecture confirmation."
             ),
-            table=_sdlc_technology_table(understanding),
+            table=_source_grounded_technology_table(understanding),
         )
     else:
         # The planner sometimes creates the required SBOM slide but omits the
@@ -2030,22 +3420,8 @@ def ensure_required_slides(
         # accepting an empty table layout.
         for slide in deck_plan.slides:
             if (slide.archetype or "").strip().lower() == "software bill of materials":
-                headers_text = " ".join(str(value) for value in ((slide.table or {}).get("headers") or [])).lower()
-                table_text = " ".join(
-                    str(cell)
-                    for row in ((slide.table or {}).get("rows") or [])
-                    for cell in row
-                ).lower()
-                implementation_tokens = (
-                    "fabric", "onelake", "azure functions", "logic apps", "api management",
-                    "service bus", "app service", "container apps", "postgresql", "kafka",
-                    "aws glue", "lambda", "bigquery", "cloud run", "terraform",
-                )
-                is_generic_lifecycle_table = "sdlc phase" in headers_text or not any(
-                    token in table_text for token in implementation_tokens
-                )
-                if not slide.table or not slide.table.get("headers") or is_generic_lifecycle_table:
-                    slide.table = _sdlc_technology_table(understanding)
+                if not _is_usable_technology_table(slide.table):
+                    slide.table = _source_grounded_technology_table(understanding)
                 elif _ai_ml_is_applicable(understanding):
                     rows = list(slide.table.get("rows") or [])
                     if not any("ai-assisted" in " ".join(str(cell) for cell in row).lower() for row in rows):
@@ -2073,7 +3449,7 @@ def ensure_required_slides(
             key_message=(
                 "This view names the implementation services behind each architecture layer and distinguishes requirements from proposed choices."
             ),
-            table=_sdlc_technology_table(understanding),
+            table=_source_grounded_technology_table(understanding),
         )
 
     has_ai_ml_slide = any(
@@ -2204,16 +3580,17 @@ def ensure_required_slides(
             ],
         )
 
-    # Team
-    has_delivery_squad_view = any(
-        (s.archetype or "").strip().lower() in {"delivery plan", "timeline"}
-        and _has_agile_delivery_language(s)
+    # A roadmap or governance slide does not replace a dedicated delivery-team view.
+    has_team_structure = any(
+        any(token in (s.title or "").lower() for token in (
+            "team structure", "delivery team", "squad structure"
+        ))
         for s in deck_plan.slides
     )
-    if not has_delivery_squad_view and not _is_archetype_present(existing_keys, "team"):
+    if not has_team_structure:
         add_slide(
             "Team",
-            "Product-aligned squads combine business and engineering ownership",
+            "Product-aligned Agile team structure supports delivery and transition",
             detailed_points=_agile_squad_points(),
             key_message=(
                 "Persistent cross-functional squads own usable outcomes end to end, supported by enabling chapters and lightweight steering governance."
@@ -2640,7 +4017,12 @@ def prune_redundant_storyline_slides(
     return deck_plan
 
 
-def enrich_slide_detail(deck_plan: DeckPlan, understanding: RFPUnderstanding | None = None) -> DeckPlan:
+def enrich_slide_detail(
+    deck_plan: DeckPlan,
+    understanding: RFPUnderstanding | None = None,
+    technology_recommendations: TechnologyRecommendationSet | None = None,
+    visual_briefs: List[DiagramBrief] | None = None,
+) -> DeckPlan:
     """Upgrade thin content slides with grounded sub-points and fix Next Steps.
 
     Applies to both model-generated and auto-added slides:
@@ -2653,6 +4035,7 @@ def enrich_slide_detail(deck_plan: DeckPlan, understanding: RFPUnderstanding | N
     for s in deck_plan.slides:
         arch = (s.archetype or "").lower()
         title = (s.title or "").lower()
+        slide_id = (getattr(s, "slide_id", "") or "").lower()
 
         if arch == "assumptions & dependencies" or (
             "assumption" in title and "dependenc" in title
@@ -2664,12 +4047,86 @@ def enrich_slide_detail(deck_plan: DeckPlan, understanding: RFPUnderstanding | N
             s.bullets = []
             s.cards = []
             s.comparison = None
-            s.detailed_points = _assumptions_dependency_points(understanding)
+            s.detailed_points = _assumptions_dependency_points(
+                understanding,
+                technology_recommendations,
+                visual_briefs,
+            )
             continue
 
-        if getattr(s, "diagram", None) is not None and any(
-            token in title for token in ("data domain", "data model", "information model")
+        is_technical_architecture_slide = (
+            slide_id == "sk_technical_arch"
+            or "technical architecture" in title
+            or "layered architecture" in title
+            or (
+                getattr(s, "diagram", None) is not None
+                and (getattr(s.diagram, "kind", "") or "").lower() == "technical_architecture"
+            )
+        )
+        if is_technical_architecture_slide:
+            s.title = "Layered technical architecture connects systems, products and custom services"
+            s.key_message = (
+                "The proposed composition reuses authoritative enterprise systems, selects products where they fit, "
+                "and reserves custom development for differentiated workflows and decision logic."
+            )
+            s.bullets = []
+            s.cards = []
+            s.comparison = None
+            s.detailed_points = []
+            if s.diagram is not None and not getattr(s.diagram, "approved", False):
+                s.diagram.kind = "technical_architecture"
+                s.diagram.prompt = _build_diagram_prompt(
+                    "technical_architecture", understanding, technology_recommendations
+                )
+            continue
+
+        is_deployment_slide = (
+            arch == "deployment architecture"
+            or (
+                "deployment" in title
+                and not any(token in title for token in ("high availability", "ha and dr", "disaster recovery"))
+            )
+            or (
+                getattr(s, "diagram", None) is not None
+                and (getattr(s.diagram, "kind", "") or "").lower() == "deployment"
+            )
+        )
+        if is_deployment_slide:
+            s.title = "Deployment and resilience protect operations"
+            s.key_message = (
+                "Environment separation, controlled promotion, secured runtime boundaries, and observability reduce release and operational risk."
+            )
+            s.bullets = _deployment_bullets(understanding, technology_recommendations)
+            s.cards = []
+            s.comparison = None
+            s.detailed_points = []
+            if s.diagram is not None and not getattr(s.diagram, "approved", False):
+                s.diagram.kind = "deployment"
+                s.diagram.prompt = _build_diagram_prompt("deployment", understanding)
+            continue
+
+        if slide_id == "sk_reporting" or any(
+            token in title for token in ("semantic layer", "decision-ready reporting")
         ):
+            s.title = "One governed semantic layer serves decision-ready reporting"
+            s.key_message = (
+                "Trusted catalogue, pricing, availability and workflow data is governed once, then reused consistently for operational, commercial, compliance and executive decisions."
+            )
+            s.bullets = []
+            s.detailed_points = []
+            s.cards = []
+            s.comparison = None
+            s.table = None
+            if s.diagram is not None and not getattr(s.diagram, "approved", False):
+                s.diagram.kind = "process"
+                s.diagram.prompt = _build_diagram_prompt("reporting", understanding)
+            continue
+
+        is_data_model_slide = (
+            (getattr(s, "slide_id", "") or "").lower() == "sk_data_model"
+            or any(token in title for token in ("data domain", "core data", "data model", "information model"))
+        )
+        if is_data_model_slide:
             s.key_message = (
                 "The data model separates authoritative inputs, canonical operational entities, control evidence, and governed consumption products."
             )
@@ -2677,6 +4134,10 @@ def enrich_slide_detail(deck_plan: DeckPlan, understanding: RFPUnderstanding | N
             s.cards = []
             s.comparison = None
             s.detailed_points = _data_domain_points(understanding)
+            if s.diagram is not None and not getattr(s.diagram, "approved", False):
+                s.diagram.kind = "data_model"
+                s.diagram.prompt = _build_diagram_prompt("data_model", understanding)
+            continue
 
         if arch == "delivery plan" and any(token in title for token in ("test", "acceptance", "uat", "sit")):
             customer = (getattr(understanding, "customer_name", None) or "customer").strip()
@@ -2688,9 +4149,7 @@ def enrich_slide_detail(deck_plan: DeckPlan, understanding: RFPUnderstanding | N
             s.cards = []
             s.comparison = None
             s.detailed_points = _testing_proposal_points(understanding)
-            if s.diagram is None:
-                s.diagram = DiagramSpec(kind="testing", prompt=_build_diagram_prompt("testing", understanding))
-            elif not getattr(s.diagram, "approved", False):
+            if s.diagram is not None and not getattr(s.diagram, "approved", False):
                 s.diagram.kind = "testing"
                 s.diagram.prompt = _build_diagram_prompt("testing", understanding)
             continue
@@ -2704,11 +4163,22 @@ def enrich_slide_detail(deck_plan: DeckPlan, understanding: RFPUnderstanding | N
             s.cards = []
             s.comparison = None
             s.detailed_points = _ams_proposal_points(understanding)
-            if s.diagram is None:
-                s.diagram = DiagramSpec(kind="ams", prompt=_build_diagram_prompt("ams", understanding))
-            elif not getattr(s.diagram, "approved", False):
+            if s.diagram is not None and not getattr(s.diagram, "approved", False):
                 s.diagram.kind = "ams"
                 s.diagram.prompt = _build_diagram_prompt("ams", understanding)
+            continue
+
+        if slide_id == "sk_roadmap_detail":
+            s.title = "Each roadmap increment has a clear outcome and exit gate"
+            s.key_message = (
+                "Every increment combines usable scope, customer decisions, assurance evidence and an explicit readiness outcome."
+            )
+            s.bullets = []
+            s.cards = []
+            s.comparison = None
+            s.table = None
+            s.diagram = None
+            s.detailed_points = _agile_roadmap_points()
             continue
 
         if arch in {"delivery plan", "timeline", "team"} and not _has_agile_delivery_language(s):
@@ -2808,7 +4278,7 @@ def polish_deck_text(deck_plan: DeckPlan) -> DeckPlan:
 
 
 def _short_card_body(text: str, limit: int = 135) -> str:
-    return _clip(_complete_sentences(text, 1) or text, limit)
+    return re.sub(r"\s+", " ", (_complete_sentences(text, 1) or text).strip())
 
 
 def _cards_from_detailed_points(points: List[BulletPoint], *, accent: str = "info", max_cards: int = 4) -> List[Card]:
@@ -2817,7 +4287,7 @@ def _cards_from_detailed_points(points: List[BulletPoint], *, accent: str = "inf
         full = re.sub(r"\s+", " ", (getattr(point, "text", "") or "").strip())
         heading = _concise_heading(full)
         bullets = [
-            _clip(item, 140)
+            re.sub(r"\s+", " ", item).strip()
             for item in (getattr(point, "sub_points", None) or [])
             if (item or "").strip()
         ][:3]
@@ -2826,7 +4296,7 @@ def _cards_from_detailed_points(points: List[BulletPoint], *, accent: str = "inf
         if full and len(full) > len(heading) + 12 and not any(
             full[:40].lower() in b.lower() for b in bullets
         ):
-            bullets = ([_clip(full, 150)] + bullets)[:3]
+            bullets = ([full] + bullets)[:3]
         if heading or bullets:
             cards.append(
                 Card(
@@ -2891,7 +4361,7 @@ def consulting_grade_proposal_polish(
 
         if arch == "customer context" or "challenge" in title or "current" in title:
             current_items = [
-                _clip(text, 100)
+                re.sub(r"\s+", " ", text).strip()
                 for text in _slide_line_items(slide)
                 if (text or "").strip()
             ][:5]
@@ -3009,13 +4479,239 @@ def enforce_slide_density(deck_plan: DeckPlan) -> DeckPlan:
     return deck_plan
 
 
-def ensure_diagrams_for_key_slides(deck_plan: DeckPlan, understanding: RFPUnderstanding | None = None) -> DeckPlan:
+def _diagram_kind_from_visual_type(visual_type: str) -> str:
+    mapping = {
+        "architecture": "architecture",
+        "technical_architecture": "technical_architecture",
+        "deployment": "deployment",
+        "hadr": "hadr",
+        "timeline": "timeline",
+        "process": "process",
+        "org": "org",
+        "data_flow": "data_model",
+        "sequence": "process",
+        "swimlane": "process",
+        "topology": "deployment",
+        "data_model": "data_model",
+        "testing": "testing",
+        "ams": "ams",
+    }
+    return mapping.get((visual_type or "").lower(), "generic")
+
+
+def _brief_grounding_score(brief: DiagramBrief) -> tuple[float, List[str]]:
+    entities = [e for e in (brief.entities or []) if (e or "").strip()]
+    flows = [f for f in (brief.flows or []) if (f or "").strip()]
+    evidence = [r for r in (brief.evidence_refs or []) if (r or "").strip()]
+    controls = [c for c in (brief.controls or []) if (c or "").strip()]
+    score = 0.0
+    if len(entities) >= 4:
+        score += 0.35
+    elif len(entities) >= 2:
+        score += 0.18
+    if len(flows) >= 2:
+        score += 0.30
+    elif len(flows) == 1:
+        score += 0.15
+    if evidence:
+        score += 0.20
+    if controls:
+        score += 0.15
+    warnings: List[str] = []
+    if len(entities) < 4:
+        warnings.append("Brief has fewer than four proposal-specific entities.")
+    if len(flows) < 2:
+        warnings.append("Brief has fewer than two concrete proposal flows.")
+    if not evidence:
+        warnings.append("Brief has no requirement/source evidence refs.")
+    return min(score, 1.0), warnings
+
+
+def _brief_to_diagram_prompt(brief: DiagramBrief, understanding: RFPUnderstanding | None = None) -> str:
+    customer = _customer_label(understanding, "the customer")
+    def solution_label(value: str) -> str:
+        clean = re.sub(r"\s+", " ", (value or "").strip())
+        clean = re.sub(
+            r"^(?:the\s+)?(?:platform|system|solution|project)\s+(?:shall|should|must)\s+",
+            "",
+            clean,
+            flags=re.I,
+        )
+        return clean[0].upper() + clean[1:] if clean else ""
+
+    entities = [item for item in (brief.entities or []) if not _is_open_visual_decision(item)]
+    flows = [item for item in (brief.flows or []) if not _is_open_visual_decision(item)]
+    controls = [item for item in (brief.controls or []) if not _is_open_visual_decision(item)]
+    must_show = [item for item in (brief.must_show or []) if not _is_open_visual_decision(item)]
+    parts = [
+        f"Create a proposal-specific {brief.visual_type} diagram for {customer}.",
+        f"Purpose: {(brief.purpose or brief.title or 'show the grounded proposal visual').strip()}",
+    ]
+    if entities:
+        parts.append("Use only these named entities/components where relevant: " + "; ".join(solution_label(item) for item in entities[:8]) + ".")
+    if flows:
+        parts.append("Show these directional flows: " + "; ".join(solution_label(item) for item in flows[:5]) + ".")
+    if controls:
+        parts.append("Show these controls/boundaries: " + "; ".join(solution_label(item) for item in controls[:4]) + ".")
+    if must_show:
+        parts.append("Must show: " + "; ".join(solution_label(item) for item in must_show[:4]) + ".")
+    banned = list(brief.must_not_show or [])
+    banned.extend(["generic stock diagram", "invented tools", "proposal-submission or procurement portals unless explicitly operational"])
+    parts.append("Must not show: " + "; ".join(dict.fromkeys(banned)) + ".")
+    # Assumptions remain in the traceability model and dedicated assumptions
+    # slide; image models tend to turn them into dense reviewer sidebars.
+    parts.append(
+        "Do not print requirement IDs, paragraph references, evidence citations, reviewer context, "
+        "source-processing notes, addendum status, or document-quality observations in the image. "
+        "Do not invent requirement-number ranges or label any group with requirement IDs."
+    )
+    parts.append(_SAFE_MARGIN_NOTE)
+    return "\n".join(parts).strip()
+
+
+def _brief_matches_slide(brief: DiagramBrief, slide: SlideSpec, fallback_kind: str) -> bool:
+    slide_id = (getattr(slide, "slide_id", "") or "").lower()
+    title = (getattr(slide, "title", "") or "").lower()
+    archetype = (getattr(slide, "archetype", "") or "").lower()
+    brief_id = (brief.slide_id or "").lower()
+    brief_title = (brief.title or "").lower()
+    visual_type = (brief.visual_type or "").lower()
+    compatible_types = {
+        "architecture": {"architecture"},
+        "technical_architecture": {"technical_architecture"},
+        "deployment": {"deployment", "topology"},
+        "hadr": {"hadr"},
+        "testing": {"testing"},
+        "ams": {"ams"},
+        "timeline": {"timeline"},
+        "org": {"org"},
+        "process": {"process", "sequence", "swimlane", "data_flow"},
+        "data_model": {"data_model", "data_flow"},
+        "generic": {"generic"},
+    }
+    if visual_type not in compatible_types.get(fallback_kind, {fallback_kind}):
+        return False
+    normalized_slide_id = re.sub(r"^(sk|auto|fallback)_", "", slide_id)
+    normalized_brief_id = re.sub(r"^(sk|auto|fallback)_", "", brief_id)
+    if normalized_brief_id and normalized_brief_id == normalized_slide_id:
+        return True
+    if brief_title and (brief_title in title or title in brief_title):
+        return True
+    aliases = {
+        "architecture": ("solution architecture", "target architecture"),
+        "technical_architecture": ("technical architecture", "layered architecture", "technology architecture"),
+        "deployment": ("deployment", "resilience", "runtime"),
+        "hadr": ("availability", "disaster", "resilience", "dr"),
+        "timeline": ("timeline", "roadmap"),
+        "process": ("process", "flow", "journey"),
+        "data_model": ("data domain", "core data", "data model", "information model"),
+        "org": ("team", "squad", "operating model"),
+        "testing": ("testing", "acceptance", "uat", "sit"),
+        "ams": ("ams", "support", "warranty", "operate", "operations"),
+    }
+    tokens = aliases.get(visual_type, aliases.get(fallback_kind, (fallback_kind,)))
+    haystack = f"{title} {archetype}"
+    return any(token in haystack for token in tokens)
+
+
+def _select_visual_brief(
+    slide: SlideSpec,
+    fallback_kind: str,
+    visual_briefs: List[DiagramBrief] | None,
+) -> DiagramBrief | None:
+    matches = [
+        brief for brief in (visual_briefs or [])
+        if _brief_matches_slide(brief, slide, fallback_kind)
+    ]
+    if not matches:
+        return None
+    slide_id = re.sub(r"^(sk|auto|fallback)_", "", (slide.slide_id or "").lower())
+    return max(
+        matches,
+        key=lambda brief: (
+            re.sub(r"^(sk|auto|fallback)_", "", (brief.slide_id or "").lower()) == slide_id,
+            len(brief.evidence_refs or []),
+            len(brief.entities or []) + len(brief.flows or []),
+        ),
+    )
+
+
+def _diagram_from_brief(brief: DiagramBrief, understanding: RFPUnderstanding | None = None) -> DiagramSpec:
+    score, warnings = _brief_grounding_score(brief)
+    return DiagramSpec(
+        kind=_diagram_kind_from_visual_type(brief.visual_type),
+        prompt=(
+            f"Diagram identity: {brief.slide_id or brief.title or brief.visual_type} [{brief.visual_type}].\n"
+            + _brief_to_diagram_prompt(brief, understanding)
+        ),
+        approved=False,
+        image_path=None,
+        entities=brief.entities,
+        flows=brief.flows,
+        controls=brief.controls,
+        evidence_refs=brief.evidence_refs,
+        open_assumptions=brief.open_assumptions,
+        grounding_score=score,
+        grounding_warnings=warnings,
+    )
+
+
+def ensure_diagrams_for_key_slides(
+    deck_plan: DeckPlan,
+    understanding: RFPUnderstanding | None = None,
+    visual_briefs: List[DiagramBrief] | None = None,
+    technology_recommendations: TechnologyRecommendationSet | None = None,
+) -> DeckPlan:
     """Ensure diagrams exist (as guarded approvals) for key slides."""
     for s in deck_plan.slides:
         arch = (s.archetype or "").lower()
         title = (s.title or "").lower()
+        slide_id = (getattr(s, "slide_id", "") or "").lower()
 
-        if arch in {
+        if _is_exec_summary(s):
+            s.diagram = None
+            continue
+
+        semantic_kind = "generic"
+        is_integration = any(token in title for token in ("integration", "interface"))
+        is_technical_architecture = (
+            slide_id == "sk_technical_arch"
+            or "technical architecture" in title
+            or "layered architecture" in title
+            or "technology architecture" in title
+        )
+        is_data_model = (
+            slide_id == "sk_data_model"
+            or any(token in title for token in ("data domain", "core data", "data model", "information model"))
+        )
+        is_reporting = slide_id == "sk_reporting" or any(
+            token in title for token in ("semantic layer", "decision-ready reporting")
+        )
+        if is_technical_architecture:
+            semantic_kind = "technical_architecture"
+        elif is_data_model:
+            semantic_kind = "data_model"
+        elif is_reporting:
+            semantic_kind = "process"
+        elif arch == "architecture":
+            semantic_kind = "architecture"
+        elif arch == "deployment architecture":
+            semantic_kind = "deployment"
+        elif arch == "high availability & dr":
+            semantic_kind = "hadr"
+        elif arch == "timeline":
+            semantic_kind = "timeline"
+        elif arch == "team":
+            semantic_kind = "org"
+        elif arch == "delivery plan":
+            if any(token in title for token in ("test", "acceptance", "uat", "sit")):
+                semantic_kind = "testing"
+            elif any(token in title for token in ("ams", "support", "warranty", "operate", "operations")):
+                semantic_kind = "ams"
+            else:
+                semantic_kind = "process"
+
+        if is_technical_architecture or is_data_model or is_reporting or arch in {
             "architecture",
             "deployment architecture",
             "high availability & dr",
@@ -3027,8 +4723,19 @@ def ensure_diagrams_for_key_slides(deck_plan: DeckPlan, understanding: RFPUnders
             if s.diagram is None:
                 prompt = ""
                 kind = "generic"
-                if arch == "architecture":
-                    prompt = _build_diagram_prompt("architecture", understanding)
+                if is_technical_architecture:
+                    prompt = _build_diagram_prompt(
+                        "technical_architecture", understanding, technology_recommendations
+                    )
+                    kind = "technical_architecture"
+                elif is_data_model:
+                    prompt = _build_diagram_prompt("data_model", understanding)
+                    kind = "data_model"
+                elif is_reporting:
+                    prompt = _build_diagram_prompt("reporting", understanding)
+                    kind = "process"
+                elif arch == "architecture":
+                    prompt = _build_diagram_prompt("integration" if is_integration else "architecture", understanding)
                     kind = "architecture"
                 elif arch == "deployment architecture":
                     prompt = _build_diagram_prompt("deployment", understanding)
@@ -3060,17 +4767,72 @@ def ensure_diagrams_for_key_slides(deck_plan: DeckPlan, understanding: RFPUnders
                         prompt = _build_diagram_prompt("solution", understanding)
                         kind = "generic"
 
-                if prompt:
-                    s.diagram = DiagramSpec(kind=kind, prompt=prompt, approved=False, image_path=None)
+                brief = None if is_integration else _select_visual_brief(s, kind, visual_briefs)
+                if brief is not None:
+                    s.diagram = _diagram_from_brief(brief, understanding)
+                elif prompt and kind != "ams":
+                    score = (
+                        0.5
+                        if understanding is not None and (
+                            is_integration or is_data_model or is_technical_architecture
+                        )
+                        else (0.25 if understanding is not None else 0.0)
+                    )
+                    warning = (
+                        "Integration topology derived directly from proposal requirements."
+                        if is_integration else
+                        "Layered technical architecture derived from proposal requirements and sourcing decisions."
+                        if is_technical_architecture else
+                        "Data-domain topology derived directly from proposal requirements."
+                        if is_data_model else
+                        "No proposal-derived visual brief matched this slide; using archetype fallback prompt."
+                    )
+                    s.diagram = DiagramSpec(
+                        kind=kind,
+                        prompt=prompt,
+                        approved=False,
+                        image_path=None,
+                        grounding_score=score,
+                        grounding_warnings=[warning],
+                    )
             elif arch == "solution overview" and _is_exec_summary(s):
                 # Remove any legacy Exec Summary diagram to keep it text-native.
                 s.diagram = None
+            elif s.diagram is not None and not getattr(s.diagram, "approved", False):
+                brief = None if is_integration else _select_visual_brief(s, semantic_kind, visual_briefs)
+                if brief is not None:
+                    s.diagram = _diagram_from_brief(brief, understanding)
+                elif semantic_kind == "ams":
+                    s.diagram = None
+                elif semantic_kind != "generic":
+                    prompt_kind = {"org": "team", "process": "delivery"}.get(semantic_kind, semantic_kind)
+                    s.diagram = DiagramSpec(
+                        kind=semantic_kind,
+                        prompt=_build_diagram_prompt("integration" if is_integration else prompt_kind, understanding),
+                        approved=False,
+                        grounding_score=(
+                            0.5
+                            if understanding is not None and (
+                                is_integration or is_data_model or is_technical_architecture
+                            )
+                            else 0.25
+                        ),
+                        grounding_warnings=(
+                            ["Integration topology derived directly from proposal requirements."]
+                            if is_integration else
+                            ["Layered technical architecture derived from proposal requirements and sourcing decisions."]
+                            if is_technical_architecture else
+                            ["Data-domain topology derived directly from proposal requirements."]
+                            if is_data_model else
+                            ["No proposal-derived visual brief matched this slide; using semantic fallback prompt."]
+                        ),
+                    )
 
             if (
                 s.diagram is not None
                 and _ai_ml_is_applicable(understanding)
                 and not getattr(s.diagram, "approved", False)
-                and arch in {"architecture", "deployment architecture", "timeline", "solution overview"}
+                and arch in {"timeline", "solution overview"}
                 and not _is_exec_summary(s)
                 and "ai-assisted" not in (s.diagram.prompt or "").lower()
             ):
@@ -3079,6 +4841,54 @@ def ensure_diagrams_for_key_slides(deck_plan: DeckPlan, understanding: RFPUnders
                     + "\n"
                     + _ai_ml_architecture_clause(understanding).strip()
                 ).strip()
+
+            if (
+                s.diagram is not None
+                and not getattr(s.diagram, "approved", False)
+                and (getattr(s.diagram, "kind", "") or "").lower() in {
+                    "technical_architecture", "deployment", "hadr"
+                }
+            ):
+                diagram_kind = (getattr(s.diagram, "kind", "") or "").lower()
+                technology_context = (
+                    _technical_architecture_context(technology_recommendations)
+                    if diagram_kind == "technical_architecture"
+                    else _deployment_technology_context(technology_recommendations)
+                    if diagram_kind == "deployment"
+                    else _hadr_technology_context(technology_recommendations)
+                )
+                if technology_context:
+                    # Rebuild from the authoritative platform decision instead of
+                    # appending to a possibly contradictory model-authored prompt.
+                    # This prevents stale AWS/Azure/GCP labels surviving after the
+                    # technology recommendation has selected a different provider.
+                    s.diagram.prompt = _build_diagram_prompt(
+                        diagram_kind,
+                        understanding,
+                        technology_recommendations,
+                    )
+
+            if (
+                s.diagram is not None
+                and not getattr(s.diagram, "approved", False)
+                and _is_open_visual_decision(s.diagram.prompt)
+            ):
+                prompt_kind = {
+                    "org": "team",
+                    "process": "delivery",
+                    "generic": "solution",
+                    "data_model": "data_model",
+                    "technical_architecture": "technical_architecture",
+                }.get((s.diagram.kind or "").lower(), (s.diagram.kind or "generic").lower())
+                if is_reporting:
+                    prompt_kind = "reporting"
+                if prompt_kind == "architecture" and is_integration:
+                    prompt_kind = "integration"
+                s.diagram.prompt = _build_diagram_prompt(
+                    prompt_kind,
+                    understanding,
+                    technology_recommendations,
+                )
 
         # Appendix architecture deep dives (if present as Content slides)
         if "appendix" in title and understanding is not None:
@@ -3242,12 +5052,16 @@ def _compact_deck_plan_prompt(
     layout_names: List[str],
     understanding: RFPUnderstanding | None,
     narrative: ExecutiveNarrative | None,
+    customer_technology_context: Dict[str, Any] | None = None,
+    contextual_reference_context: str = "",
 ) -> str:
     compact_layouts = layout_names[: min(16, len(layout_names))]
     payload = {
         "layouts": compact_layouts,
         "understanding": _compact_understanding_for_plan(understanding),
         "narrative": _compact_narrative_for_plan(narrative),
+        "customer_technology_context": customer_technology_context or {},
+        "contextual_reference_context": contextual_reference_context,
     }
     return (
         "You are a Tier-1 consulting deck architect. Return strict JSON matching the DeckPlan schema.\n"
@@ -3273,9 +5087,10 @@ def _compact_deck_plan_prompt(
 class SolutionBrief:
     """Cross-cutting decisions locked once, shared by every downstream step.
 
-    Deterministically derived from the RFP understanding + narrative so it is
-    stable and testable. Later phases (specialist agents) consume the same
-    brief so sections build on one foundation instead of diverging.
+    Deterministically derived from the RFP understanding + narrative, with an
+    explicit customer technology selection taking precedence over inferred
+    provider terms. Later phases consume the same brief so sections build on
+    one foundation instead of diverging.
     """
     customer: str
     engagement_kind: str
@@ -3313,16 +5128,30 @@ def _solution_name(understanding: RFPUnderstanding | None) -> str:
 def build_solution_brief(
     understanding: RFPUnderstanding | None,
     narrative: ExecutiveNarrative | None,
+    customer_technology_context: Dict[str, Any] | None = None,
 ) -> SolutionBrief:
     corpus = " ".join(
         [_understanding_text(understanding)]
         + ((getattr(understanding, "solution_technologies", None) or []) if understanding else [])
     )
     win = (getattr(narrative, "value_proposition", "") or "").strip() if narrative else ""
+    customer_platform = str(
+        (customer_technology_context or {}).get("platform") or ""
+    ).strip()
+    selected_provider = _selected_provider_family(customer_platform)
+    normalized_platform = customer_platform.lower()
+    if selected_provider:
+        target_cloud = selected_provider
+    elif "on-premises" in normalized_platform or "private cloud" in normalized_platform:
+        target_cloud = "on-premises / private cloud"
+    elif "hybrid" in normalized_platform:
+        target_cloud = "hybrid"
+    else:
+        target_cloud = _cloud_signal(corpus)
     return SolutionBrief(
         customer=_customer_label(understanding),
         engagement_kind=_engagement_kind(understanding),
-        target_cloud=_cloud_signal(corpus),
+        target_cloud=target_cloud,
         solution_name=_solution_name(understanding),
         win_theme=_clip(_complete_sentences(win, 1) or win, 180) if win else "",
     )
@@ -3405,20 +5234,85 @@ def lead_consolidation(deck_plan: DeckPlan, brief: SolutionBrief) -> DeckPlan:
     return deck_plan
 
 
+def _sanitize_customer_visible_source_notes(deck_plan: DeckPlan) -> DeckPlan:
+    """Keep extraction/audit mechanics out of customer-facing slide content."""
+    def clean(text: str | None) -> str:
+        value = re.sub(r"\s+", " ", (text or "").strip())
+        if _is_internal_source_note(value):
+            return ""
+        value = re.sub(r"\b(?:RFP|evidence) extract\b", "available requirements", value, flags=re.I)
+        value = re.sub(r"\bextracted evidence\b", "available requirements", value, flags=re.I)
+        return value
+
+    def sentence(text: str | None) -> str:
+        value = clean(text)
+        if value and value[-1] not in ".?!":
+            value += "."
+        return value
+
+    for slide in deck_plan.slides:
+        slide.key_message = sentence(slide.key_message) or None
+        slide.bullets = [value for item in slide.bullets if (value := sentence(item))]
+        slide.kpis = [value for item in slide.kpis if (value := clean(item))]
+        points: List[BulletPoint] = []
+        for point in slide.detailed_points:
+            heading = clean(point.text)
+            if heading:
+                points.append(BulletPoint(
+                    text=heading,
+                    sub_points=[value for item in point.sub_points if (value := sentence(item))],
+                ))
+        slide.detailed_points = points
+        cards: List[Card] = []
+        for card in slide.cards:
+            heading = clean(card.heading)
+            body = sentence(card.body)
+            bullets = [value for item in card.bullets if (value := sentence(item))]
+            if heading and (body or bullets):
+                cards.append(Card(heading=heading, body=body, bullets=bullets, accent=card.accent))
+        slide.cards = cards
+        if slide.comparison is not None:
+            slide.comparison.left.items = [
+                value for item in slide.comparison.left.items if (value := sentence(item))
+            ]
+            slide.comparison.right.items = [
+                value for item in slide.comparison.right.items if (value := sentence(item))
+            ]
+        if slide.table:
+            slide.table["rows"] = [
+                [clean(str(cell)) for cell in row]
+                for row in (slide.table.get("rows") or [])
+            ]
+    return deck_plan
+
+
 def _post_process_deck_plan(
     deck_plan: DeckPlan,
     *,
     understanding: RFPUnderstanding | None,
     narrative: ExecutiveNarrative | None,
+    visual_briefs: List[DiagramBrief] | None = None,
+    technology_recommendations: TechnologyRecommendationSet | None = None,
+    customer_technology_context: Dict[str, Any] | None = None,
 ) -> DeckPlan:
-    brief = build_solution_brief(understanding, narrative)
+    brief = build_solution_brief(
+        understanding,
+        narrative,
+        customer_technology_context,
+    )
     log.info(
         "Solution brief: customer=%r engagement=%r cloud=%r solution=%r",
         brief.customer, brief.engagement_kind, brief.target_cloud, brief.solution_name,
     )
     keystone_ids = {str(section.get("slide_id", "")) for section in _proposal_section_skeleton(understanding)}
     deck_plan = ensure_required_slides(deck_plan, understanding=understanding, narrative=narrative)
-    deck_plan = enrich_slide_detail(deck_plan, understanding=understanding)
+    deck_plan = _apply_technology_recommendations(deck_plan, technology_recommendations)
+    deck_plan = enrich_slide_detail(
+        deck_plan,
+        understanding=understanding,
+        technology_recommendations=technology_recommendations,
+        visual_briefs=visual_briefs,
+    )
     deck_plan = prune_empty_content_slides(deck_plan)
     deck_plan = prune_redundant_storyline_slides(deck_plan, protected_ids=keystone_ids)
     deck_plan = consulting_grade_proposal_polish(deck_plan, understanding=understanding, narrative=narrative)
@@ -3426,7 +5320,13 @@ def _post_process_deck_plan(
     deck_plan = synchronize_agenda(deck_plan)
     deck_plan = polish_deck_text(deck_plan)
     deck_plan = lead_consolidation(deck_plan, brief)
-    deck_plan = ensure_diagrams_for_key_slides(deck_plan, understanding=understanding)
+    deck_plan = _sanitize_customer_visible_source_notes(deck_plan)
+    deck_plan = ensure_diagrams_for_key_slides(
+        deck_plan,
+        understanding=understanding,
+        visual_briefs=visual_briefs,
+        technology_recommendations=technology_recommendations,
+    )
     deck_plan = enforce_slide_density(deck_plan)
     return deck_plan
 
@@ -3471,6 +5371,15 @@ def _fallback_deck_plan(
             title="Solution architecture builds the centralized data hub",
             archetype="Architecture",
             diagram=DiagramSpec(kind="architecture", prompt=_build_diagram_prompt("architecture", understanding)),
+        ),
+        SlideSpec(
+            slide_id="fallback_technical_architecture",
+            title="Layered technical architecture connects systems, products and custom services",
+            archetype="Architecture",
+            diagram=DiagramSpec(
+                kind="technical_architecture",
+                prompt=_build_diagram_prompt("technical_architecture", understanding),
+            ),
         ),
         SlideSpec(
             slide_id="fallback_deployment",
@@ -3595,7 +5504,9 @@ def _is_data_platform_engagement(understanding: RFPUnderstanding | None) -> bool
 def _cloud_signal(corpus: str) -> str:
     """Return the dominant target cloud ('azure' | 'aws' | 'gcp' | '')."""
     c = (corpus or "").lower()
-    if any(t in c for t in ("azure", "microsoft fabric", "power bi", "entra", "onelake", "aks", "app service")):
+    # Reporting or endpoint products do not establish the hosting platform.
+    # Require an actual cloud/platform signal before selecting an ecosystem.
+    if any(t in c for t in ("azure", "microsoft fabric", "onelake", "aks", "azure app service")):
         return "azure"
     if any(t in c for t in ("aws", "amazon web services", "eks", "redshift", "cloudfront", "lambda")):
         return "aws"
@@ -3642,6 +5553,14 @@ def _proposal_section_skeleton(understanding: RFPUnderstanding | None) -> List[D
     has_migration = _contains_any(text, ("migration", "migrate", "legacy", "cutover", "re-platform", "replatform", "modernization", "modernisation", "lift and shift"))
     has_support = _contains_any(text, ("ams", "maintenance", "support", "warranty", "hypercare", "operate", "run"))
     has_security = _contains_any(text, ("security", "mfa", "audit", "siem", "access control", "encryption", "compliance", "log"))
+    needs_technical_architecture = _contains_any(
+        text,
+        (
+            "system", "application", "platform", "software", "digital", "technology",
+            "architecture", "develop", "development", "build", "implement", "cloud",
+            "data", "database", "catalogue", "catalog", "api", "integration", "interface",
+        ),
+    )
 
     # Neutral outcomes title; only name the customer when it is a real name.
     outcomes_title = (
@@ -3661,12 +5580,29 @@ def _proposal_section_skeleton(understanding: RFPUnderstanding | None) -> List[D
         {"slide_id": "sk_flow", "title": "End-to-end solution flow", "archetype": "Solution Overview", "purpose": "Visual flow from inputs through the solution to outputs", "diagram_kind": "process"},
         {"slide_id": "sk_arch", "title": "Concrete solution architecture", "archetype": "Architecture", "purpose": "Specific build architecture and major components", "diagram_kind": "architecture"},
     ]
+    if needs_technical_architecture:
+        sections.append({
+            "slide_id": "sk_technical_arch",
+            "title": "Layered technical architecture connects systems, products and custom services",
+            "archetype": "Architecture",
+            "purpose": (
+                "External systems and their data, COTS/build/integrate decisions, technical layers, "
+                "selected platform services and cross-cutting controls"
+            ),
+            "diagram_kind": "technical_architecture",
+        })
     if has_integration:
         sections.append({"slide_id": "sk_integration", "title": "Integration architecture connects source and consumer systems", "archetype": "Architecture", "purpose": "APIs, files, messaging, system dependencies, error handling", "diagram_kind": "architecture"})
     if is_data:
         sections.extend([
-            {"slide_id": "sk_data_model", "title": "Core data domains and ownership", "archetype": "Content", "purpose": "Core data entities/domains and ownership"},
-            {"slide_id": "sk_reporting", "title": "Reporting and analytics reuse trusted data", "archetype": "Content", "purpose": "Reports, dashboards, analytics, and governed outputs"},
+            {"slide_id": "sk_data_model", "title": "Core data domains and ownership", "archetype": "Content", "purpose": "Core data entities/domains, relationships, ownership and stewardship", "diagram_kind": "data_model"},
+            {
+                "slide_id": "sk_reporting",
+                "title": "One governed semantic layer serves decision-ready reporting",
+                "archetype": "Content",
+                "purpose": "A simple trusted-data-to-decisions story for operational, commercial, compliance and executive audiences; avoid a dense report matrix",
+                "diagram_kind": "process",
+            },
         ])
     if _ai_ml_is_applicable(understanding):
         sections.append({
@@ -3681,8 +5617,14 @@ def _proposal_section_skeleton(understanding: RFPUnderstanding | None) -> List[D
     if has_migration:
         sections.append({"slide_id": "sk_migration", "title": "Migration and cutover protect continuity", "archetype": "Delivery Plan", "purpose": "Data/workload migration, rehearsals, cutover controls"})
     sections.extend([
-        {"slide_id": "sk_testing", "title": "Acceptance evidence proves the solution is ready", "archetype": "Delivery Plan", "purpose": "Requirement-led evidence for named interfaces, functional parity, reconciliation, controls, customer UAT, and cutover readiness"},
+        {"slide_id": "sk_testing", "title": "Acceptance evidence proves the solution is ready", "archetype": "Delivery Plan", "purpose": "Requirement-led evidence streams for named interfaces, functional parity, reconciliation, controls, customer UAT, and cutover readiness", "diagram_kind": "testing"},
         {"slide_id": "sk_roadmap", "title": "Agile roadmap releases value through increments", "archetype": "Timeline", "purpose": "Incremental delivery, gates, feedback, readiness", "diagram_kind": "timeline"},
+        {
+            "slide_id": "sk_roadmap_detail",
+            "title": "Each roadmap increment has a clear outcome and exit gate",
+            "archetype": "Content",
+            "purpose": "Follow the roadmap with a concise explanation of increment outcomes, customer decisions, evidence and exit gates",
+        },
     ])
     if has_support:
         sections.append({"slide_id": "sk_ams", "title": "Warranty and AMS support model", "archetype": "Delivery Plan", "purpose": "Service coverage, monitoring, interface ownership, runbooks, warranty transition, and improvement"})
@@ -3701,8 +5643,14 @@ def _proposal_section_skeleton(understanding: RFPUnderstanding | None) -> List[D
 def _chunked_plan_input(
     understanding: RFPUnderstanding | None,
     narrative: ExecutiveNarrative | None,
+    customer_technology_context: Dict[str, Any] | None = None,
+    contextual_reference_context: str = "",
 ) -> str:
-    brief = build_solution_brief(understanding, narrative)
+    brief = build_solution_brief(
+        understanding,
+        narrative,
+        customer_technology_context,
+    )
     payload = {
         # Locked cross-cutting decisions the Lead Architect sets up-front; every
         # section must write against these so the deck stays consistent.
@@ -3715,6 +5663,8 @@ def _chunked_plan_input(
         },
         "understanding": _compact_understanding_for_plan(understanding),
         "narrative": _compact_narrative_for_plan(narrative),
+        "customer_technology_context": customer_technology_context or {},
+        "contextual_reference_context": contextual_reference_context,
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
@@ -3741,10 +5691,17 @@ def _chunked_deck_plan(
     title: str,
     understanding: RFPUnderstanding | None,
     narrative: ExecutiveNarrative | None,
+    customer_technology_context: Dict[str, Any] | None = None,
+    contextual_reference_context: str = "",
 ) -> DeckPlan:
     sections = _proposal_section_skeleton(understanding)
     batch_size = max(2, min(6, getattr(settings, "deck_plan_batch_size", 4)))
-    input_json = _chunked_plan_input(understanding, narrative)
+    input_json = _chunked_plan_input(
+        understanding,
+        narrative,
+        customer_technology_context,
+        contextual_reference_context,
+    )
     all_slides: List[SlideSpec] = []
     for batch_index, batch in enumerate(_batched(sections, batch_size), start=1):
         prompt = DECK_SECTION_EXPANSION_PROMPT.format(
@@ -3764,6 +5721,7 @@ def _chunked_deck_plan(
                 DeckPlan,
                 reasoning_effort=settings.reasoning_effort_deck_plan,
                 timeout_seconds=settings.deck_plan_timeout_s,
+                background=True,
             )
             all_slides.extend(partial.slides)
         except Exception:
@@ -3826,7 +5784,7 @@ def _section_role(section: Dict[str, Any]) -> str:
         return _ROLE_INTEGRATION
     if sid in {"sk_data_model", "sk_reporting"}:
         return _ROLE_DATA
-    if sid in {"sk_solution", "sk_flow", "sk_arch", "sk_deployment", "sk_security"} or archetype in {
+    if sid in {"sk_solution", "sk_flow", "sk_arch", "sk_technical_arch", "sk_deployment", "sk_security"} or archetype in {
         "architecture", "deployment architecture", "solution overview", "high availability & dr",
     }:
         return _ROLE_APPLICATION
@@ -3856,6 +5814,7 @@ def _expand_role_sections(
                 DeckPlan,
                 reasoning_effort=settings.reasoning_effort_deck_plan,
                 timeout_seconds=settings.deck_plan_timeout_s,
+                background=True,
             )
             slides.extend(partial.slides)
         except Exception:
@@ -3871,10 +5830,17 @@ def _specialist_deck_plan(
     title: str,
     understanding: RFPUnderstanding | None,
     narrative: ExecutiveNarrative | None,
+    customer_technology_context: Dict[str, Any] | None = None,
+    contextual_reference_context: str = "",
 ) -> DeckPlan:
     sections = _proposal_section_skeleton(understanding)
     batch_size = max(2, min(6, getattr(settings, "deck_plan_batch_size", 4)))
-    input_json = _chunked_plan_input(understanding, narrative)
+    input_json = _chunked_plan_input(
+        understanding,
+        narrative,
+        customer_technology_context,
+        contextual_reference_context,
+    )
 
     # Group sections by owning role (order preserved within each group).
     groups: Dict[str, List[Dict[str, Any]]] = {}
@@ -3941,11 +5907,16 @@ def plan_deck(state: AgentState) -> Dict[str, Any]:
             title=plan_title,
             understanding=state.understanding,
             narrative=state.narrative,
+            customer_technology_context=state.customer_technology_context,
+            contextual_reference_context=state.contextual_reference_context,
         )
         deck_plan = _post_process_deck_plan(
             deck_plan,
             understanding=state.understanding,
             narrative=state.narrative,
+            visual_briefs=state.visual_briefs,
+            technology_recommendations=state.technology_recommendations,
+            customer_technology_context=state.customer_technology_context,
         )
         state.deck_plan = deck_plan
         return {"deck_plan": deck_plan}
@@ -3959,11 +5930,16 @@ def plan_deck(state: AgentState) -> Dict[str, Any]:
             title=plan_title,
             understanding=state.understanding,
             narrative=state.narrative,
+            customer_technology_context=state.customer_technology_context,
+            contextual_reference_context=state.contextual_reference_context,
         )
         deck_plan = _post_process_deck_plan(
             deck_plan,
             understanding=state.understanding,
             narrative=state.narrative,
+            visual_briefs=state.visual_briefs,
+            technology_recommendations=state.technology_recommendations,
+            customer_technology_context=state.customer_technology_context,
         )
         state.deck_plan = deck_plan
         return {"deck_plan": deck_plan}
@@ -3980,6 +5956,11 @@ def plan_deck(state: AgentState) -> Dict[str, Any]:
         if state.narrative is not None
         else "{}"
     )
+    customer_technology_context_json = json.dumps(
+        state.customer_technology_context or {},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     rag_context = _bounded_plan_context(state.rag_context or "")
 
     layout_json = json.dumps(layout_names, ensure_ascii=False, separators=(",", ":"))
@@ -3991,6 +5972,8 @@ def plan_deck(state: AgentState) -> Dict[str, Any]:
         rag_context=rag_context,
         understanding_json=understanding_json,
         narrative_json=narrative_json,
+        customer_technology_context_json=customer_technology_context_json,
+        contextual_reference_context=state.contextual_reference_context,
     )
     prompt_mode = "full"
     max_prompt_chars = max(12000, getattr(settings, "deck_plan_prompt_max_chars", 30000))
@@ -3999,6 +5982,8 @@ def plan_deck(state: AgentState) -> Dict[str, Any]:
             layout_names=layout_names,
             understanding=state.understanding,
             narrative=state.narrative,
+            customer_technology_context=state.customer_technology_context,
+            contextual_reference_context=state.contextual_reference_context,
         )
         prompt_mode = "compact"
 
@@ -4021,6 +6006,7 @@ def plan_deck(state: AgentState) -> Dict[str, Any]:
             DeckPlan,
             reasoning_effort=settings.reasoning_effort_deck_plan,
             timeout_seconds=settings.deck_plan_timeout_s,
+            background=True,
         )
     except Exception:
         log.warning(
@@ -4038,6 +6024,9 @@ def plan_deck(state: AgentState) -> Dict[str, Any]:
         deck_plan,
         understanding=state.understanding,
         narrative=state.narrative,
+        visual_briefs=state.visual_briefs,
+        technology_recommendations=state.technology_recommendations,
+        customer_technology_context=state.customer_technology_context,
     )
 
     state.deck_plan = deck_plan
@@ -4048,18 +6037,37 @@ def plan_deck(state: AgentState) -> Dict[str, Any]:
 def compress_bullets(state: AgentState) -> Dict[str, Any]:
     """Editorial pass: tighten bullets to executive-grade language.
 
-    Runs the SLIDE_COMPRESSION_PROMPT and merges only the rewritten bullets back
-    by slide_id, preserving slide order, diagrams, tables, and traceability. Any
-    failure leaves the original deck untouched.
+    Sends only slide IDs, titles and editable bullets, then merges the rewritten
+    bullets back by slide_id. Diagrams, tables, notes and traceability never enter
+    this editorial request. Any failure leaves the original deck untouched.
     """
     if state.deck_plan is None:
         return {"deck_plan": None}
+    editable_slides = [
+        {
+            "slide_id": slide.slide_id,
+            "title": slide.title,
+            "bullets": slide.bullets,
+        }
+        for slide in state.deck_plan.slides
+        if slide.bullets
+    ]
+    if not editable_slides:
+        return {"deck_plan": state.deck_plan}
     try:
         prompt = SLIDE_COMPRESSION_PROMPT.format(
-            deck_plan_json=state.deck_plan.model_dump()
+            bullet_input_json=json.dumps(
+                {"slides": editable_slides},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
         )
         compressed = response_as_schema(
-            prompt, DeckPlan, reasoning_effort=settings.reasoning_effort_medium
+            prompt,
+            BulletCompressionSet,
+            model=settings.model_fast,
+            reasoning_effort=settings.reasoning_effort_low,
+            background=False,
         )
         by_id = {s.slide_id: s for s in compressed.slides}
         for s in state.deck_plan.slides:
@@ -4082,7 +6090,9 @@ def _fallback_note(slide: SlideSpec) -> str:
     parts: List[str] = []
     title = (slide.title or "").strip()
     if title:
-        parts.append(f'This slide covers "{title}."')
+        parts.append(
+            f'Open by framing the central message of "{title}" and why that decision matters to the customer.'
+        )
 
     points: List[str] = []
     if getattr(slide, "detailed_points", None):
@@ -4096,10 +6106,27 @@ def _fallback_note(slide: SlideSpec) -> str:
         points = [b.strip() for b in (slide.bullets or []) if (b or "").strip()]
 
     if points:
-        parts.append("Walk the audience through each point: " + "; ".join(points[:6]) + ".")
+        parts.append("Then explain the slide in this order: " + "; ".join(points[:6]) + ".")
         parts.append(
-            "For each, explain why it matters to the client and connect it to their priorities."
+            "For each point, connect the visible statement to the design rationale, the risk it controls, and the customer outcome it enables."
         )
+    if slide.diagram is not None:
+        diagram = slide.diagram
+        entities = [item for item in (diagram.entities or []) if item][:5]
+        flows = [item for item in (diagram.flows or []) if item][:3]
+        if entities:
+            parts.append("Read the visual through its main components: " + "; ".join(entities) + ".")
+        if flows:
+            parts.append("Trace the important movement or decision path: " + "; ".join(flows) + ".")
+    if slide.table:
+        headers = [str(value) for value in (slide.table.get("headers") or [])]
+        if headers:
+            parts.append(
+                "Explain how the table links " + ", ".join(headers[:4]) + ", highlighting choices and rationale rather than reading every cell."
+            )
+    parts.append(
+        "Close by separating committed design choices from items that still require normal architecture validation, then transition to the next decision in the story."
+    )
     return " ".join(parts).strip()
 
 
@@ -4118,15 +6145,96 @@ def _slide_wants_notes(slide: SlideSpec) -> bool:
     return True
 
 
+def _compact_slide_for_notes(
+    slide: SlideSpec,
+    previous_title: str,
+    next_title: str,
+) -> Dict[str, Any]:
+    diagram = slide.diagram
+    comparison = slide.comparison
+    return {
+        "slide_id": slide.slide_id,
+        "title": slide.title,
+        "archetype": slide.archetype,
+        "previous_slide_title": previous_title,
+        "next_slide_title": next_title,
+        "key_message": slide.key_message,
+        "bullets": slide.bullets,
+        "detailed_points": [
+            {"text": point.text, "sub_points": point.sub_points}
+            for point in (slide.detailed_points or [])
+        ],
+        "cards": [
+            {"heading": card.heading, "body": card.body, "bullets": card.bullets}
+            for card in (slide.cards or [])
+        ],
+        "comparison": (
+            {
+                "left": {"heading": comparison.left.heading, "items": comparison.left.items},
+                "right": {"heading": comparison.right.heading, "items": comparison.right.items},
+            }
+            if comparison is not None else None
+        ),
+        "table": (
+            {
+                "headers": (slide.table.get("headers") or [])[:6],
+                "rows": (slide.table.get("rows") or [])[:10],
+            }
+            if slide.table else None
+        ),
+        "diagram": (
+            {
+                "kind": diagram.kind,
+                "entities": (diagram.entities or [])[:10],
+                "flows": (diagram.flows or [])[:6],
+                "controls": (diagram.controls or [])[:6],
+                "design_prompt": _clip(diagram.prompt or "", 2200),
+            }
+            if diagram is not None else None
+        ),
+    }
+
+
+def _technology_context_for_notes(
+    recommendation_set: TechnologyRecommendationSet | None,
+) -> Dict[str, Any]:
+    if recommendation_set is None:
+        return {}
+    return {
+        "selected_platform": recommendation_set.selected_platform,
+        "hosting_model": recommendation_set.hosting_model,
+        "deployment_rationale": recommendation_set.deployment_rationale,
+        "primary_region_strategy": recommendation_set.primary_region_strategy,
+        "recommendations": [
+            {
+                "layer": item.architecture_layer,
+                "technology": item.proposed_technology,
+                "role": item.role,
+                "status": item.status,
+            }
+            for item in (recommendation_set.recommendations or [])[:20]
+        ],
+        "component_decisions": [
+            {
+                "capability": item.capability,
+                "recommendation": item.recommendation,
+                "sourcing": item.sourcing_model,
+                "role": item.role,
+                "system_of_record": item.system_of_record,
+            }
+            for item in (recommendation_set.component_decisions or [])[:10]
+        ],
+    }
+
+
 @_logged_node
 def generate_notes(state: AgentState) -> Dict[str, Any]:
     """Generate presenter speaker notes for content slides.
 
-    Best-effort: a single fast LLM pass writes notes that unpack the reasoning
-    behind each slide so a human can present it confidently. Any slide the model
-    misses (or the whole pass, if it fails) falls back to deterministic notes
-    derived from the slide content. Self-explanatory slides (Title, Agenda, Next
-    Steps) are skipped. Never fails the pipeline.
+    Notes are generated in small parallel batches. This gives the model enough
+    room to explain visuals and design decisions without one very large request,
+    while a failed batch falls back independently instead of degrading the whole
+    deck. Self-explanatory slides are skipped. Never fails the pipeline.
     """
     if state.deck_plan is None:
         return {"deck_plan": None}
@@ -4136,43 +6244,54 @@ def generate_notes(state: AgentState) -> Dict[str, Any]:
     notes_by_id: Dict[str, str] = {}
 
     if notes_slides and getattr(state, "enable_notes", True):
-        try:
-            compact = [
-                {
-                    "slide_id": s.slide_id,
-                    "title": s.title,
-                    "archetype": s.archetype,
-                    "bullets": s.bullets,
-                    "detailed_points": [
-                        {"text": p.text, "sub_points": p.sub_points}
-                        for p in (s.detailed_points or [])
-                    ],
-                }
-                for s in notes_slides
-            ]
+        index_by_id = {slide.slide_id: index for index, slide in enumerate(slides)}
+        batch_size = max(2, min(10, int(getattr(settings, "notes_batch_size", 6))))
+        batches = [notes_slides[index:index + batch_size] for index in range(0, len(notes_slides), batch_size)]
+        technology_context = _technology_context_for_notes(state.technology_recommendations)
+        narrative_context = state.narrative.model_dump() if state.narrative else {}
+        understanding_summary = (
+            getattr(state.understanding, "summary", "") if state.understanding else ""
+        ) or ""
+        reference_context = (state.contextual_reference_context or "")[:6000]
+
+        def generate_batch(batch: List[SlideSpec]) -> DeckNotes:
+            compact: List[Dict[str, Any]] = []
+            for slide in batch:
+                index = index_by_id.get(slide.slide_id, 0)
+                previous_title = slides[index - 1].title if index > 0 else ""
+                next_title = slides[index + 1].title if index + 1 < len(slides) else ""
+                compact.append(_compact_slide_for_notes(slide, previous_title, next_title))
             prompt = SPEAKER_NOTES_PROMPT.format(
-                deck_plan_json=compact,
-                narrative_json=state.narrative.model_dump() if state.narrative else {},
-                understanding_summary=(
-                    getattr(state.understanding, "summary", "") if state.understanding else ""
-                )
-                or "",
+                deck_plan_json=json.dumps(compact, ensure_ascii=False, separators=(",", ":")),
+                narrative_json=json.dumps(narrative_context, ensure_ascii=False, separators=(",", ":")),
+                understanding_summary=understanding_summary,
+                technology_context=json.dumps(technology_context, ensure_ascii=False, separators=(",", ":")),
+                reference_context=reference_context,
             )
-            deck_notes = response_as_schema(
+            return response_as_schema(
                 prompt,
                 DeckNotes,
                 model=settings.model_fast,
                 reasoning_effort=settings.reasoning_effort_low,
+                background=False,
             )
-            for n in deck_notes.notes:
-                if n.slide_id and (n.notes or "").strip():
-                    notes_by_id[n.slide_id] = n.notes.strip()
-        except Exception:
-            # Notes are an enhancement; never fail the deck over them.
-            log.warning(
-                "Speaker-notes LLM pass failed; using deterministic fallback notes.",
-                exc_info=True,
-            )
+
+        workers = max(1, min(int(getattr(settings, "notes_workers", 3)), len(batches)))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="rfp-notes") as executor:
+            futures = {executor.submit(generate_batch, batch): batch for batch in batches}
+            for future in as_completed(futures):
+                batch = futures[future]
+                try:
+                    deck_notes = future.result()
+                    for note in deck_notes.notes:
+                        if note.slide_id and (note.notes or "").strip():
+                            notes_by_id[note.slide_id] = note.notes.strip()
+                except Exception:
+                    log.warning(
+                        "Speaker-notes batch failed for slides %s; using deterministic notes for that batch.",
+                        ", ".join(slide.slide_id for slide in batch),
+                        exc_info=True,
+                    )
 
     for s in slides:
         if not _slide_wants_notes(s):

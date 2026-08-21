@@ -115,6 +115,15 @@ ANALYSIS LENSES (reflect these in the JSON fields of the schema):
     requirements, or diagrams.
   - Do **not** invent technologies that are not named in the RFP; if none are
     named for the solution, return an empty list.
+  - Explicitly inspect development, build, source-control, testing, test-data,
+    quality/security scanning, CI/CD, infrastructure-as-code, deployment,
+    hosting/runtime, monitoring, and support sections for named technologies.
+    Preserve those names in `solution_technologies` and describe their stated
+    role and evidence in `software_bill_of_materials`.
+  - Do not infer a wider vendor ecosystem from one adjacent product. For
+    example, Power BI alone does not establish Microsoft Fabric or Azure as the
+    target platform, and a source/endpoint technology does not establish the
+    implementation stack.
 - Software Bill of Materials:
   - Populate `software_bill_of_materials` with named solution components,
     source/target systems, data stores, integration/runtime components,
@@ -340,6 +349,14 @@ RULES:
     ingestion/extraction, validation/business rules, central operational data
     store or lakehouse, application services, APIs, reporting/BI, security,
     monitoring, and operational support boundaries.
+  - A separate Layered Technical Architecture when the proposal includes a
+    system, application, platform, data, integration, cloud, or software build.
+    This view must show external systems and channels, systems of record, the
+    data each supplies, COTS/SaaS or existing enterprise products, custom
+    services, integration/API services, operational and analytical data
+    services, the selected hosting platform, and cross-cutting security and
+    operations. Do not relabel the logical or solution architecture as the
+    technical architecture.
   - An AI/ML opportunity assessment when the scope contains suitable data,
     recurring exceptions, forecasting needs, analytics, or support workflows.
     Prioritise 2-4 use cases by business value, data readiness, implementation
@@ -361,6 +378,22 @@ RULES:
     referenced solution technologies; complete missing layers with a qualified
     ecosystem-aligned recommendation and mark each row as required/referenced,
     proposed/confirm, or platform-decision-required.
+    Before recommending products, audit the understanding for explicitly named
+    development, testing, CI/CD, deployment, runtime, data, integration,
+    security, observability, and support technologies. Preserve mandatory
+    choices and compatibility constraints, but do not treat every mentioned
+    product as a mandate or infer an entire vendor stack from one product.
+    For layers not prescribed by the RFP, reason independently from workload
+    shape, functional and non-functional requirements, integration fit,
+    portability, team operability, security/compliance, delivery speed, lock-in,
+    licensing, and run cost. Consider credible open-source, managed-cloud,
+    SaaS, and hybrid alternatives before selecting a recommendation. Do not
+    default to Microsoft Fabric, Azure, AWS, GCP, or any other familiar stack.
+    Include development, automated testing, security/quality gates, CI/CD,
+    infrastructure-as-code, environment promotion, deployment, observability,
+    and operational tooling where relevant. In the status/basis column, state
+    whether each row is RFP-mandated, RFP-referenced/current-state,
+    independently recommended (with a concise reason), or a customer decision.
     The slide MUST populate the structured `table` field with headers and rows;
     do not return a title, key message, or bullets without the table payload.
     Never include procurement, tender, clarification, pricing-upload, or
@@ -372,6 +405,13 @@ RULES:
     site/business unit, or scheduled cutover.
   - Explain why the model fits. Do not name cloud services/products unless the
     RFP names them or reusable context explicitly mandates them.
+  - Do not choose or print a target cloud provider in a diagram prompt. The
+    independent technology-recommendation pass supplies the authoritative
+    provider and services after slide planning.
+  - Keep unresolved hosting, environment, interface, recovery, support, and
+    approval decisions on the Assumptions and Dependencies slide. Diagram
+    labels must show the proposed topology and must not contain unresolved-status
+    placeholders or customer-confirmation qualifiers.
 
 AI/ML VALUE AND COST DISCIPLINE:
 - Do not add AI terminology to every slide. Integrate it selectively into the
@@ -575,7 +615,7 @@ DIAGRAMS (VERY IMPORTANT):
 - For Architecture, Deployment Architecture, High Availability & DR, Timeline,
   Team, Data Model, Operating Model:
   Provide a `diagram` object with:
-  - kind (architecture/deployment/hadr/timeline/org/data_model)
+  - kind (architecture/technical_architecture/deployment/hadr/timeline/org/data_model)
   - prompt (clear, renderable, consulting style)
 - The diagram prompt MUST be **grounded in this specific RFP**:
   - Name the actual technologies, platforms, datastores, and tools from the RFP
@@ -643,8 +683,13 @@ CONSTRAINTS:
 - Use only information from:
   - RFP understanding JSON
   - Executive narrative spine JSON
+  - Customer technology context JSON
+  - Advisory supporting-reference context for design options only
   - Reusable context
   Do **not** fabricate specific metrics, SLAs, or commitments.
+- Treat a platform supplied in Customer technology context as the authoritative
+  target-platform decision. It overrides conflicting inferred or draft provider
+  labels in the RFP understanding for the proposed target architecture.
 
 OUTPUT FORMAT:
 Return **strictly valid JSON** that conforms to the DeckPlan V2 schema.
@@ -664,6 +709,12 @@ RFP understanding (JSON):
 
 Executive narrative spine (JSON):
 {narrative_json}
+
+Customer technology context (JSON; explicit selection takes precedence):
+{customer_technology_context_json}
+
+Advisory supporting-reference context (not customer scope or a mandate):
+{contextual_reference_context}
 """
 
 DECK_SECTION_EXPANSION_PROMPT = """
@@ -678,12 +729,33 @@ RULES:
 - Return strict JSON matching the DeckPlan schema.
 - Create 1 slide for each section unless the section explicitly asks for 2.
 - Use RFP-grounded content only from INPUT_JSON.
+- INPUT_JSON.contextual_reference_context is advisory architecture research. Use
+  it to enrich layers, product options and rationale, but never restate it as a
+  customer requirement, current-state fact, or committed product selection.
 - Be specific enough for a customer pre-read; avoid slogans and generic filler.
 - Keep each slide readable: 3-5 bullets, 3-4 detailed points, or a table/diagram.
 - Diagram slides must be visual-first: include a diagram and leave bullets,
   detailed_points, cards, and comparison empty.
 - For architecture/data/deployment/delivery sections, include concrete labels,
   flows, controls, assumptions, and named systems from the input.
+- When a section declares `diagram_kind`, always populate its `diagram` object
+  with that exact kind. In particular, `sk_data_model` must contain a grounded
+  `data_model` diagram that shows domains, relationships, ownership and
+  stewardship rather than a title-and-message-only slide.
+- `sk_technical_arch` must contain a `technical_architecture` diagram that is
+  distinct from the logical/solution view. Show clear layers, external systems,
+  systems of record and their data, selected COTS/managed products, custom
+  components, integration paths, data services, platform services, and
+  cross-cutting controls only where the supplied proposal makes them applicable.
+  Derive, name and order the layers from the proposal rather than applying a
+  fixed layer taxonomy. The later recommendation pass may replace provisional
+  category labels with its authoritative product and sourcing decisions.
+- Keep diagram entities and flows provider-neutral during this pass. Do not
+  choose or print a target cloud provider; the later technology-recommendation
+  pass supplies the authoritative platform and services.
+- Put unresolved choices in diagram.open_assumptions for the dedicated
+  Assumptions and Dependencies slide. Never instruct the image to print
+  unresolved-status placeholders or customer-confirmation qualifiers.
 - Preserve the slide_id and archetype supplied in SECTIONS.
 
 SECTIONS TO EXPAND:
@@ -693,11 +765,191 @@ INPUT_JSON:
 {input_json}
 """
 
+VISUAL_BRIEF_PROMPT = """
+You are a consulting visual architect. Your task is to decide which proposal
+visuals are actually justified by the RFP analysis before any image prompt is
+written.
+
+Return strict JSON matching DiagramBriefSet.
+
+Rules:
+- Treat INPUT_JSON.contextual_reference_context as advisory architecture
+  research. It may inform design options and visual structure but must not be
+  converted into customer scope, an RFP mandate, or a current-state fact.
+- Treat INPUT_JSON.customer_technology_context separately from proposal evidence.
+  A customer-mandated platform is a hard constraint; a customer-preferred or
+  existing-estate platform is a strong decision factor; a working assumption
+  must be labelled as an assumption and may be challenged when requirements
+  materially conflict. Never cite this context as an RFP mandate.
+- Do not choose or write a target cloud provider in a DiagramBrief. Keep
+  deployment entities provider-neutral because the independent technology-
+  recommendation pass supplies the authoritative provider and services.
+- Create only visuals that prove a proposal-specific point.
+- Do not create a visual just because decks often contain that slide type.
+- Ground every brief in INPUT_JSON. Prefer named systems, roles, datastores,
+  channels, integrations, controls, milestones, and customer responsibilities.
+- Put concrete source requirement IDs, source refs, or short evidence labels in
+  evidence_refs when available.
+- For each brief, provide enough entities and flows for a non-generic diagram.
+- For technical architecture, derive the applicable layers and boundaries from
+  the proposal inputs. Do not force a standard Experience/API/Services/Data/Cloud
+  arrangement when the workload or supplied products call for another structure.
+- Put unresolved choices in open_assumptions so they can be rendered on the
+  dedicated Assumptions and Dependencies slide. Never put unresolved-status
+  placeholders or customer-confirmation qualifiers in entities, flows,
+  controls, must_show, or visible diagram labels.
+- Use must_not_show to block generic patterns such as stock cloud diagrams,
+  generic Agile ceremony loops, generic L1/L2/L3 pyramids, or invented tools.
+- If the RFP lacks enough evidence for a diagram, omit the brief.
+- For every proposal_skeleton section that contains `diagram_kind`, return a
+  brief using that section's exact slide_id. Also return exact briefs for
+  `sk_solution`, `sk_technical_arch`, `sk_integration`, `sk_data_model`, `sk_deployment`,
+  `sk_roadmap`, and `sk_governance` when those sections are present. These are required proposal
+  visuals: use grounded proposal recommendations and label assumptions rather
+  than omitting them merely because the RFP does not prescribe the design.
+- Never create a diagram for the Executive Summary. Reserve diagrams for a
+  slide whose specific architecture, flow, topology, evidence model, roadmap,
+  or operating boundary materially needs a visual.
+- Keep visual types semantically distinct: deployment shows environments and
+  runtime topology; HA/DR shows redundancy, replication and failover; testing
+  shows evidence streams and acceptance; AMS shows the live-service boundary,
+  telemetry and resolution paths. Do not reuse a solution/process visual for
+  any of these purposes.
+- Use slide_id values that can match the likely deck section, for example
+  architecture, deployment, delivery, timeline, team, testing, ams, or the
+  section slide_id supplied by the proposal skeleton.
+
+INPUT_JSON:
+{input_json}
+"""
+
+TECHNOLOGY_RECOMMENDATION_PROMPT = """
+You are an independent enterprise solution architect. Produce a concrete,
+implementable technology recommendation from the proposal analysis.
+
+Return strict JSON matching TechnologyRecommendationSet.
+
+Rules:
+- Treat INPUT_JSON.contextual_reference_context as advisory architecture
+  research. Use it when evaluating layers, build/buy/COTS decisions and product
+  options, while preserving its non-authoritative status.
+- Derive the architecture layers for this proposal from the required channels,
+  workloads, integrations, data shapes, products, controls and operating model.
+  Do not copy a fixed layer taxonomy from another proposal. Common layer names
+  are examples only and must be omitted, merged, split or renamed when the
+  supplied requirements indicate a different architecture.
+- First identify technologies explicitly mandated or referenced in INPUT_JSON,
+  especially development languages/frameworks, source control/build, automated
+  testing, API development, data storage, search, integration, CI/CD, IaC,
+  deployment/runtime, identity, security, observability, and support tooling.
+- Distinguish business capabilities and solution names from technologies. Names
+  such as "Digital Catalogue", "AI-enabled engine", "compliance module", or
+  "customer portal" are not technologies and must never occupy the proposed
+  technology field.
+- Populate `component_decisions` for the major business-facing capabilities as
+  well as the lower-level technology recommendations. For each component,
+  decide whether to reuse a customer product, configure COTS/SaaS, use a
+  managed-cloud or maintained open-source service, build custom software,
+  integrate an authoritative source without replacing it, or retain a genuine
+  customer decision.
+- Treat build-versus-buy as an architectural decision, not a preference. Assess
+  functional coverage, data-model fit, workflow differentiation, integration,
+  extensibility, security, operability, implementation time, licensing/run
+  cost, portability and lock-in. Prefer configuration and integration for
+  mature commodity capabilities; prefer custom development only where the
+  differentiating workflow, decision logic or experience would be materially
+  constrained by available products. A hybrid composition is normally valid.
+- Recommend a named COTS product only when the requirements and constraints
+  justify it. Preserve named customer products as existing or mandated rather
+  than presenting them as new selections. For an independently recommended
+  product, name a primary choice, record credible alternatives, and explain why
+  it fits. When evidence is insufficient to select a vendor, recommend the
+  product category and keep vendor selection as a customer decision.
+- Do not force master-data, content, pricing, inventory and analytics into one
+  product. MDM/PIM commonly governs mastered attributes, hierarchies and
+  stewardship; DAM or object storage commonly holds binary media/documents;
+  ERP/procurement/pricing engines commonly remain authoritative for costs and
+  prices; WMS/ERP commonly remains authoritative for inventory and warehouse
+  availability. Apply these as evaluation heuristics, not assumptions, and let
+  proposal evidence override them.
+- For every component decision, identify the authoritative system or
+  system-of-record role where supported, the principal inbound data, the
+  produced/served data, the decision status, evidence, alternatives and open
+  assumptions. Use role-based source labels when the proposal does not name a
+  system; never invent a customer system name.
+- Never recommend a complete greenfield build merely because products are not
+  mandated. If custom-build is selected, state why COTS/SaaS, managed-cloud and
+  open-source alternatives fail the material requirements. Conversely, do not
+  select COTS solely to avoid development when integration or product
+  constraints would create greater delivery and operating risk.
+- For unspecified layers, independently select concrete products or services
+  using workload fit, data shape and volume, consistency/transaction needs,
+  search requirements, API/runtime fit, NFRs, security, operability, skills,
+  portability, lock-in, licensing, delivery speed, and run cost.
+- Consider credible SQL, NoSQL, search-index, data lake/lakehouse/warehouse,
+  open-source, SaaS, managed-cloud, serverless, container, and hybrid options.
+  Choose rather than listing only generic capability labels.
+- Recommend concrete development languages/frameworks and testing tools when
+  the solution requires custom APIs or applications. Couple cloud-native
+  services to the selected hyperscaler only when proposal evidence or the
+  reasoned platform choice supports that hyperscaler.
+- Power BI alone does not imply Azure or Microsoft Fabric. A named endpoint or
+  current-state product does not imply the complete vendor ecosystem.
+- Treat customer technology context explicitly. A customer-mandated platform
+  must be selected. A customer-preferred or existing-estate platform must be
+  selected unless a concrete requirement makes it materially unsuitable; any
+  exception must be stated in deployment_rationale. Never silently select a
+  different hyperscaler from the one supplied by the customer.
+- Do not treat selecting a hyperscaler as selecting that provider's full service
+  catalogue. Derive every framework, runtime, database, integration service,
+  search service, analytics product, test tool and DevSecOps tool independently
+  from proposal requirements, existing standards, advisory research and stated
+  trade-offs. Never use a pre-authored Azure, AWS or GCP default stack.
+- Include rows as relevant for: application/UI, API/backend development, data
+  store, catalogue/search, ingestion/integration, analytics, automated testing,
+  CI/CD and quality/security gates, IaC/deployment/runtime, identity/secrets,
+  observability/operations, and optional AI.
+- For a deployable solution, include concrete rows for edge/ingress and DNS,
+  network topology and private connectivity, firewall/WAF and egress control,
+  load balancing, application runtime/compute, API management, messaging or
+  integration, transactional and analytical data services, cache/search where
+  required, identity, secrets/keys/certificates, security posture and SIEM,
+  logs/metrics/traces, backup, availability-zone and regional recovery design,
+  CI/CD, artifact registry, IaC, and environment configuration.
+- Keep the stack coherent. Do not mix services from multiple hyperscalers
+  unless hybrid or multi-cloud requirements justify the operational cost.
+- Select currently supported, generally available services and maintained
+  language/framework versions. Avoid retired services and preview-only
+  dependencies unless the proposal explicitly accepts that risk.
+- Derive primary and recovery regions from supplied customer geography,
+  residency, latency, service-availability and recovery requirements. Do not
+  infer a fixed regional pair merely from the company name, country, or cloud
+  provider. If proposing regions beyond explicit inputs, mark them as a reasoned
+  recommendation with the selection rationale and validation dependency.
+- Evaluate the recommendation against reliability, security, performance,
+  operational excellence, cost, portability, data residency, and sustainability
+  trade-offs. Do not choose cloud merely because it is common.
+- proposed_technology must contain real technology/product names. Put the
+  generic class (for example relational SQL database, search engine, object
+  store, serverless functions) in technology_category.
+- Mark each row RFP-mandated, RFP-referenced, recommended, or customer-decision.
+  Give a concise rationale, evidence refs where available, and 1-3 genuine
+  alternatives considered for recommended rows.
+- Populate `sourcing_model` and `build_vs_buy_rationale` on every technology
+  recommendation. The rationale must explain why the service should be bought,
+  configured, reused, integrated or built rather than merely restating its role.
+- Do not default to Microsoft, AWS, Google, Java, .NET, Python, or any familiar
+  stack. Select them only when the requirements and trade-offs justify them.
+
+INPUT_JSON:
+{input_json}
+"""
+
 SLIDE_COMPRESSION_PROMPT = """
 You are a senior consulting editor and presentation coach.
 
 TASK:
-Edit the bullets of each slide in the DeckPlan to be **customer-pre-read grade**
+Edit the supplied slide bullets to be **customer-pre-read grade**
 while preserving the original meaning and all decision-relevant context.
 
 EDITING RULES:
@@ -716,7 +968,7 @@ EDITING RULES:
   - The order of bullets on each slide (unless the schema explicitly allows reordering).
 
 SCOPE OF CHANGES:
-- Only modify the `bullets` field(s) in the DeckPlan JSON.
+- Only return `slide_id` and the edited `bullets` for each supplied slide.
 - Do not alter:
   - slide_id
   - `detailed_points` (headline + sub_points) — preserve these exactly as given
@@ -731,49 +983,61 @@ GUARDRAILS:
   that is not present in the original bullet or obviously implied.
 
 OUTPUT FORMAT:
-- Return the **updated DeckPlan JSON**, strictly matching the original schema.
+- Return one JSON object matching the BulletCompressionSet schema: a `slides`
+  array containing `slide_id` and `bullets` for every supplied slide.
 - Do not add any text or comments outside the JSON.
 
-Input deck plan JSON:
-{deck_plan_json}
+Input slide bullets JSON:
+{bullet_input_json}
 """
 
 SPEAKER_NOTES_PROMPT = """
-You are a senior consulting presenter coaching a colleague who must DELIVER this
+You are a senior consulting presenter coaching a colleague who must deliver this
 proposal deck to a client executive audience.
 
 TASK:
-For EVERY slide in the DeckPlan, write **speaker notes** that let a human
-presenter confidently explain the slide — even if they did not build it. The
-notes must unpack the thinking behind the points, not just repeat them.
+For every slide in this batch, write presenter-ready narrative notes that let a
+colleague explain the slide confidently even if they did not build it. Unpack
+the thinking behind the slide; do not merely repeat the visible text.
 
 WHAT EACH SLIDE'S NOTES MUST DO:
-- Explain, in plain language, WHAT the slide is saying and WHY it matters to THIS
-  client (tie back to their context, drivers, and priorities).
-- Give the presenter 2–4 concrete **talking points** that expand each bullet /
-  sub-point with the reasoning a human would otherwise have to guess.
-- Where useful, suggest a natural **transition** into the next idea.
-- Anticipate one likely **question or objection** and how to respond, when relevant.
+- Open with the slide's single claim and why it matters to this client.
+- Explain how to read the visual, table or content from left to right or top to
+  bottom, naming the important systems, layers, technologies and decisions.
+- Expand the design reasoning: what was selected, what remains outside the
+  solution boundary, why the approach is credible, and what risk it controls.
+- State any important assumption or dependency as presentation guidance, never
+  as a hidden commitment.
+- End with a natural transition to `next_slide_title` when one is supplied.
+- Anticipate one likely question and give a concise, grounded answer where useful.
 
 STYLE:
 - Conversational but professional, first-person plural ("we", "our approach").
-- 60–130 words per slide. Full sentences, not bullet fragments.
-- Speak to the presenter (e.g., "Open by reminding them that…", "Emphasise…").
-- Do NOT invent facts, metrics, names, or commitments not present in the inputs.
-  If something is unknown, coach the presenter to speak to it at a high level.
+- 140-220 words per slide. Use 2-4 short paragraphs, not bullet fragments and
+  not a verbatim reading of the slide.
+- Speak to the presenter (for example, "Open by...", "Emphasise...", "Then explain...").
+- Make every slide's notes distinct. Never reuse the same generic paragraph for
+  a diagram and its explanatory follow-up slide.
+- Do not invent facts, metrics, names, recovery targets or commitments absent
+  from the inputs. Clearly frame open items as validation or dependencies.
 
 OUTPUT FORMAT:
 - Return a single JSON object matching the DeckNotes schema: a `notes` array of
-  objects, each with `slide_id` (exactly matching the input) and `notes` (the
-  speaker notes text). Include an entry for every slide_id in the DeckPlan.
-- No text outside the JSON.
+  objects with the exact supplied `slide_id` and its narrative `notes`.
+- Include one entry for every slide in this batch and no text outside the JSON.
 
-DECK PLAN (JSON — slide_id, title, archetype, bullets, detailed_points):
+SLIDE BATCH (JSON; includes neighbouring titles, content, visual and table):
 {deck_plan_json}
 
-EXECUTIVE NARRATIVE SPINE (JSON, for rationale/context):
+EXECUTIVE NARRATIVE SPINE (JSON):
 {narrative_json}
 
-RFP UNDERSTANDING SUMMARY (for grounding):
+RFP UNDERSTANDING SUMMARY:
 {understanding_summary}
+
+SELECTED TECHNOLOGY AND PLATFORM DECISIONS (JSON; authoritative for proposed design):
+{technology_context}
+
+ADVISORY SUPPORTING-REFERENCE CONTEXT (architecture rationale only; never present it as customer scope):
+{reference_context}
 """

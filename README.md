@@ -174,17 +174,23 @@ All configuration is via environment variables (loaded from `.env`). See
 |----------|---------|---------|
 | `OPENAI_API_KEY` | *(required)* | OpenAI authentication. |
 | `OPENAI_MODEL_REASONING` | `gpt-5.4-2026-03-05` | Model for understanding, narrative, and deck planning. |
-| `OPENAI_MODEL_FAST` | `gpt-5.4-mini-2026-03-17` | Faster model for bounded evidence extraction and speaker notes. |
+| `OPENAI_MODEL_FAST` | `gpt-5.4-mini-2026-03-17` | Faster model for bounded evidence extraction, section classification, bullet compression, and speaker notes. |
 | `OPENAI_IMAGE_MODEL` | `gpt-image-2` | Model for AI-generated diagram images. |
 | `OPENAI_EMBEDDINGS_MODEL` | `text-embedding-3-large` | Embeddings for RAG retrieval. |
 | `OPENAI_TIMEOUT_S` | `120` | Per-request timeout (seconds). |
 | `OPENAI_RETRY_ATTEMPTS` | `3` | Attempts for retryable OpenAI transient errors. |
-| `OPENAI_RETRY_BASE_WAIT_S` | `5` | Initial application-level retry delay; subsequent attempts use exponential backoff. |
+| `OPENAI_RETRY_BASE_WAIT_S` | `5` | Initial application-level retry delay; subsequent attempts use exponential backoff with jitter. |
 | `OPENAI_RETRY_MAX_WAIT_S` | `90` | Maximum retry wait when OpenAI returns `Retry-After` / `retry_after`. |
+| `OPENAI_RETRY_JITTER_RATIO` | `0.20` | Random jitter applied to application-level exponential backoff when no server retry interval is supplied. |
 | `OPENAI_STRUCTURED_STREAMING` | `false` | Opt into streaming for structured Responses calls; non-streaming is more stable for large RFP prompts. |
+| `OPENAI_STRUCTURED_BACKGROUND_ENABLED` | `true` | Global switch for background Responses execution. Disable when organizational data-retention policy prohibits temporary background-response storage. |
+| `OPENAI_STRUCTURED_BACKGROUND_ALL` | `false` | Force every structured LLM node through background create plus polling. Keep disabled for the lower-latency hybrid policy; large prompts and explicitly long-running planning calls still use background mode. |
+| `OPENAI_STRUCTURED_BACKGROUND_MIN_CHARS` | `30000` | When `OPENAI_STRUCTURED_BACKGROUND_ALL=false`, automatically use background mode for prompts at or above this size; set `0` to disable size-based routing. |
+| `OPENAI_STRUCTURED_BACKGROUND_POLL_S` | `2` | Poll interval for background Responses calls. |
+| `OPENAI_STRUCTURED_BACKGROUND_GRACE_S` | `300` | Continue polling the same healthy background job for this bounded grace period after its normal node deadline, avoiding duplicate model work. |
 | `OPENAI_REASONING_EFFORT_HIGH` | `high` | Effort used by RFP understanding and narrative calls. |
-| `OPENAI_REASONING_EFFORT_MEDIUM` | `medium` | Effort used by section classification and bullet compression calls. |
-| `OPENAI_REASONING_EFFORT_LOW` | `low` | Effort used by speaker-notes calls. |
+| `OPENAI_REASONING_EFFORT_MEDIUM` | `medium` | Effort used by architecture and technology-recommendation calls. |
+| `OPENAI_REASONING_EFFORT_LOW` | `low` | Effort used by bounded extraction, classification, compression, and speaker-notes calls. |
 | `OPENAI_REASONING_EFFORT_DECK_PLAN` | `medium` | Dedicated DeckPlan effort; avoids coupling a large structured-output call to the high-effort understanding pass. |
 | `OPENAI_DECK_PLAN_TIMEOUT_S` | `420` | Per-attempt timeout for DeckPlan generation. |
 | `OPENAI_DECK_PLAN_RAG_MAX_CHARS` | `18000` | Maximum ranked reusable-context characters included in the DeckPlan prompt. |
@@ -197,7 +203,16 @@ All configuration is via environment variables (loaded from `.env`). See
 | `OPENAI_UNDERSTANDING_EVIDENCE_MAX_CHARS` | `180000` | Final merged-evidence budget for the RFPUnderstanding prompt. |
 | `OPENAI_UNDERSTANDING_EVIDENCE_WORKERS` | `2` | Concurrent bounded evidence calls; keep low to avoid rate and service pressure. |
 | `OPENAI_UNDERSTANDING_EVIDENCE_TIMEOUT_S` | `300` | Timeout for each evidence extraction call. |
+| `OPENAI_CONTEXTUAL_EVIDENCE_LLM_ENABLED` | `false` | Send contextual/reference chunks through an LLM extractor. Disabled by default: bounded architecture-aware source excerpts are prepared locally because these documents cannot create authoritative scope. |
+| `OPENAI_CONTEXTUAL_EVIDENCE_TIMEOUT_S` | `60` | Normal timeout for optional/contextual chunks when their LLM extraction is explicitly enabled. |
+| `OPENAI_CONTEXTUAL_EVIDENCE_GRACE_S` | `30` | Additional polling grace when contextual LLM extraction is enabled. The in-flight response is cancelled before bounded local fallback when this period expires. |
+| `OPENAI_CONTEXTUAL_REFERENCE_MAX_CHARS` | `18000` | Bounded advisory architecture context retained for visual, technology, planning, and notes agents without converting supporting research into customer scope. |
+| `OPENAI_UNDERSTANDING_EVIDENCE_GRACE_S` | `60` | Additional polling grace for authoritative evidence chunks that remain active at their normal timeout. |
 | `OPENAI_UNDERSTANDING_EVIDENCE_CACHE` | `true` | Cache source-chunk structured evidence under `.data/evidence_cache` so downstream retries do not repeat extraction calls. |
+| `OPENAI_NOTES_BATCH_SIZE` | `6` | Slides per speaker-notes request; smaller batches allow richer, slide-specific presenter narrative. |
+| `OPENAI_NOTES_WORKERS` | `3` | Parallel speaker-notes batches, bounded to the number of batches. |
+| `RFP2DECK_PIPELINE_CACHE` | `true` | Reuse plan and diagram outputs for identical inputs. |
+| `RFP2DECK_PIPELINE_CACHE_VERSION` | `v3-proposal-derived-architecture` | Cache namespace; change it when prompt or plan semantics change so stale plans are not reused. |
 | `APP_DATA_DIR` | `.data` | Base directory for indexes/outputs/reports. |
 | `HCLTECH_TEMPLATE_PATH` | `templates/hcltech_expanded_v5.potx` | Corporate template path. Defaults to the bundled, repo-relative HCLTech `.potx` (resolved against the project root, so it works on any host). Override with an absolute path or another `.pptx`/`.potx` if needed. |
 | `TEMPLATE_CACHE_DIR` | `.data/templates` | Cache directory for PPTX files generated from POTX templates. |

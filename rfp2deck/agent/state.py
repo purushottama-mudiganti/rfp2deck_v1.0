@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from rfp2deck.core.schemas import (
     ClarificationRecord,
     DeckPlan,
+    DiagramBrief,
     ExecutiveNarrative,
     RFPUnderstanding,
     SectionPlan,
@@ -14,11 +15,15 @@ from rfp2deck.core.schemas import (
     SourceEvidenceBatch,
     SourceReconciliation,
     TraceabilityReport,
+    TechnologyRecommendationSet,
 )
 
 
 class AgentState(BaseModel):
     narrative: Optional[ExecutiveNarrative] = None
+    visual_briefs: List[DiagramBrief] = Field(default_factory=list)
+    technology_recommendations: Optional[TechnologyRecommendationSet] = None
+    customer_technology_context: Dict[str, Any] = Field(default_factory=dict)
     rfp_text: str
     template_info: Dict[str, Any]
     source_documents: List[SourceDocument] = Field(default_factory=list)
@@ -26,6 +31,10 @@ class AgentState(BaseModel):
     source_reconciliation: Optional[SourceReconciliation] = None
     source_evidence: List[SourceEvidenceBatch] = Field(default_factory=list)
     evidence_text: Optional[str] = None
+    # Architecture research and other supporting references are advisory, not
+    # requirements.  Keep a bounded, explicitly-labelled copy available after
+    # RFPUnderstanding so visual/technology planners do not silently lose it.
+    contextual_reference_context: str = ""
     retrieved_context: Optional[str] = None
     rag_context: Optional[str] = None
     understanding: Optional[RFPUnderstanding] = None

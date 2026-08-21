@@ -985,19 +985,12 @@ def _has_explanatory_body(slide_spec) -> bool:
 
 
 def _find_safe_diagram_layout(prs: Presentation, slide_spec=None):
-    """Use a clean split layout with no baked-in sample picture."""
-    if slide_spec is not None and _has_explanatory_body(slide_spec):
-        layout = _find_layout_with_tokens(
-            prs, "wide margins", "diagram", "space left", "text"
-        )
-        if layout is not None:
-            return layout
+    """Use the full slide body for generated visuals; explanation paginates separately."""
     # Image-only page: a clean split layout with no baked-in sample photo.
     # ("Diagram (space center) – Full image" carries a decorative portrait in
     # its master, so it is deliberately not used here.)
     return (
-        _find_layout_with_tokens(prs, "diagram", "space right", "flexible")
-        or _find_layout_with_tokens(prs, "wide margins", "diagram", "space left")
+        _find_layout_by_name(prs, "Title Only")
         or _find_blank_layout(prs)
     )
 
@@ -1602,6 +1595,16 @@ def _set_card_text(shape, text: str, font_pt: Optional[int] = None) -> None:
         for run in first.runs:
             run.font.bold = True
             _set_run_font(run, FONT_NAME_HEAVY)
+        for paragraph in shape.text_frame.paragraphs[1:]:
+            value = (paragraph.text or "").strip()
+            if not value.startswith("-"):
+                continue
+            # A literal marker remains visible in native placeholders whose
+            # inherited paragraph XML suppresses PowerPoint bullet properties.
+            paragraph.text = "• " + value[1:].strip()
+            for run in paragraph.runs:
+                _set_run_font(run)
+                run.font.size = Pt(font_pt)
     except Exception:
         pass
 
@@ -3001,9 +3004,36 @@ def _key_message_to_points(text: str) -> list[str]:
     return [p[0].upper() + p[1:] if p else p for p in points]
 
 
+def _complete_proposal_assertion(text: str) -> str:
+    """Turn fragments and requirement clauses into customer-facing assertions."""
+    clean = re.sub(r"\s+", " ", (text or "").strip()).rstrip(" .")
+    if not clean:
+        return ""
+    clean = re.sub(
+        r"^(?:the\s+)?(?:platform|system|solution|project)\s+(?:shall|should|must)\s+",
+        "The proposed solution will ",
+        clean,
+        flags=re.I,
+    )
+    if re.match(r"^(?:explain|show|describe|confirm|validate|use|provide|ensure)\b", clean, flags=re.I):
+        return clean
+    if not re.search(
+        r"\b(?:is|are|will|uses|provides|supports|enables|ensures|delivers|connects|"
+        r"protects|creates|consolidates|routes|applies|includes|combines|separates)\b",
+        clean,
+        flags=re.I,
+    ):
+        clean = "The proposed solution supports " + clean[0].lower() + clean[1:]
+    return clean + "."
+
+
 def _diagram_companion_bullets(slide_spec, bullets: list[str]) -> list[str]:
     """Keep customer-facing authored explanation; never expose image prompts."""
-    authored = [bullet.strip() for bullet in bullets if (bullet or "").strip()]
+    authored = [
+        _complete_proposal_assertion(bullet)
+        for bullet in bullets
+        if (bullet or "").strip()
+    ]
     if len(authored) >= 2:
         return authored[:5]
 
@@ -3021,8 +3051,8 @@ def _diagram_companion_bullets(slide_spec, bullets: list[str]) -> list[str]:
     key_message = (getattr(slide_spec, "key_message", None) or "").strip()
     expanded = _key_message_to_points(seed if len(seed) > len(key_message) else key_message)
     if len(expanded) >= 2:
-        return expanded
-    return [seed or key_message] if (seed or key_message) else []
+        return [_complete_proposal_assertion(item) for item in expanded]
+    return [_complete_proposal_assertion(seed or key_message)] if (seed or key_message) else []
 
 
 def _dedupe_page_groups(groups: list[list]) -> list[list]:
@@ -3182,6 +3212,12 @@ def _split_items_to_fit_14pt(items: list) -> list[list]:
     n = len(items)
     if n <= 1:
         return [items] if items else []
+    # Keep three concise proof points in one native composition. Rendering at
+    # 11pt is preferable to a visually unrelated 2+1 continuation.
+    if n == 3:
+        w_in, h_in = _KEYPOINT_BOX_14[3]
+        if all(_item_fits_at_pt(item, w_in, h_in, 11) for item in items):
+            return [items]
     # Never explode to one card per slide: a lone genuinely-oversized card would
     # spawn a slide each and still not reach 14pt. Two-up (wide boxes) is the
     # densest split we allow; the rare oversized card then renders at ~13pt.
@@ -3298,7 +3334,7 @@ def _render_pages_for_slide(
     # Native HCLTech key-point layouts provide 2-5 tall boxes; whole small sets
     # fit one slide, so only very large content paginates on the native path.
     if native:
-        table_page_size = 14 if archetype == "software bill of materials" else 16
+        table_page_size = 5 if archetype == "software bill of materials" else 10
     else:
         table_page_size = 6 if archetype == "software bill of materials" else 8
     if len(rows) > table_page_size:
@@ -3424,13 +3460,49 @@ def rendered_slide_count(
     return len(_normalize_singleton_continuation_titles(_dedupe_render_slides(render_slides)))
 
 
+def _add_customer_logo(slide, prs: Presentation, logo_bytes: bytes | None) -> None:
+    """Overlay customer branding without modifying the template or slide master."""
+    if not logo_bytes:
+        return
+    slide_w = float(prs.slide_width) / EMU_PER_INCH
+    slide_h = float(prs.slide_height) / EMU_PER_INCH
+    max_w = 1.20
+    max_h = 0.28
+    hcltech_reserved_w = 1.15
+    right_pad = 0.42
+    gap = 0.16
+    right_edge = slide_w - right_pad - hcltech_reserved_w - gap
+    try:
+        picture = slide.shapes.add_picture(
+            BytesIO(logo_bytes),
+            Inches(max(0.4, right_edge - max_w)),
+            Inches(slide_h - 0.57),
+            height=Inches(max_h),
+        )
+    except Exception as exc:
+        raise ValueError("The uploaded customer logo is not a valid PNG or JPEG image.") from exc
+    width_in = float(picture.width) / EMU_PER_INCH
+    if width_in > max_w:
+        scale = max_w / width_in
+        picture.width = Inches(max_w)
+        picture.height = int(picture.height * scale)
+    picture.left = Inches(right_edge - float(picture.width) / EMU_PER_INCH)
+    picture.top = Inches(slide_h - 0.43 - float(picture.height) / EMU_PER_INCH / 2)
+    picture.name = "Customer Logo"
+
+
 def render_deck_from_template(
     deck_plan: DeckPlan,
     template_pptx: Union[Path, bytes],
     out_path: Optional[Path] = None,
     diagram_images: Optional[dict[str, bytes]] = None,
+    customer_logo: Optional[bytes] = None,
 ) -> Union[Path, bytes]:
-    """Render a new PPTX from a template and a deck plan."""
+    """Render a new PPTX from a template and a deck plan.
+
+    Customer branding is added as a slide-level overlay; the source template,
+    masters, layouts, and existing HCLTech branding remain unchanged.
+    """
     if isinstance(template_pptx, (bytes, bytearray)):
         prs = Presentation(BytesIO(template_pptx))
     else:
@@ -3535,6 +3607,7 @@ def render_deck_from_template(
                     getattr(slide_spec, "slide_id", "?"),
                 )
             _validate_rendered_native_slide(slide, slide_spec)
+        _add_customer_logo(slide, prs, customer_logo)
         _set_speaker_notes(slide, getattr(slide_spec, "notes", None))
 
     if out_path is not None:

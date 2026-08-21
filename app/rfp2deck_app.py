@@ -132,6 +132,8 @@ st.session_state.setdefault("diagrams_generated", False)  # ran generation at le
 st.session_state.setdefault("diagram_images", {})
 st.session_state.setdefault("diagram_failures", [])
 st.session_state.setdefault("rag_index", None)
+st.session_state.setdefault("customer_logo_bytes", None)
+st.session_state.setdefault("customer_logo_name", None)
 
 # Corporate template path (no UI upload required). Configure this with
 # HCLTECH_TEMPLATE_PATH in .env. It may point to either the official HCLTech
@@ -301,12 +303,15 @@ with st.sidebar:
             "diagrams_generated",
             "diagram_images",
             "diagram_failures",
+            "customer_logo_bytes",
+            "customer_logo_name",
             "rag_index",
             "render_complete",
             "rfp_step1",
             "clarifications_step1",
             "supporting_step1",
             "ref_step1",
+            "customer_logo_step1",
         ]
         for k in keys:
             if k in st.session_state:
@@ -338,14 +343,17 @@ def parse_rfp_source(upload, role: str) -> tuple[SourceDocument, list[Clarificat
 def parse_rfp_sources(
     uploads: list,
     role: str,
+    on_progress=None,
 ) -> tuple[list[SourceDocument], list[ClarificationRecord], list[dict]]:
     """Parse a group of package sources with a shared upload role."""
     documents: list[SourceDocument] = []
     clarifications: list[ClarificationRecord] = []
     summaries: list[dict] = []
-    for upload in uploads or []:
+    total = len(uploads or [])
+    for index, upload in enumerate(uploads or [], start=1):
         name = getattr(upload, "name", "rfp")
-        st.info(f"Parsing {name}...")
+        if on_progress is not None:
+            on_progress(f"Parsing {role} document {index} of {total}: {name}")
         document, extracted_clarifications, meta = parse_rfp_source(upload, role)
         documents.append(document)
         clarifications.extend(extracted_clarifications)
@@ -393,6 +401,7 @@ def pipeline_logic_hash() -> str:
         [
             PROJECT_ROOT / "rfp2deck" / "agent" / "prompts.py",
             PROJECT_ROOT / "rfp2deck" / "agent" / "nodes.py",
+            PROJECT_ROOT / "rfp2deck" / "agent" / "graph.py",
             PROJECT_ROOT / "rfp2deck" / "core" / "schemas.py",
         ]
     )
@@ -406,6 +415,7 @@ def build_step1_cache_key(
     deck_mode: str | None,
     enable_notes: bool,
     deck_plan_specialists: bool,
+    customer_technology_context: dict | None = None,
 ) -> str:
     return build_plan_cache_key(
         {
@@ -415,6 +425,7 @@ def build_step1_cache_key(
             "retrieved_context_hash": sha256_text(retrieved_context or ""),
             "deck_mode": deck_mode or "",
             "enable_notes": bool(enable_notes),
+            "customer_technology_context": customer_technology_context or {},
             "models": {
                 "reasoning": settings.model_reasoning,
                 "fast": settings.model_fast,
@@ -426,6 +437,12 @@ def build_step1_cache_key(
                 "batch_size": settings.deck_plan_batch_size,
                 "prompt_max_chars": settings.deck_plan_prompt_max_chars,
                 "specialists": bool(deck_plan_specialists),
+            },
+            "evidence": {
+                "direct_max_chars": settings.understanding_direct_max_chars,
+                "chunk_chars": settings.understanding_evidence_chunk_chars,
+                "max_chars": settings.understanding_evidence_max_chars,
+                "contextual_llm": settings.understanding_contextual_evidence_llm_enabled,
             },
             "logic_hash": pipeline_logic_hash(),
         }
@@ -616,6 +633,28 @@ if st.session_state.wizard_step == 1:
             key="clarifications_step1",
             accept_multiple_files=True,
         )
+    customer_logo = st.file_uploader(
+        "Optional customer logo",
+        type=["png", "jpg", "jpeg"],
+        key="customer_logo_step1",
+        help="Upload an approved PNG or JPEG logo. It will be added to every generated slide without changing the HCLTech template or master.",
+    )
+    if customer_logo is not None:
+        logo_bytes = customer_logo.getvalue()
+        if len(logo_bytes) > 5 * 1024 * 1024:
+            st.error("Customer logo must be 5 MB or smaller.")
+            st.stop()
+        previous_logo = st.session_state.get("customer_logo_bytes")
+        st.session_state.customer_logo_bytes = logo_bytes
+        st.session_state.customer_logo_name = customer_logo.name
+        if previous_logo != logo_bytes:
+            st.session_state.render_complete = False
+        st.image(logo_bytes, caption=f"Customer logo: {customer_logo.name}", width=160)
+    else:
+        if st.session_state.get("customer_logo_bytes") is not None:
+            st.session_state.render_complete = False
+        st.session_state.customer_logo_bytes = None
+        st.session_state.customer_logo_name = None
     with st.expander("Optional supporting material", expanded=False):
         supporting_files = st.file_uploader(
             "Supporting reference documents",
@@ -629,6 +668,29 @@ if st.session_state.wizard_step == 1:
         )
         st.caption("Enable 'Build/Update RAG index' in sidebar to index this TXT.")
 
+    with st.expander("Customer technology constraints", expanded=False):
+        cloud_platform = st.selectbox(
+            "Known hyperscaler or hosting platform",
+            ["Not specified", "Microsoft Azure", "Amazon Web Services (AWS)", "Google Cloud Platform", "On-premises / private cloud", "Hybrid", "Other"],
+            key="customer_cloud_platform_step1",
+        )
+        cloud_context_status = st.selectbox(
+            "How should this information be treated?",
+            ["Customer-preferred", "Customer-mandated", "Existing estate", "Working assumption"],
+            key="customer_cloud_status_step1",
+        )
+        cloud_context_details = st.text_area(
+            "Relevant customer standards, approved services, regions, or restrictions",
+            key="customer_cloud_details_step1",
+            help="This is treated separately from RFP evidence and is carried into technology and architecture decisions.",
+        )
+
+    customer_technology_context = {
+        "platform": cloud_platform,
+        "status": cloud_context_status,
+        "details": cloud_context_details.strip(),
+    } if cloud_platform != "Not specified" or cloud_context_details.strip() else {}
+
     if rfp_files:
         show_step1_progress(0.1, "Step 1 progress: ready to generate plan.")
 
@@ -640,7 +702,26 @@ if st.session_state.wizard_step == 1:
     if submitted:
         show_step1_progress(0.15, "Step 1 progress: generating plan...")
         step_progress = st.progress(0.0)
-        step_status = st.status("Step 1 in progress...", expanded=False)
+        step_status = st.status(
+            "Step 1 - Generate the proposal deck plan",
+            expanded=False,
+        )
+        activity_slot = st.empty()
+        activity_state = {"progress": 0.1}
+
+        def update_step1_activity(message: str, progress: float | None = None) -> None:
+            if progress is not None:
+                # Parallel analysis branches may finish out of display order;
+                # never move the user-visible progress bar backwards.
+                activity_state["progress"] = max(
+                    activity_state["progress"],
+                    max(0.0, min(1.0, progress)),
+                )
+                step_progress.progress(activity_state["progress"])
+            activity_slot.info(
+                f"{round(activity_state['progress'] * 100)}% complete - {message}"
+            )
+
         step_progress.progress(0.1)
 
         if not rfp_files:
@@ -651,6 +732,7 @@ if st.session_state.wizard_step == 1:
             resolved_template = resolve_standard_template(
                 str(STANDARD_TEMPLATE), str(STANDARD_TEMPLATE_CACHE_DIR)
             )
+            update_step1_activity("Preparing the proposal template and uploaded package...", 0.15)
             all_uploads = list(rfp_files) + list(clarification_files or []) + list(
                 supporting_files or []
             )
@@ -662,13 +744,13 @@ if st.session_state.wizard_step == 1:
             st.session_state.tpl_bytes = tpl_bytes
 
             primary_documents, primary_clarifications, primary_summaries = parse_rfp_sources(
-                rfp_files, "primary"
+                rfp_files, "primary", update_step1_activity
             )
             clarification_documents, customer_clarifications, clarification_summaries = (
-                parse_rfp_sources(clarification_files or [], "clarification")
+                parse_rfp_sources(clarification_files or [], "clarification", update_step1_activity)
             )
             supporting_documents, supporting_clarifications, supporting_summaries = (
-                parse_rfp_sources(supporting_files or [], "supporting")
+                parse_rfp_sources(supporting_files or [], "supporting", update_step1_activity)
             )
             source_documents = (
                 primary_documents + clarification_documents + supporting_documents
@@ -680,7 +762,7 @@ if st.session_state.wizard_step == 1:
                 primary_summaries + clarification_summaries + supporting_summaries
             )
             rfp_text = render_source_package(source_documents)
-            step_progress.progress(0.5)
+            update_step1_activity("Building the reconciled source package...", 0.45)
 
             if rfp_summaries:
                 st.markdown("**RFP package evidence summary**")
@@ -720,7 +802,7 @@ if st.session_state.wizard_step == 1:
             }
             st.session_state.template_info = template_info
             st.info(f"Template analyzed: {len(ti.slide_layout_names)} layouts found.")
-            step_progress.progress(0.7)
+            update_step1_activity("Analyzing presentation layouts and placeholders...", 0.52)
 
             # Optional RAG (in-memory only)
             retrieved_context = None
@@ -752,7 +834,7 @@ if st.session_state.wizard_step == 1:
                 st.caption(f"Retrieved reusable context from {rag_source} RAG index.")
 
             st.session_state.retrieved_context = retrieved_context
-            step_progress.progress(0.85)
+            update_step1_activity("Checking reusable knowledge and the Step 1 cache...", 0.58)
 
             cache_key = build_step1_cache_key(
                 uploads_by_role=[
@@ -765,6 +847,7 @@ if st.session_state.wizard_step == 1:
                 deck_mode=st.session_state.get("deck_mode"),
                 enable_notes=enable_notes,
                 deck_plan_specialists=deck_plan_specialists,
+                customer_technology_context=customer_technology_context,
             )
             if settings.pipeline_cache:
                 cached = read_json_cache(cache_key)
@@ -784,6 +867,7 @@ if st.session_state.wizard_step == 1:
                     st.session_state.diagram_failures = []
                     st.session_state.render_complete = False
                     step_progress.progress(1.0)
+                    activity_slot.success("100% complete - Proposal plan loaded from cache.")
                     step_status.update(label="Step 1 complete from cache.", state="complete")
                     st.success("Step 1 loaded from cache. Moving to next step...")
                     st.session_state.wizard_step = 2 if enable_diagrams else 3
@@ -799,6 +883,7 @@ if st.session_state.wizard_step == 1:
                 retrieved_context=retrieved_context,
                 source_documents=source_documents,
                 clarification_records=clarification_records,
+                customer_technology_context=customer_technology_context,
             )
             state.deck_mode = st.session_state.get("deck_mode")
             state.enable_notes = enable_notes
@@ -812,7 +897,28 @@ if st.session_state.wizard_step == 1:
                 st.session_state.get("deck_mode"),
                 retrieved_context is not None,
             )
-            final_state = graph.invoke(state)
+            node_progress = {
+                "reconcile_sources": ("Extracting requirements and traceable evidence...", 0.66),
+                "extract_source_evidence": ("Analyzing objectives, scope, constraints, and risks...", 0.71),
+                "understand_rfp": ("Determining the proposal storyline and required sections...", 0.75),
+                "derive_sections": ("Building the executive narrative and win themes...", 0.79),
+                "build_narrative": ("Designing proposal-specific visual briefs...", 0.83),
+                "derive_visual_briefs": ("Evaluating suitable technologies and cloud services...", 0.87),
+                "derive_technology_recommendations": ("Creating the detailed slide plan...", 0.91),
+                "plan_deck": ("Refining slide content for readability...", 0.94),
+                "compress_bullets": ("Generating presenter notes...", 0.96),
+                "generate_notes": ("Validating coverage, traceability, and proposal quality...", 0.98),
+                "qa_and_report": ("Finalizing the proposal plan...", 0.99),
+            }
+            final_state = state.model_dump()
+            update_step1_activity("Reconciling source authority and clarifications...", 0.62)
+            for event in graph.stream(state, stream_mode="updates"):
+                for node_name, update in event.items():
+                    if node_name in node_progress:
+                        message, progress_value = node_progress[node_name]
+                        update_step1_activity(message, progress_value)
+                    if isinstance(update, dict):
+                        final_state.update(update)
             log.info("Agent pipeline completed.")
 
             if isinstance(final_state, dict):
@@ -847,6 +953,7 @@ if st.session_state.wizard_step == 1:
             st.session_state.diagram_failures = []
             st.session_state.render_complete = False
             step_progress.progress(1.0)
+            activity_slot.success("100% complete - Proposal plan and quality checks completed.")
             step_status.update(label="Step 1 complete.", state="complete")
 
             # Advance
@@ -876,6 +983,20 @@ if st.session_state.wizard_step == 2:
             total = len(plan.slides)
             with_prompt = sum(1 for s in plan.slides if getattr(s, "diagram", None) is not None)
             st.write(f"Slides: {total} | With diagram prompts: {with_prompt}")
+            weak = [
+                {
+                    "slide_id": s.slide_id,
+                    "title": s.title,
+                    "score": getattr(s.diagram, "grounding_score", 0.0),
+                    "warnings": getattr(s.diagram, "grounding_warnings", []),
+                }
+                for s in plan.slides
+                if getattr(s, "diagram", None) is not None
+                and getattr(s.diagram, "grounding_score", 0.0) < 0.45
+            ]
+            if weak:
+                st.warning("Some diagram prompts are weakly grounded and will be skipped unless improved.")
+                st.json(weak)
             missing = [
                 f"{s.slide_id}: {s.title} ({s.archetype})"
                 for s in plan.slides
@@ -946,12 +1067,37 @@ if st.session_state.wizard_step == 2:
         diagram_failures = []
 
         slides_with_diagrams = [s for s in plan.slides if s.diagram]
-        total_targets = len(slides_with_diagrams)
+        eligible_targets = []
+        for slide in slides_with_diagrams:
+            score = float(getattr(slide.diagram, "grounding_score", 0.0) or 0.0)
+            warnings = list(getattr(slide.diagram, "grounding_warnings", []) or [])
+            if score < 0.45:
+                diagram_failures.append(
+                    {
+                        "slide_id": slide.slide_id,
+                        "title": slide.title,
+                        "error": "Diagram prompt blocked because it is not grounded enough for generation.",
+                        "grounding_score": score,
+                        "warnings": warnings,
+                    }
+                )
+            else:
+                eligible_targets.append(slide)
+        total_targets = len(eligible_targets)
         progress = st.progress(0)
-        status = st.status("Generating diagrams...", expanded=False)
+        status = st.status(
+            f"Generating {total_targets} grounded diagram(s)...",
+            expanded=False,
+        )
+
+        if diagram_failures:
+            blocked_names = "; ".join(item["title"] for item in diagram_failures)
+            st.warning(
+                f"Skipped {len(diagram_failures)} weakly grounded diagram prompt(s): {blocked_names}"
+            )
 
         made = 0
-        for idx, s in enumerate(slides_with_diagrams, start=1):
+        for idx, s in enumerate(eligible_targets, start=1):
             if not s.diagram:
                 continue
             status.update(
@@ -1023,14 +1169,14 @@ if st.session_state.wizard_step == 2:
             status.update(label="Diagram generation complete with available images.", state="complete")
             if diagram_failures:
                 st.warning(
-                    f"Generated {made} diagram(s); {len(diagram_failures)} diagram(s) failed and were skipped."
+                    f"Generated {made} diagram(s); {len(diagram_failures)} diagram(s) were blocked or failed."
                 )
             else:
                 st.success(f"Generated {made} diagram(s). Now approve below.")
             st.rerun()
         else:
-            status.update(label="Diagram generation failed for all diagrams.", state="error")
-            st.error("No diagrams were generated. Check the failure details below and retry.")
+            status.update(label="No eligible diagrams were generated.", state="error")
+            st.error("No diagrams met the grounding gate or generation failed. Check the details below.")
             st.json(diagram_failures)
 
     diagram_images = st.session_state.get("diagram_images", {})
@@ -1053,6 +1199,21 @@ if st.session_state.wizard_step == 2:
 
             st.markdown(f"""**{s.slide_id} — {s.title}**  
 Kind: `{s.diagram.kind}`""")
+
+            with st.expander("Grounding details", expanded=False):
+                st.metric("Grounding score", f"{getattr(s.diagram, 'grounding_score', 0.0):.2f}")
+                st.write("Entities")
+                st.json(getattr(s.diagram, "entities", []) or [])
+                st.write("Flows")
+                st.json(getattr(s.diagram, "flows", []) or [])
+                st.write("Controls")
+                st.json(getattr(s.diagram, "controls", []) or [])
+                st.write("Evidence refs")
+                st.json(getattr(s.diagram, "evidence_refs", []) or [])
+                warnings = getattr(s.diagram, "grounding_warnings", []) or []
+                if warnings:
+                    st.warning("Grounding warnings")
+                    st.json(warnings)
 
             st.image(img_bytes, caption=s.diagram.prompt)
 
@@ -1135,6 +1296,7 @@ if st.session_state.wizard_step == 3:
                 tpl_bytes,
                 out_path=None,
                 diagram_images=st.session_state.get("diagram_images"),
+                customer_logo=st.session_state.get("customer_logo_bytes"),
             )
             render_progress.progress(0.7)
 
