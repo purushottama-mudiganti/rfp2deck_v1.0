@@ -41,7 +41,10 @@ from rfp2deck.core.schemas import (
     DiagramBrief,
     DiagramBriefSet,
     DiagramSpec,
+    EngagementProfile,
+    EngagementTypeAssessment,
     ExecutiveNarrative,
+    LifecycleStageAssessment,
     RFPUnderstanding,
     SectionTaxonomy,
     SlideSpec,
@@ -523,6 +526,7 @@ def understand_rfp(state: AgentState) -> Dict[str, Any]:
         prompt, RFPUnderstanding, reasoning_effort=settings.reasoning_effort_high
     )
     understanding = enrich_understanding_risks(understanding)
+    understanding.engagement_profile = _effective_engagement_profile(understanding)
     for requirement_group in (
         understanding.requirements,
         understanding.superseded_requirements,
@@ -751,6 +755,36 @@ def _fallback_visual_briefs(understanding: RFPUnderstanding | None) -> List[Diag
     if len(base_flows) == 1:
         base_flows.append("Operational events -> monitoring and support -> controlled resolution")
     assumptions = _visible_assumptions(understanding)[:4]
+    scope_text = " ".join([
+        getattr(understanding, "summary", "") or "",
+        getattr(understanding, "project_scope", "") or "",
+        " ".join(getattr(understanding, "in_scope_work", []) or []),
+        " ".join(getattr(requirement, "text", "") or "" for requirement in requirements),
+    ]).lower()
+    profile = _effective_engagement_profile(understanding)
+    managed = _profile_is_managed_operations(profile)
+    if managed:
+        managed_roles = [
+            label for label in (
+                "Service Delivery Lead", "Incident Manager", "Problem Manager",
+                "Change Manager", "Service Reporting Analyst", "Customer service owners",
+            )
+            if label.lower() in scope_text or label in (
+                "Service Delivery Lead", "Customer service owners"
+            )
+        ]
+        base_entities = list(dict.fromkeys(
+            [customer]
+            + managed_roles
+            + ["Incident Management", "Problem Management", "Change Management"]
+            + ["Governance and service reporting", "Continuous improvement backlog"]
+        ))[:9]
+        base_flows = [
+            "Operational event -> incident triage, escalation and resolution -> post-incident review",
+            "Recurring incident trend -> problem analysis and known error -> corrective action",
+            "Corrective action or planned change -> risk assessment and approval -> controlled implementation",
+            "Service evidence -> operational and executive reviews -> prioritized improvement",
+        ]
     common = dict(
         evidence_refs=req_refs,
         open_assumptions=assumptions,
@@ -823,6 +857,30 @@ def _fallback_visual_briefs(understanding: RFPUnderstanding | None) -> List[Diag
             entities=base_entities, flows=base_flows, controls=controls[:4], must_show=scope[:4], **common,
         ),
         DiagramBrief(
+            slide_id="sk_operating_model",
+            title="The operating model connects accountability, process and evidence",
+            visual_type="process",
+            purpose="Show the accountable service model across customer, provider, operational practices, governance and improvement.",
+            entities=base_entities,
+            flows=base_flows,
+            controls=(controls[:4] or ["Named accountability", "RACI and escalation", "Service reviews", "Audit evidence"]),
+            must_show=scope[:4],
+            **common,
+        ),
+        DiagramBrief(
+            slide_id="sk_service_lifecycle",
+            title="Integrated service practices turn operational signals into improvement",
+            visual_type="process",
+            purpose="Show how incident, problem and change practices interact and feed measurable continuous improvement.",
+            entities=[
+                "Operational signal", "Incident Management", "Problem Management",
+                "Change Management", "Service reporting", "Continuous improvement backlog",
+            ],
+            flows=base_flows,
+            controls=(controls[:4] or ["Severity and escalation", "Root-cause evidence", "Change authorization", "Action closure"]),
+            **common,
+        ),
+        DiagramBrief(
             slide_id="sk_arch", title="Concrete solution architecture", visual_type="architecture",
             purpose="Show how proposal capabilities, systems, data and controls form the target solution.",
             entities=base_entities, flows=base_flows, controls=controls[:6], must_show=scope[:4], **common,
@@ -887,11 +945,31 @@ def _fallback_visual_briefs(understanding: RFPUnderstanding | None) -> List[Diag
             controls=(controls[:5] or ["Identity and access", "Release approval", "Monitoring and audit"]), **common,
         ),
         DiagramBrief(
-            slide_id="sk_roadmap", title="Agile roadmap releases value through increments", visual_type="timeline",
-            purpose="Show proposed increments, feedback, assurance and release-readiness gates.",
-            entities=["Mobilisation and backlog", "Architecture runway", "Incremental releases", "Integrated assurance", "Transition and improvement"],
-            flows=["Mobilisation -> thin end-to-end increment -> customer demonstration", "Feedback -> reprioritised backlog -> next release", "Assurance evidence -> release decision"],
-            controls=["Customer feedback", "Security/testing gates", "Operational readiness"], **common,
+            slide_id="sk_roadmap",
+            title=(
+                "Mobilization, transition and stabilization establish the live service"
+                if managed else "Incremental delivery releases value through controlled outcomes"
+            ),
+            visual_type="timeline",
+            purpose=(
+                "Show mobilization, knowledge transfer, process validation, service readiness, stabilization and improvement."
+                if managed else "Show proposed increments, feedback, assurance and release-readiness gates."
+            ),
+            entities=(
+                ["Mobilize and align", "Transition knowledge and access", "Validate processes and reporting", "Stabilize live operations", "Operate and improve"]
+                if managed else
+                ["Mobilisation and backlog", "Architecture runway", "Incremental releases", "Integrated assurance", "Transition and improvement"]
+            ),
+            flows=(
+                ["Mobilization -> transition acceptance -> live-service readiness", "Stabilization evidence -> governance review -> steady-state operation", "Service trends -> improvement backlog -> measurable action"]
+                if managed else
+                ["Mobilisation -> thin end-to-end increment -> customer demonstration", "Feedback -> reprioritised backlog -> next release", "Assurance evidence -> release decision"]
+            ),
+            controls=(
+                ["Named transition owners", "Readiness criteria", "Weekly stabilization review", "Service acceptance"]
+                if managed else ["Customer feedback", "Security/testing gates", "Operational readiness"]
+            ),
+            **common,
         ),
         DiagramBrief(
             slide_id="sk_testing",
@@ -916,11 +994,31 @@ def _fallback_visual_briefs(understanding: RFPUnderstanding | None) -> List[Diag
             **common,
         ),
         DiagramBrief(
-            slide_id="sk_governance", title="Product-aligned squads combine business and engineering ownership", visual_type="org",
-            purpose="Show proposed decision rights and collaboration between customer ownership, delivery and enabling governance.",
-            entities=["Customer Product Owner", "Business SMEs", "Cross-functional product squad", "Architecture/security/data chapters", "Steering forum"],
-            flows=["Product Owner and SMEs -> prioritised outcomes -> product squad", "Product squad -> demonstrations and evidence -> customer feedback", "Escalated decisions -> steering forum -> resolved dependencies"],
-            controls=["Architecture and security standards", "RAID and dependency decisions", "Outcome reporting"], **common,
+            slide_id="sk_governance",
+            title=(
+                "Governance and service leadership make accountability explicit"
+                if managed else "Governance resolves decisions without slowing delivery"
+            ),
+            visual_type="org",
+            purpose=(
+                "Show service leadership, process ownership, RACI, escalation paths and operational, monthly and executive review forums."
+                if managed else "Show proposed decision rights and collaboration between customer ownership, delivery and enabling governance."
+            ),
+            entities=(
+                ["Customer accountable owner", "Provider Service Delivery Lead", "Incident Manager", "Problem Manager", "Change Manager", "Service Reporting Analyst", "Operational review", "Service performance review", "Executive review"]
+                if managed else
+                ["Customer Product Owner", "Business SMEs", "Cross-functional product squad", "Architecture/security/data chapters", "Steering forum"]
+            ),
+            flows=(
+                ["Operational roles -> Service Delivery Lead -> customer accountable owner", "Service evidence -> review forums -> decisions and actions", "Major incident or change risk -> named escalation and authorization path"]
+                if managed else
+                ["Product Owner and SMEs -> prioritised outcomes -> product squad", "Product squad -> demonstrations and evidence -> customer feedback", "Escalated decisions -> steering forum -> resolved dependencies"]
+            ),
+            controls=(
+                ["Cross-party RACI", "Named decision owners", "Escalation thresholds", "Recorded actions and due dates"]
+                if managed else ["Architecture and security standards", "RAID and dependency decisions", "Outcome reporting"]
+            ),
+            **common,
         ),
     ]
     if _has_explicit_hadr_need(understanding):
@@ -936,7 +1034,16 @@ def _fallback_visual_briefs(understanding: RFPUnderstanding | None) -> List[Diag
             evidence_refs=req_refs,
             open_assumptions=assumptions,
         ))
-    return briefs
+    planned_visual_ids = {
+        str(section.get("slide_id", ""))
+        for section in _proposal_section_skeleton(understanding)
+        if section.get("diagram_kind")
+    }
+    return [
+        brief for brief in briefs
+        if brief.slide_id in planned_visual_ids
+        or brief.visual_type == "hadr" and _has_explicit_hadr_need(understanding)
+    ]
 
 
 @_logged_node
@@ -976,6 +1083,12 @@ def derive_visual_briefs(state: AgentState) -> Dict[str, Any]:
     except Exception:
         log.warning("Visual brief LLM call failed; using deterministic visual briefs.", exc_info=True)
         briefs = _fallback_visual_briefs(state.understanding)
+    allowed_visual_ids = {
+        str(section.get("slide_id", ""))
+        for section in _proposal_section_skeleton(state.understanding)
+        if section.get("diagram_kind")
+    }
+    briefs = [brief for brief in briefs if brief.slide_id in allowed_visual_ids]
     state.visual_briefs = briefs
     return {"visual_briefs": briefs}
 
@@ -1230,6 +1343,16 @@ def _technology_recommendation_quality_issues(
 @_logged_node
 def derive_technology_recommendations(state: AgentState) -> Dict[str, Any]:
     """Select a concrete stack independently from proposal constraints."""
+    profile = _effective_engagement_profile(state.understanding)
+    if not _profile_is_technical_delivery(profile):
+        recommendations = TechnologyRecommendationSet()
+        state.technology_recommendations = recommendations
+        log.info(
+            "Skipping technology-stack recommendation for engagement=%s delivery_mode=%s",
+            profile.primary_type,
+            profile.delivery_mode,
+        )
+        return {"technology_recommendations": recommendations}
     input_json = json.dumps(
         _technology_recommendation_input(
             state.understanding,
@@ -1404,7 +1527,32 @@ def _ai_ml_opportunities(understanding: Optional[RFPUnderstanding]) -> List[Dict
 
 
 def _ai_ml_is_applicable(understanding: Optional[RFPUnderstanding]) -> bool:
-    return len(_ai_ml_opportunities(understanding)) >= 2
+    if understanding is None:
+        return False
+    scope = _scope_text(understanding)
+    explicit_ai = _contains_any(
+        scope,
+        (
+            "artificial intelligence", "machine learning", "generative ai", "genai",
+            "predictive model", "natural language processing", " ai ", "ml model",
+        ),
+    )
+    analytical_use_case = _contains_any(
+        scope,
+        (
+            "forecast", "predict", "anomaly", "optimisation", "optimization",
+            "document extraction", "email extraction", "elp extraction",
+            "intelligent classification",
+        ),
+    )
+    profile = _effective_engagement_profile(understanding)
+    technical_fit = any(
+        _profile_type_score(profile, engagement_type) >= 0.50
+        for engagement_type in ("data_analytics", "application_development", "platform_implementation")
+    )
+    return len(_ai_ml_opportunities(understanding)) >= 2 and (
+        explicit_ai or (technical_fit and analytical_use_case)
+    )
 
 
 def _ai_ml_cards(understanding: Optional[RFPUnderstanding]) -> List[Card]:
@@ -2612,7 +2760,13 @@ def _first_sentence(text: str, max_len: int = 200) -> str:
 
 
 def _clip(text: str, max_len: int = 160) -> str:
-    t = re.sub(r"\s+", " ", (text or "").strip()).rstrip(".")
+    original = re.sub(r"\s+", " ", (text or "").strip())
+    if len(original) <= max_len:
+        # Already fits — keep its own closing punctuation. Stripping the
+        # trailing period unconditionally (even when nothing was cut) made a
+        # complete sentence read as a dangling fragment for no reason.
+        return original
+    t = original.rstrip(".")
     if len(t) > max_len:
         return _truncate_on_word(t, max_len)
     return t
@@ -2821,7 +2975,17 @@ def _exec_summary_cards(
     # vs response vs outcomes) and are de-duplicated across cards so the summary
     # never repeats the same sentence in every box.
     def _clean(items, limit=3):
-        return [re.sub(r"\s+", " ", i).strip() for i in (items or []) if (i or "").strip()][:limit]
+        # Exec Summary is exempt from the renderer's card-pagination escape
+        # hatch (kept to one slide by design), so a bullet has to fit the box
+        # it's committed to — _clip's word/clause-boundary truncation is what
+        # guarantees that instead of silently overflowing. The cap is sized to
+        # rarely trigger (the renderer's own font-fit floor, not this cap, is
+        # what actually keeps dense cards inside the box) — a lower cap here
+        # just clips a sentence before the box ever needed it to, and a clause
+        # boundary inside an enumerated list ("Incident, Problem, Change...")
+        # isn't a safe place to cut anyway, so the box-fit shrink is the
+        # correct backstop, not a tighter character budget.
+        return [_clip(i.strip(), 170) for i in (items or []) if (i or "").strip()][:limit]
 
     def _sentences(text, limit=3):
         parts = re.split(r"(?<=[.!?])\s+", re.sub(r"\s+", " ", (text or "").strip()))
@@ -3088,6 +3252,16 @@ def _risk_mitigation(risk: str) -> str:
         return "Agree the control model, evidence requirements, and accountable owners before build completion."
     if any(term in low for term in ("cutover", "operation", "disrupt", "change")):
         return "Use phased release, parallel validation, rollback readiness, and visible cutover support."
+    if any(
+        term in low
+        for term in ("ownership", "boundary", "boundaries", "coordinat", "escalation", "third part", "vendor", "raci")
+    ):
+        return "Agree a RACI across every named party during mobilisation and close boundary gaps before go-live."
+    if any(
+        term in low
+        for term in ("report", "reporting", "repository", "baseline", "kpi", "visibility", "metric", "dashboard")
+    ):
+        return "Stand up the reporting baseline and repository early, and validate KPI accuracy before it drives decisions."
     return "Assign an accountable owner and validate the mitigation through the programme RAID process."
 
 
@@ -3111,6 +3285,50 @@ def _risk_detailed_points(understanding: RFPUnderstanding | None) -> List[Bullet
         BulletPoint(text=risk, sub_points=[_risk_mitigation(risk)])
         for risk in risks
     ]
+
+
+def _expansion_detailed_points(understanding: RFPUnderstanding | None) -> List[BulletPoint]:
+    """Grounded fallback body for an optional/later-phase expansion slide.
+
+    A slide about optional scope still needs its own visible argument —
+    "optional" describes the customer's decision, not licence to leave the
+    slide empty. Named later-phase items come from the same
+    ``optional_response_topics`` the RFP-understanding step already extracts
+    (visible elsewhere, e.g. a commercials slide's "optional expansion" card,
+    proving the data exists); this only backfills the *dedicated* expansion
+    slide's own body when generation left it blank.
+    """
+    profile = getattr(understanding, "engagement_profile", None) if understanding else None
+    topics = [t.strip() for t in (getattr(profile, "optional_response_topics", None) or []) if (t or "").strip()][:5]
+    points = [
+        BulletPoint(
+            text="Phase 1 stays self-contained",
+            sub_points=[
+                "Every required capability is delivered and evidenced in Phase 1; nothing in scope depends on an "
+                "optional item being taken up."
+            ],
+        ),
+    ]
+    if topics:
+        points.append(BulletPoint(text="Electable Phase 2 scope", sub_points=topics))
+    else:
+        points.append(
+            BulletPoint(
+                text="Electable Phase 2 scope",
+                sub_points=["Later-phase options are scoped and priced separately once Phase 1 evidence is available."],
+            )
+        )
+    points.append(
+        BulletPoint(
+            text="Each option activates only when evidence supports it",
+            sub_points=[
+                "Service performance evidence, dependencies, business benefit, and commercial terms are confirmed "
+                "before an option starts.",
+                "The customer decides which options to take up and when — none are assumed or pre-committed.",
+            ],
+        )
+    )
+    return points
 
 
 def _next_steps_bullets(understanding: RFPUnderstanding | None) -> List[str]:
@@ -3197,6 +3415,10 @@ def ensure_required_slides(
     """Ensure required slides exist. Adds missing ones with sensible defaults."""
     existing = {(s.archetype or "").lower(): s for s in deck_plan.slides}
     existing_keys = set(existing.keys())
+    planned_sections = _proposal_section_skeleton(understanding)
+    planned_ids = {str(section.get("slide_id", "")) for section in planned_sections}
+    profile = _effective_engagement_profile(understanding)
+    managed = _profile_is_managed_operations(profile)
     # Helper: add slide
     def add_slide(
         archetype: str,
@@ -3312,7 +3534,7 @@ def ensure_required_slides(
         )
 
     # Architecture
-    if not _is_archetype_present(existing_keys, "architecture"):
+    if "sk_arch" in planned_ids and not _is_archetype_present(existing_keys, "architecture"):
         add_slide(
             "Architecture",
             "Target Architecture Overview",
@@ -3330,7 +3552,7 @@ def ensure_required_slides(
         )
 
     # Deployment Architecture
-    if not _is_archetype_present(existing_keys, "deployment architecture"):
+    if "sk_deployment" in planned_ids and not _is_archetype_present(existing_keys, "deployment architecture"):
         add_slide(
             "Deployment Architecture",
             "Deployment and resilience architecture protects operations",
@@ -3358,7 +3580,7 @@ def ensure_required_slides(
         )
         for slide in deck_plan.slides
     )
-    if not has_platform_nfr:
+    if "sk_security" in planned_ids and not has_platform_nfr:
         add_slide(
             "Architecture",
             "Security, observability and NFR controls are built in",
@@ -3391,7 +3613,7 @@ def ensure_required_slides(
         )
 
     # High Availability and DR
-    if _has_explicit_hadr_need(understanding) and not _is_archetype_present(existing_keys, "high availability"):
+    if "sk_hadr" in planned_ids and not _is_archetype_present(existing_keys, "high availability"):
         add_slide(
             "High Availability & DR",
             "HA and DR protect business continuity",
@@ -3405,7 +3627,7 @@ def ensure_required_slides(
         )
 
     # Software Bill of Materials
-    if not _is_archetype_present(existing_keys, "software bill of materials"):
+    if "sk_tech" in planned_ids and not _is_archetype_present(existing_keys, "software bill of materials"):
         add_slide(
             "Software Bill of Materials",
             "Proposed solution stack maps services to architecture layers",
@@ -3442,7 +3664,7 @@ def ensure_required_slides(
         (slide.archetype or "").strip().lower() == "software bill of materials"
         for slide in deck_plan.slides
     )
-    if not has_sdlc_tech:
+    if "sk_tech" in planned_ids and not has_sdlc_tech:
         add_slide(
             "Software Bill of Materials",
             "Proposed solution stack maps services to architecture layers",
@@ -3457,7 +3679,7 @@ def ensure_required_slides(
             for token in ("ai-assisted", "ai/ml opportunity", "machine learning opportunity"))
         for slide in deck_plan.slides
     )
-    if _ai_ml_is_applicable(understanding):
+    if "sk_ai_opportunities" in planned_ids and _ai_ml_is_applicable(understanding):
         if not has_ai_ml_slide:
             add_slide(
                 "Value & Differentiators",
@@ -3478,7 +3700,7 @@ def ensure_required_slides(
                     "A rules-first core protects operational continuity while optional AI is introduced only where data readiness, measurable value, and run cost justify it."
                 )
 
-    if _ai_ml_is_applicable(understanding):
+    if "sk_ai_opportunities" in planned_ids and _ai_ml_is_applicable(understanding):
         ai_risk = BulletPoint(
             text="AI accuracy, drift, and consumption cost",
             sub_points=[
@@ -3524,7 +3746,7 @@ def ensure_required_slides(
     # Assumptions and dependencies are essential in a customer pre-read when
     # delivery relies on unresolved inputs, access, hosting, or third parties.
     assumption_points = _assumptions_dependency_points(understanding)
-    if assumption_points and not _is_archetype_present(existing_keys, "assumptions & dependencies"):
+    if "sk_assumptions" in planned_ids and assumption_points and not _is_archetype_present(existing_keys, "assumptions & dependencies"):
         add_slide(
             "Assumptions & Dependencies",
             "Delivery conditions must be confirmed early",
@@ -3535,30 +3757,34 @@ def ensure_required_slides(
         )
 
     # Delivery Plan
-    if not _is_archetype_present(existing_keys, "delivery plan"):
+    if "sk_testing" in planned_ids and not _is_archetype_present(existing_keys, "delivery plan"):
         add_slide(
             "Delivery Plan",
-            "Agile delivery turns priorities into usable increments",
-            detailed_points=_agile_delivery_points(),
+            "Acceptance evidence proves the solution is ready",
+            detailed_points=_testing_proposal_points(understanding),
             key_message=(
-                "Product ownership, persistent cross-functional squads, and evidence-based release decisions maintain speed without weakening governance."
+                "Requirement-led evidence and named customer decisions control release readiness."
             ),
             diagram=DiagramSpec(
-                kind="process",
-                prompt=_build_diagram_prompt("delivery", understanding),
+                kind="testing",
+                prompt=_build_diagram_prompt("testing", understanding),
                 approved=False,
                 image_path=None,
             ),
         )
 
     # Timeline
-    if not _is_archetype_present(existing_keys, "timeline"):
+    if "sk_roadmap" in planned_ids and not _is_archetype_present(existing_keys, "timeline"):
+        roadmap_title = (
+            "Mobilization, transition and stabilization establish the live service"
+            if managed else "Incremental delivery releases value through controlled outcomes"
+        )
         add_slide(
             "Timeline",
-            "Agile roadmap releases value through recurring increments",
+            roadmap_title,
             detailed_points=_agile_roadmap_points(),
             key_message=(
-                "Discovery, engineering, assurance, security, and operational readiness progress together within each increment."
+                "Each stage has explicit outcomes, customer decisions and readiness evidence."
             ),
             diagram=DiagramSpec(
                 kind="timeline",
@@ -3569,7 +3795,7 @@ def ensure_required_slides(
         )
 
     # Risks
-    if not _is_archetype_present(existing_keys, "risks"):
+    if "sk_risks" in planned_ids and not _is_archetype_present(existing_keys, "risks"):
         add_slide(
             "Risks",
             "Risks & Mitigations",
@@ -3582,29 +3808,42 @@ def ensure_required_slides(
 
     # A roadmap or governance slide does not replace a dedicated delivery-team view.
     has_team_structure = any(
-        any(token in (s.title or "").lower() for token in (
-            "team structure", "delivery team", "squad structure"
-        ))
+        (s.archetype or "").strip().lower() == "team"
         for s in deck_plan.slides
     )
-    if not has_team_structure:
+    if "sk_governance" in planned_ids and not has_team_structure:
+        if managed:
+            team_title = "Governance and service leadership make accountability explicit"
+            team_points = [
+                BulletPoint(text="Named service leadership", sub_points=["A Service Delivery Lead owns day-to-day execution, performance, stakeholder alignment and improvement."]),
+                BulletPoint(text="Accountable process ownership", sub_points=["Named operational roles execute the required service practices with explicit decision and escalation rights."]),
+                BulletPoint(text="Cross-party operating boundaries", sub_points=["A RACI separates customer, provider and third-party responsibilities, approvals and evidence obligations."]),
+                BulletPoint(text="Evidence-led governance", sub_points=["Operational, service-performance and executive reviews convert measures, risks and trends into recorded actions."]),
+            ]
+            team_message = "Named accountability and evidence-led governance keep the service controlled and measurable."
+            diagram_kind = "org"
+            diagram_prompt_kind = "team"
+        else:
+            team_title = "Product-aligned Agile team structure supports delivery and transition"
+            team_points = _agile_squad_points()
+            team_message = "Persistent cross-functional squads own usable outcomes end to end, supported by enabling chapters and lightweight steering governance."
+            diagram_kind = "org"
+            diagram_prompt_kind = "team"
         add_slide(
             "Team",
-            "Product-aligned Agile team structure supports delivery and transition",
-            detailed_points=_agile_squad_points(),
-            key_message=(
-                "Persistent cross-functional squads own usable outcomes end to end, supported by enabling chapters and lightweight steering governance."
-            ),
+            team_title,
+            detailed_points=team_points,
+            key_message=team_message,
             diagram=DiagramSpec(
-                kind="org",
-                prompt=_build_diagram_prompt("team", understanding),
+                kind=diagram_kind,
+                prompt=_build_diagram_prompt(diagram_prompt_kind, understanding),
                 approved=False,
                 image_path=None,
             ),
         )
 
     # Commercials (always)
-    if not _is_archetype_present(existing_keys, "commercials"):
+    if "sk_commercials" in planned_ids and not _is_archetype_present(existing_keys, "commercials"):
         add_slide(
             "Commercials",
             "Commercials & Pricing",
@@ -3625,7 +3864,7 @@ def ensure_required_slides(
 
     # Slides added later in this function must receive the same AI governance
     # treatment as model-provided slides handled above.
-    if _ai_ml_is_applicable(understanding):
+    if "sk_ai_opportunities" in planned_ids and _ai_ml_is_applicable(understanding):
         governance_items = {
             "risks": (
                 "AI accuracy, drift, and consumption cost",
@@ -3727,6 +3966,12 @@ def _deck_beat(slide: SlideSpec) -> str:
         return "title"
     if arch == "agenda":
         return "agenda"
+    # The win-theme statement slide is spliced in right after the Exec
+    # Summary and must stay grouped with it — its title is blank, so it
+    # would otherwise fall through to the generic "solution" (Act 2) default
+    # and land after the Act-2 divider instead of before it.
+    if arch == "win theme":
+        return "exec"
     # Terminal archetypes first: their descriptive titles often contain solution
     # keywords (e.g. "Commercials align build, warranty and support") that would
     # otherwise mis-route them into an earlier act.
@@ -4017,6 +4262,86 @@ def prune_redundant_storyline_slides(
     return deck_plan
 
 
+def prune_profile_misaligned_slides(
+    deck_plan: DeckPlan,
+    understanding: RFPUnderstanding | None,
+) -> DeckPlan:
+    """Remove lifecycle slides contradicted by the selected engagement policy.
+
+    This protects the direct-planner and cached-plan paths as well as the
+    engagement-specific chunked planner. It targets recognizable lifecycle
+    artifacts rather than arbitrary content, preserving useful proposal extras.
+    """
+    sections = _proposal_section_skeleton(understanding)
+    allowed_ids = {str(section.get("slide_id", "")).lower() for section in sections}
+    allowed_visual_kinds = {
+        str(section.get("diagram_kind", "")).lower()
+        for section in sections
+        if section.get("diagram_kind")
+    }
+    profile = _effective_engagement_profile(understanding)
+    managed_without_build = _profile_is_managed_operations(profile) and not _profile_is_technical_delivery(profile)
+    allowed_flags = {
+        "architecture": any(item in allowed_ids for item in ("sk_arch", "sk_technical_arch", "sk_integration")),
+        "deployment": "sk_deployment" in allowed_ids,
+        "testing": "sk_testing" in allowed_ids,
+        "technology": "sk_tech" in allowed_ids,
+        "ai": "sk_ai_opportunities" in allowed_ids,
+        "ams": "sk_ams" in allowed_ids,
+    }
+
+    kept: List[SlideSpec] = []
+    for slide in deck_plan.slides:
+        sid = (slide.slide_id or "").lower()
+        title = (slide.title or "").lower()
+        archetype = (slide.archetype or "").lower()
+        if sid in allowed_ids:
+            kept.append(slide)
+            continue
+
+        remove = False
+        if archetype == "deployment architecture" or "deployment architecture" in title:
+            remove = not allowed_flags["deployment"]
+        elif archetype == "software bill of materials" or any(
+            token in title for token in ("technology stack", "solution stack", "bill of materials")
+        ):
+            remove = not allowed_flags["technology"]
+        elif archetype == "architecture" or any(
+            token in title for token in ("solution architecture", "technical architecture", "integration architecture")
+        ):
+            remove = not allowed_flags["architecture"]
+        elif any(token in title for token in (
+            "testing strategy", "testing builds", "test strategy", "release confidence",
+            "quality engineering", "quality assurance", "system testing", "integration testing",
+            "user acceptance testing", " uat", " sit",
+        )):
+            remove = not allowed_flags["testing"]
+        elif any(token in title for token in ("ai-assisted", "ai/ml", "artificial intelligence")):
+            remove = not allowed_flags["ai"]
+        elif any(token in title for token in ("warranty and ams", "ams support")):
+            remove = not allowed_flags["ams"]
+        elif managed_without_build and any(
+            token in title for token in ("product-aligned squad", "agile team", "agile squad", "architecture runway")
+        ):
+            remove = True
+
+        if remove:
+            log.info(
+                "Pruned profile-misaligned slide: engagement=%s slide_id=%s title=%r",
+                profile.primary_type,
+                slide.slide_id,
+                slide.title,
+            )
+            continue
+        if slide.diagram and not getattr(slide.diagram, "approved", False):
+            kind = (getattr(slide.diagram, "kind", "") or "").lower()
+            if kind not in allowed_visual_kinds:
+                slide.diagram = None
+        kept.append(slide)
+    deck_plan.slides = kept
+    return deck_plan
+
+
 def enrich_slide_detail(
     deck_plan: DeckPlan,
     understanding: RFPUnderstanding | None = None,
@@ -4032,6 +4357,9 @@ def enrich_slide_detail(
       - Next Steps slides are sanitized of proposal logistics and, if needed,
         replaced with supplier-driven calls to action.
     """
+    profile = _effective_engagement_profile(understanding)
+    managed = _profile_is_managed_operations(profile)
+    technical_delivery = _profile_is_technical_delivery(profile)
     for s in deck_plan.slides:
         arch = (s.archetype or "").lower()
         title = (s.title or "").lower()
@@ -4181,7 +4509,12 @@ def enrich_slide_detail(
             s.detailed_points = _agile_roadmap_points()
             continue
 
-        if arch in {"delivery plan", "timeline", "team"} and not _has_agile_delivery_language(s):
+        if (
+            technical_delivery
+            and not managed
+            and arch in {"delivery plan", "timeline", "team"}
+            and not _has_agile_delivery_language(s)
+        ):
             if arch == "delivery plan":
                 s.title = "Agile delivery turns priorities into usable increments"
                 s.key_message = (
@@ -4309,6 +4642,37 @@ def _cards_from_detailed_points(points: List[BulletPoint], *, accent: str = "inf
     return cards
 
 
+def _risk_cards_from_detailed_points(points: List[BulletPoint], *, max_cards: int = 4) -> List[Card]:
+    """Like ``_cards_from_detailed_points``, but for Risks specifically: the
+    risk and its mitigation must read as visibly distinct, not one run-on
+    paragraph. ``_risk_detailed_points`` builds each point as
+    ``text=risk, sub_points=[mitigation]`` — put the risk in the card body
+    (plain prose under the heading) and the mitigation as its own explicitly
+    labelled bullet, so a reader can tell which is which without parsing two
+    merged sentences.
+    """
+    cards: List[Card] = []
+    for point in points[:max_cards]:
+        risk = re.sub(r"\s+", " ", (getattr(point, "text", "") or "").strip())
+        mitigations = [
+            re.sub(r"\s+", " ", item).strip()
+            for item in (getattr(point, "sub_points", None) or [])
+            if (item or "").strip()
+        ]
+        if not risk and not mitigations:
+            continue
+        heading = _concise_heading(risk) or "Risk"
+        cards.append(
+            Card(
+                heading=heading,
+                body=risk,
+                bullets=[f"Mitigation: {m}" for m in mitigations[:2]],
+                accent="challenge",
+            )
+        )
+    return cards
+
+
 def _cards_from_bullets(bullets: List[str], *, accent: str = "info", max_cards: int = 4) -> List[Card]:
     cards: List[Card] = []
     for idx, bullet in enumerate([b for b in bullets if (b or "").strip()][:max_cards], start=1):
@@ -4394,6 +4758,21 @@ def consulting_grade_proposal_polish(
                 slide.detailed_points = []
             continue
 
+        if (
+            arch == "timeline"
+            and "optional" in title
+            and not slide.cards
+            and not slide.detailed_points
+            and not slide.bullets
+        ):
+            # The dedicated optional/later-phase expansion slide sometimes
+            # comes back with only a key_message and no visible body — the
+            # model pushed the real Phase 2 argument into speaker notes
+            # instead. Backfill from RFP-grounded optional_response_topics
+            # rather than leaving the slide empty.
+            slide.detailed_points = _expansion_detailed_points(understanding)
+            continue
+
         if any(token in title for token in ("security", "observability", "nfr", "non-functional")):
             points = slide.detailed_points or [
                 BulletPoint(text="End-to-end secured communication", sub_points=[
@@ -4416,10 +4795,10 @@ def consulting_grade_proposal_polish(
 
         if arch in {"risks", "assumptions & dependencies", "value & differentiators", "requirements"}:
             if slide.detailed_points:
-                slide.cards = _cards_from_detailed_points(
-                    slide.detailed_points,
-                    accent="challenge" if arch == "risks" else "info",
-                    max_cards=4,
+                slide.cards = (
+                    _risk_cards_from_detailed_points(slide.detailed_points, max_cards=4)
+                    if arch == "risks"
+                    else _cards_from_detailed_points(slide.detailed_points, accent="info", max_cards=4)
                 )
                 slide.detailed_points = []
                 slide.bullets = []
@@ -4662,11 +5041,32 @@ def ensure_diagrams_for_key_slides(
     visual_briefs: List[DiagramBrief] | None = None,
     technology_recommendations: TechnologyRecommendationSet | None = None,
 ) -> DeckPlan:
-    """Ensure diagrams exist (as guarded approvals) for key slides."""
+    """Attach diagrams only to profile-selected, evidence-backed visual slides."""
+    # With an RFP understanding, the engagement-specific skeleton is the
+    # eligibility authority.  A few low-level callers deliberately invoke this
+    # helper without one (for example rendering/unit utilities); preserve their
+    # explicit slide semantics instead of treating "no context" as a classified
+    # engagement with no visual sections.
+    planned_sections = _proposal_section_skeleton(understanding) if understanding is not None else []
+    known_section_ids = {
+        str(section.get("slide_id", "")).lower() for section in planned_sections
+    }
+    planned_visual_by_id = {
+        str(section.get("slide_id", "")).lower(): str(section.get("diagram_kind", "")).lower()
+        for section in planned_sections
+        if section.get("diagram_kind")
+    }
+    planned_visual_kinds = set(planned_visual_by_id.values())
+    if understanding is None:
+        planned_visual_kinds = {
+            "generic", "architecture", "technical_architecture", "deployment",
+            "hadr", "timeline", "org", "testing", "data_model", "process", "ams",
+        }
     for s in deck_plan.slides:
         arch = (s.archetype or "").lower()
         title = (s.title or "").lower()
         slide_id = (getattr(s, "slide_id", "") or "").lower()
+        exact_kind = planned_visual_by_id.get(slide_id)
 
         if _is_exec_summary(s):
             s.diagram = None
@@ -4711,7 +5111,19 @@ def ensure_diagrams_for_key_slides(
             else:
                 semantic_kind = "process"
 
-        if is_technical_architecture or is_data_model or is_reporting or arch in {
+        if exact_kind:
+            semantic_kind = exact_kind
+        elif slide_id in known_section_ids:
+            # Text-native skeleton sections must not gain a diagram merely
+            # because their broad archetype commonly has one.
+            s.diagram = None
+            continue
+        elif semantic_kind not in planned_visual_kinds:
+            if s.diagram is None or not getattr(s.diagram, "approved", False):
+                s.diagram = None
+            continue
+
+        if exact_kind or is_technical_architecture or is_data_model or is_reporting or arch in {
             "architecture",
             "deployment architecture",
             "high availability & dr",
@@ -4723,7 +5135,39 @@ def ensure_diagrams_for_key_slides(
             if s.diagram is None:
                 prompt = ""
                 kind = "generic"
-                if is_technical_architecture:
+                if exact_kind == "process":
+                    prompt = _build_diagram_prompt(
+                        "delivery" if arch == "delivery plan" else "solution",
+                        understanding,
+                    )
+                    kind = "process"
+                elif exact_kind == "org":
+                    prompt = _build_diagram_prompt("team", understanding)
+                    kind = "org"
+                elif exact_kind == "timeline":
+                    prompt = _build_diagram_prompt("timeline", understanding)
+                    kind = "timeline"
+                elif exact_kind == "testing":
+                    prompt = _build_diagram_prompt("testing", understanding)
+                    kind = "testing"
+                elif exact_kind == "data_model":
+                    prompt = _build_diagram_prompt("data_model", understanding)
+                    kind = "data_model"
+                elif exact_kind == "deployment":
+                    prompt = _build_diagram_prompt("deployment", understanding)
+                    kind = "deployment"
+                elif exact_kind == "technical_architecture":
+                    prompt = _build_diagram_prompt(
+                        "technical_architecture", understanding, technology_recommendations
+                    )
+                    kind = "technical_architecture"
+                elif exact_kind == "architecture" and is_integration:
+                    prompt = _build_diagram_prompt("integration", understanding)
+                    kind = "architecture"
+                elif exact_kind == "architecture":
+                    prompt = _build_diagram_prompt("architecture", understanding)
+                    kind = "architecture"
+                elif is_technical_architecture:
                     prompt = _build_diagram_prompt(
                         "technical_architecture", understanding, technology_recommendations
                     )
@@ -4767,7 +5211,7 @@ def ensure_diagrams_for_key_slides(
                         prompt = _build_diagram_prompt("solution", understanding)
                         kind = "generic"
 
-                brief = None if is_integration else _select_visual_brief(s, kind, visual_briefs)
+                brief = _select_visual_brief(s, kind, visual_briefs)
                 if brief is not None:
                     s.diagram = _diagram_from_brief(brief, understanding)
                 elif prompt and kind != "ams":
@@ -5003,6 +5447,7 @@ def _compact_understanding_for_plan(understanding: RFPUnderstanding | None) -> D
         getattr(understanding, "requirements", []) or [],
         key=lambda r: {"must": 0, "should": 1, "may": 2}.get(getattr(r, "priority", "should"), 1),
     )
+    profile = _effective_engagement_profile(understanding)
     return {
         "customer_name": getattr(understanding, "customer_name", None),
         "opportunity_title": getattr(understanding, "opportunity_title", None),
@@ -5030,6 +5475,7 @@ def _compact_understanding_for_plan(understanding: RFPUnderstanding | None) -> D
             }
             for item in (getattr(understanding, "software_bill_of_materials", []) or [])[:14]
         ],
+        "engagement_profile": profile.model_dump(),
     }
 
 
@@ -5060,19 +5506,20 @@ def _compact_deck_plan_prompt(
         "layouts": compact_layouts,
         "understanding": _compact_understanding_for_plan(understanding),
         "narrative": _compact_narrative_for_plan(narrative),
+        "proposal_sections": _proposal_section_skeleton(understanding),
         "customer_technology_context": customer_technology_context or {},
         "contextual_reference_context": contextual_reference_context,
     }
     return (
         "You are a Tier-1 consulting deck architect. Return strict JSON matching the DeckPlan schema.\n"
-        "Create a focused HCLTech proposal deck plan with 16-20 main slides plus appendix only when needed.\n"
-        "Story order: Title, Agenda, Executive Summary, Current Challenges, Business Outcomes, "
-        "Proposed Solution, End-to-End Operational Flow, Concrete Solution Architecture, "
-        "Integration/Data/Reporting, selective AI/ML opportunities, Deployment & Resilience, Scope/Assumptions, Delivery Roadmap, "
-        "Risks, Commercials, Next Steps.\n"
-        "Rules: challenges must precede solution; avoid duplicate slides; avoid tutorial-like deployment "
-        "or Agile ceremony slides; include a concrete data-hub architecture and an architecture-layer technology stack naming implementable services; exclude procurement/submission tools; distinguish mandated technologies from proposed choices; assess AI/ML selectively using value, data readiness, human control, infrastructure, and run-cost gates; keep diagram slides visual-first; "
-        "keep bullets short enough to render without clipping.\n"
+        "Create a focused HCLTech proposal using only INPUT_JSON.proposal_sections. The supplied "
+        "engagement profile and lifecycle scope are authoritative planning constraints. Do not add "
+        "architecture, deployment, testing, Agile squads, technology-stack, AI, migration, or managed-"
+        "service sections merely because those sections are common in proposal decks.\n"
+        "Rules: challenges must precede the response; preserve Phase 1 versus optional/later-phase "
+        "boundaries; prioritize mandatory response topics and evaluation criteria; avoid duplicate "
+        "slides and tutorial content; exclude procurement/submission tools; keep diagram slides "
+        "visual-first; keep bullets short enough to render without clipping.\n"
         "Use these compact inputs only; do not invent facts.\n"
         f"INPUT_JSON:\n{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
     )
@@ -5097,9 +5544,24 @@ class SolutionBrief:
     target_cloud: str
     solution_name: str
     win_theme: str
+    # A complete, unclipped sentence for the dedicated hero quote slide — see
+    # insert_win_theme_slide. `win_theme` itself stays clipped to banner
+    # length (its original job as a compact key_message strip); reusing that
+    # pre-clipped string for a full-slide statement produced sentence
+    # fragments (a long comma-separated list truncated mid-list reads as
+    # broken copy, not a finished thought).
+    win_theme_full: str
 
 
 def _engagement_kind(understanding: RFPUnderstanding | None) -> str:
+    profile = _effective_engagement_profile(understanding)
+    if profile.primary_type != "other":
+        primary = profile.primary_type.replace("_", " ")
+        if profile.secondary_types:
+            return primary + " with " + ", ".join(
+                item.replace("_", " ") for item in profile.secondary_types[:2]
+            )
+        return primary
     if _is_data_platform_engagement(understanding):
         return "data platform"
     text = _understanding_text(understanding).lower()
@@ -5154,6 +5616,7 @@ def build_solution_brief(
         target_cloud=target_cloud,
         solution_name=_solution_name(understanding),
         win_theme=_clip(_complete_sentences(win, 1) or win, 180) if win else "",
+        win_theme_full=(_complete_sentences(win, 1) or win).strip() if win else "",
     )
 
 
@@ -5234,6 +5697,180 @@ def lead_consolidation(deck_plan: DeckPlan, brief: SolutionBrief) -> DeckPlan:
     return deck_plan
 
 
+# ------------------------------------------------------------------
+# Template/layout variety: an engagement-aware cover mood, a win-theme
+# statement slide, and section dividers between narrative acts. These are
+# purely presentational (no proposal content is added or removed) — they
+# exist because a 30-55 slide deck with one fixed cover and no visual break
+# between context/solution/delivery/commercials reads as one undifferentiated
+# wall of "Two key points" boxes.
+# ------------------------------------------------------------------
+def _cover_layout_hint(brief: SolutionBrief) -> Optional[str]:
+    """Match the cover's mood to the engagement instead of always using the
+    same cover. Picks by theme (speed/agility/collaboration/progress), never
+    by demographic imagery, so the swap reads as intentional, not arbitrary."""
+    kind = (brief.engagement_kind or "").lower()
+    if _contains_any(kind, ("migration", "modernization", "modernisation")):
+        return "Cover – Speed (Light)"
+    if _contains_any(kind, ("data platform", "analytics", "reporting")):
+        return "Cover – Progress (Light)"
+    if _contains_any(kind, ("integration",)):
+        return "Cover – Collaboration (Light)"
+    if _contains_any(kind, ("application", "platform")):
+        return "Cover – Agility (Light)"
+    return None
+
+
+def apply_cover_mood(deck_plan: DeckPlan, brief: SolutionBrief) -> DeckPlan:
+    hint = _cover_layout_hint(brief)
+    if not hint:
+        return deck_plan
+    for slide in deck_plan.slides:
+        if (slide.archetype or "").strip().lower() != "title":
+            continue
+        existing = (slide.layout_hint or "").strip()
+        # Respect an existing hint only if it looks like a real cover layout
+        # name (all of them read "Cover – ..."); the model sometimes puts
+        # free-text description ("Clean customer-facing cover with...") into
+        # layout_hint instead, which never resolves to a layout at render time
+        # and would otherwise silently block the mood swap below.
+        if existing and existing.lower().startswith("cover"):
+            break
+        slide.layout_hint = hint
+        break
+    return deck_plan
+
+
+def insert_win_theme_slide(deck_plan: DeckPlan, brief: SolutionBrief) -> DeckPlan:
+    """A full-bleed statement slide right after the Executive Summary.
+
+    Echoes the same win theme ``lead_consolidation`` threads into the Exec
+    Summary key_message — giving it a dedicated visual beat is a deliberate
+    emphasis choice real proposal decks use, not accidental duplication.
+    Attributed to HCLTech, never fabricated as a customer quote. Uses
+    ``win_theme_full`` (the complete, unclipped sentence), not ``win_theme``
+    (clipped to banner length for its other use as a compact key_message
+    strip) — this slide has a full page to work with, and the renderer's own
+    box-fit sizing (see ``_fill_quote_slide``) is what should decide how
+    small the text gets, not an upstream character cap.
+    """
+    quote = (brief.win_theme_full or brief.win_theme or "").strip()
+    if not quote:
+        return deck_plan
+    if any((slide.archetype or "").strip().lower() == "win theme" for slide in deck_plan.slides):
+        return deck_plan
+    exec_idx = next((i for i, s in enumerate(deck_plan.slides) if _is_exec_summary(s)), None)
+    if exec_idx is None:
+        return deck_plan
+    deck_plan.slides.insert(
+        exec_idx + 1,
+        SlideSpec(slide_id="sk_win_theme", title="", archetype="Win Theme", key_message=quote),
+    )
+    return deck_plan
+
+
+_ACT1_BEATS = {"title", "agenda", "exec", "context", "outcomes"}
+_ACT2_BEATS = {
+    "solution", "scope", "flow", "architecture", "data", "integration",
+    "security", "deployment", "ha_dr", "ai", "sbom",
+}
+_ACT3_BEATS = {"delivery", "timeline", "testing", "ams", "team"}
+# Act 4 is everything else (whyus, case_studies, risks, mapping, assumptions,
+# commercials, next) — the tail of _DECK_BEATS.
+_DIVIDER_LABELS = {
+    2: ("Our Proposed Solution", "Architecture, delivery approach and technical design"),
+    3: ("Delivery and Governance", "How we mobilize, deliver and support the engagement"),
+    4: ("Why HCLTech", "Value, credentials and commercial terms"),
+}
+
+
+def _act_of_beat(beat: str) -> int:
+    if beat in _ACT1_BEATS:
+        return 1
+    if beat in _ACT2_BEATS:
+        return 2
+    if beat in _ACT3_BEATS:
+        return 3
+    return 4
+
+
+def insert_section_dividers(deck_plan: DeckPlan) -> DeckPlan:
+    """Splice a section-break slide before each Act transition.
+
+    Reads the beat already assigned by ``order_deck`` to find the three Act
+    boundaries and inserts a divider ahead of each — it never re-sorts, so it
+    must run after all ordering/pruning passes have settled the final order.
+    """
+    result: List[SlideSpec] = []
+    current_act = 1
+    for slide in deck_plan.slides:
+        act = _act_of_beat(_deck_beat(slide))
+        for missing_act in range(current_act + 1, act + 1):
+            label = _DIVIDER_LABELS.get(missing_act)
+            if label is None:
+                continue
+            title, subtitle = label
+            result.append(
+                SlideSpec(
+                    slide_id=f"div_act_{missing_act}",
+                    title=title,
+                    archetype="Divider",
+                    bullets=[subtitle],
+                )
+            )
+        current_act = max(current_act, act)
+        result.append(slide)
+    deck_plan.slides = result
+    return deck_plan
+
+
+_KPI_PATTERN = re.compile(
+    r"\b\d{1,3}(?:\.\d+)?\s?%|\b\d+x\b|\$\s?\d[\d,.]*\s?(?:million|billion|[mbk])?\b|\bin \d+\s?(?:days?|weeks?|months?)\b",
+    re.IGNORECASE,
+)
+
+
+def _derive_kpis_for_slide(slide: SlideSpec) -> List[str]:
+    """Pull up to two numeric highlights already present on the slide.
+
+    Additive only: the source bullet/point text is left in place, so this can
+    never remove proposal content — it only gives the renderer material for a
+    stat-forward layout on slides that would otherwise be plain text boxes.
+    """
+    candidates: List[str] = []
+    for bullet in (slide.bullets or []):
+        if bullet and _KPI_PATTERN.search(bullet):
+            candidates.append(bullet.strip())
+    for point in (slide.detailed_points or []):
+        text = getattr(point, "text", "") or ""
+        if _KPI_PATTERN.search(text):
+            candidates.append(text.strip())
+    seen: set[str] = set()
+    result: List[str] = []
+    for candidate in candidates:
+        key = _norm_unit(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(candidate)
+        if len(result) >= 2:
+            break
+    return result
+
+
+def enrich_outcome_kpis(deck_plan: DeckPlan) -> DeckPlan:
+    """Surface numeric outcome highlights as stat callouts where they exist."""
+    for slide in deck_plan.slides:
+        if slide.kpis:
+            continue
+        if _deck_beat(slide) not in {"exec", "outcomes"}:
+            continue
+        derived = _derive_kpis_for_slide(slide)
+        if derived:
+            slide.kpis = derived
+    return deck_plan
+
+
 def _sanitize_customer_visible_source_notes(deck_plan: DeckPlan) -> DeckPlan:
     """Keep extraction/audit mechanics out of customer-facing slide content."""
     def clean(text: str | None) -> str:
@@ -5305,6 +5942,7 @@ def _post_process_deck_plan(
         brief.customer, brief.engagement_kind, brief.target_cloud, brief.solution_name,
     )
     keystone_ids = {str(section.get("slide_id", "")) for section in _proposal_section_skeleton(understanding)}
+    deck_plan = prune_profile_misaligned_slides(deck_plan, understanding)
     deck_plan = ensure_required_slides(deck_plan, understanding=understanding, narrative=narrative)
     deck_plan = _apply_technology_recommendations(deck_plan, technology_recommendations)
     deck_plan = enrich_slide_detail(
@@ -5316,10 +5954,12 @@ def _post_process_deck_plan(
     deck_plan = prune_empty_content_slides(deck_plan)
     deck_plan = prune_redundant_storyline_slides(deck_plan, protected_ids=keystone_ids)
     deck_plan = consulting_grade_proposal_polish(deck_plan, understanding=understanding, narrative=narrative)
+    deck_plan = enrich_outcome_kpis(deck_plan)
     deck_plan = order_deck(deck_plan)
     deck_plan = synchronize_agenda(deck_plan)
     deck_plan = polish_deck_text(deck_plan)
     deck_plan = lead_consolidation(deck_plan, brief)
+    deck_plan = apply_cover_mood(deck_plan, brief)
     deck_plan = _sanitize_customer_visible_source_notes(deck_plan)
     deck_plan = ensure_diagrams_for_key_slides(
         deck_plan,
@@ -5328,6 +5968,11 @@ def _post_process_deck_plan(
         technology_recommendations=technology_recommendations,
     )
     deck_plan = enforce_slide_density(deck_plan)
+    # Positional inserts — appended last so no earlier pass (pruning, density
+    # limits, agenda sync) has to know about these synthetic, content-free
+    # slides. They read the plan's already-final order and never re-sort it.
+    deck_plan = insert_win_theme_slide(deck_plan, brief)
+    deck_plan = insert_section_dividers(deck_plan)
     return deck_plan
 
 
@@ -5337,92 +5982,50 @@ def _fallback_deck_plan(
     understanding: RFPUnderstanding | None,
     narrative: ExecutiveNarrative | None,
 ) -> DeckPlan:
-    """Build a deterministic plan if the LLM planner cannot be reached."""
-    slides = [
-        SlideSpec(slide_id="fallback_title", title=title or "Proposal", archetype="Title"),
-        SlideSpec(slide_id="fallback_agenda", title="Agenda", archetype="Agenda"),
-        SlideSpec(
-            slide_id="fallback_exec",
-            title="Executive Summary",
-            archetype="Solution Overview",
-            key_message=(getattr(narrative, "value_proposition", "") or "") if narrative else None,
-            cards=_exec_summary_cards(understanding, narrative),
-        ),
-        SlideSpec(
-            slide_id="fallback_context",
-            title="Current challenges define the solution priorities",
-            archetype="Customer Context",
-            detailed_points=_context_detailed_points(understanding),
-        ),
-        SlideSpec(
-            slide_id="fallback_requirements",
-            title="Scope and requirements are broad but bounded",
-            archetype="Requirements",
-            detailed_points=_requirements_detailed_points(understanding),
-        ),
-        SlideSpec(
-            slide_id="fallback_solution",
-            title="The proposed data hub creates one trusted flow",
-            archetype="Solution Overview",
-            bullets=_exec_summary_bullets(understanding, narrative),
-        ),
-        SlideSpec(
-            slide_id="fallback_architecture",
-            title="Solution architecture builds the centralized data hub",
-            archetype="Architecture",
-            diagram=DiagramSpec(kind="architecture", prompt=_build_diagram_prompt("architecture", understanding)),
-        ),
-        SlideSpec(
-            slide_id="fallback_technical_architecture",
-            title="Layered technical architecture connects systems, products and custom services",
-            archetype="Architecture",
-            diagram=DiagramSpec(
-                kind="technical_architecture",
-                prompt=_build_diagram_prompt("technical_architecture", understanding),
-            ),
-        ),
-        SlideSpec(
-            slide_id="fallback_deployment",
-            title="Deployment and resilience architecture protects operations",
-            archetype="Deployment Architecture",
-            diagram=DiagramSpec(kind="deployment", prompt=_build_diagram_prompt("deployment", understanding)),
-        ),
-        SlideSpec(
-            slide_id="fallback_assumptions",
-            title="Delivery conditions must be confirmed early",
-            archetype="Assumptions & Dependencies",
-            detailed_points=_assumptions_dependency_points(understanding),
-        ),
-        SlideSpec(
-            slide_id="fallback_timeline",
-            title="Agile roadmap releases value through increments",
-            archetype="Timeline",
-            detailed_points=_agile_roadmap_points(),
-        ),
-        SlideSpec(
-            slide_id="fallback_risks",
-            title="Key risks can be actively managed",
-            archetype="Risks",
-            detailed_points=_risk_detailed_points(understanding),
-        ),
-        SlideSpec(
-            slide_id="fallback_commercials",
-            title="Commercials should align build and support",
-            archetype="Commercials",
-            bullets=[
-                "Confirm implementation, warranty, and maintenance scope as one accountable commercial model",
-                "Use delivery gates and acceptance evidence to manage non-conformance and rework exposure",
-                "Treat open hosting, migration, and integration assumptions as commercial dependencies",
-            ],
-        ),
-        SlideSpec(
-            slide_id="fallback_next",
-            title="Recommended Next Steps",
-            archetype="Next Steps",
-            bullets=_next_steps_bullets(understanding),
-        ),
-    ]
-    return DeckPlan(deck_title=title or "Proposal", slides=slides)
+    """Build a conservative profile-driven plan if the LLM planner is unavailable."""
+    sections = _proposal_section_skeleton(understanding)
+    deck = _empty_plan_for_sections(title, sections)
+    section_by_id = {str(section.get("slide_id", "")): section for section in sections}
+    prompt_kind = {
+        "architecture": "architecture",
+        "technical_architecture": "technical_architecture",
+        "deployment": "deployment",
+        "hadr": "hadr",
+        "timeline": "timeline",
+        "org": "team",
+        "testing": "testing",
+        "data_model": "data_model",
+        "process": "delivery",
+    }
+    for slide in deck.slides:
+        if slide.slide_id == "sk_exec":
+            slide.key_message = (
+                (getattr(narrative, "value_proposition", "") or "") if narrative else None
+            )
+            slide.cards = _exec_summary_cards(understanding, narrative)
+        elif slide.slide_id == "sk_context":
+            slide.detailed_points = _context_detailed_points(understanding)
+        elif slide.slide_id == "sk_scope":
+            slide.detailed_points = _requirements_detailed_points(understanding)
+        elif slide.slide_id == "sk_solution":
+            slide.bullets = _exec_summary_bullets(understanding, narrative)
+        elif slide.slide_id == "sk_risks":
+            slide.detailed_points = _risk_detailed_points(understanding)
+        elif slide.slide_id == "sk_assumptions":
+            slide.detailed_points = _assumptions_dependency_points(understanding)
+        elif slide.slide_id == "sk_tech":
+            slide.table = _source_grounded_technology_table(understanding)
+        elif slide.slide_id == "sk_next":
+            slide.bullets = _next_steps_bullets(understanding)
+
+        diagram_kind = str(section_by_id.get(slide.slide_id, {}).get("diagram_kind", ""))
+        if diagram_kind:
+            slide.diagram = DiagramSpec(
+                kind=diagram_kind,
+                prompt=_build_diagram_prompt(prompt_kind.get(diagram_kind, "solution"), understanding),
+                approved=False,
+            )
+    return deck
 
 
 def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
@@ -5501,6 +6104,300 @@ def _is_data_platform_engagement(understanding: RFPUnderstanding | None) -> bool
     return False
 
 
+_TECHNICAL_ENGAGEMENT_TYPES = {
+    "application_development",
+    "platform_implementation",
+    "migration_modernization",
+    "data_analytics",
+    "infrastructure_cloud",
+}
+
+_OPERATING_ENGAGEMENT_TYPES = {
+    "managed_service_operations",
+    "business_process_transformation",
+}
+
+
+def _phrase_score(text: str, weighted_phrases: tuple[tuple[str, float], ...]) -> tuple[float, List[str]]:
+    score = 0.0
+    evidence: List[str] = []
+    low = (text or "").lower()
+    for phrase, weight in weighted_phrases:
+        if phrase in low:
+            score += weight
+            evidence.append(phrase)
+    return min(1.0, score), evidence[:6]
+
+
+def _infer_engagement_profile(understanding: RFPUnderstanding | None) -> EngagementProfile:
+    """Conservative local fallback when the understanding has no model profile.
+
+    Strong multi-word scope signals carry the most weight. Broad terms such as
+    ``technology``, ``platform``, ``system``, ``implement`` and ``support`` are
+    intentionally not sufficient on their own because they occur in nearly
+    every technology RFP.
+    """
+    if understanding is None:
+        return EngagementProfile(classification_rationale="No RFP understanding was available.")
+
+    scope = _scope_text(understanding)
+    requirements = " ".join(
+        (getattr(item, "text", "") or "")
+        for item in (getattr(understanding, "requirements", []) or [])
+    ).lower()
+    corpus = f"{scope} {requirements}"
+    score_map: Dict[str, tuple[float, List[str]]] = {
+        "managed_service_operations": _phrase_score(corpus, (
+            ("managed service", 0.55), ("service management", 0.45),
+            ("incident management", 0.30), ("problem management", 0.30),
+            ("change management", 0.25), ("service delivery manager", 0.25),
+            ("service level", 0.15), ("operating model", 0.20),
+            ("operate the", 0.15), ("itil", 0.30), ("service desk", 0.30),
+            ("application maintenance", 0.35),
+        )),
+        "application_development": _phrase_score(corpus, (
+            ("application development", 0.55), ("software development", 0.55),
+            ("develop and implement", 0.35), ("design and build", 0.30),
+            ("build an application", 0.45), ("build a web application", 0.45),
+            ("develop an application", 0.45), ("develop a web application", 0.45),
+            ("build a portal", 0.45), ("develop a portal", 0.45),
+            ("web application", 0.30), ("mobile application", 0.30),
+            ("source code", 0.25), ("user stories", 0.20),
+            ("software engineering", 0.30),
+        )),
+        "platform_implementation": _phrase_score(corpus, (
+            ("platform implementation", 0.55), ("system implementation", 0.45),
+            ("implement a platform", 0.45), ("configure and implement", 0.35),
+            ("erp implementation", 0.45), ("crm implementation", 0.45),
+            ("servicenow implementation", 0.45),
+        )),
+        "migration_modernization": _phrase_score(corpus, (
+            ("migration", 0.35), ("migrate", 0.30), ("modernization", 0.40),
+            ("modernisation", 0.40), ("re-platform", 0.40),
+            ("replatform", 0.40), ("cutover", 0.25), ("legacy replacement", 0.40),
+        )),
+        "data_analytics": _phrase_score(corpus, (
+            ("data platform", 0.55), ("data hub", 0.55), ("data lake", 0.50),
+            ("lakehouse", 0.50), ("data warehouse", 0.50),
+            ("analytics platform", 0.45), ("reporting platform", 0.40),
+            ("business intelligence", 0.35), ("master data", 0.35),
+        )),
+        "infrastructure_cloud": _phrase_score(corpus, (
+            ("cloud migration", 0.55), ("cloud infrastructure", 0.50),
+            ("infrastructure transformation", 0.45), ("data center", 0.35),
+            ("datacentre", 0.35), ("network transformation", 0.40),
+            ("landing zone", 0.40), ("infrastructure managed service", 0.35),
+        )),
+        "advisory_assessment": _phrase_score(corpus, (
+            ("advisory services", 0.50), ("strategy and roadmap", 0.45),
+            ("maturity assessment", 0.35), ("current state assessment", 0.35),
+            ("recommendations report", 0.30), ("consulting services", 0.30),
+        )),
+        "business_process_transformation": _phrase_score(corpus, (
+            ("process transformation", 0.50), ("operating model transformation", 0.50),
+            ("process redesign", 0.40), ("business process", 0.25),
+            ("continuous improvement", 0.20), ("process governance", 0.25),
+        )),
+        "training_change_enablement": _phrase_score(corpus, (
+            ("training delivery", 0.50), ("instructor-led training", 0.55),
+            ("change enablement", 0.45), ("change adoption", 0.35),
+            ("learning program", 0.40), ("training programme", 0.40),
+        )),
+    }
+    if _is_data_platform_engagement(understanding):
+        score, evidence = score_map["data_analytics"]
+        score_map["data_analytics"] = (max(score, 0.75), evidence or ["data-platform scope"])
+    if (
+        (getattr(understanding, "solution_technologies", []) or [])
+        and _contains_any(scope, ("configure", "implement", "deploy"))
+    ):
+        score, evidence = score_map["platform_implementation"]
+        score_map["platform_implementation"] = (
+            max(score, 0.55),
+            list(dict.fromkeys(evidence + ["named platform implementation scope"])),
+        )
+
+    ranked = sorted(score_map.items(), key=lambda item: item[1][0], reverse=True)
+    top_type, (top_score, _) = ranked[0]
+    if top_score < 0.20:
+        top_type = "other"
+    secondaries = [
+        name for name, (score, _) in ranked[1:]
+        if score >= 0.30 and score >= top_score * 0.60
+    ][:3]
+    assessments = [
+        EngagementTypeAssessment(engagement_type=name, score=score, evidence=evidence)
+        for name, (score, evidence) in ranked
+        if score > 0
+    ]
+
+    technical_primary = top_type in _TECHNICAL_ENGAGEMENT_TYPES
+    technical_secondary = any(name in _TECHNICAL_ENGAGEMENT_TYPES for name in secondaries)
+    stages: List[LifecycleStageAssessment] = []
+
+    def add_stage(stage: str, terms: tuple[str, ...], *, allowed: bool = True) -> None:
+        hits = [term for term in terms if term in corpus]
+        if hits and allowed:
+            stages.append(LifecycleStageAssessment(
+                stage=stage,
+                in_scope=True,
+                confidence=min(0.9, 0.45 + 0.12 * len(hits)),
+                evidence=hits[:5],
+            ))
+
+    add_stage("discover_assess", ("assessment", "discovery", "current state", "maturity"))
+    add_stage("design", ("design", "framework", "operating model", "process model"))
+    add_stage(
+        "configure_build",
+        ("application development", "software development", "design and build", "configure and implement", "source code", "build"),
+        allowed=technical_primary or technical_secondary,
+    )
+    add_stage(
+        "integrate_migrate",
+        ("migration", "migrate", "cutover", "api integration", "system integration", "interface integration"),
+        allowed=technical_primary or technical_secondary,
+    )
+    add_stage(
+        "test_validate",
+        ("system testing", "integration testing", "user acceptance testing", "uat", "test automation", "testing"),
+        allowed=technical_primary or technical_secondary,
+    )
+    add_stage(
+        "deploy_release",
+        ("production deployment", "application deployment", "release pipeline", "ci/cd", "go-live", "deployment"),
+        allowed=technical_primary or technical_secondary,
+    )
+    add_stage("mobilize_transition", ("mobilization", "mobilisation", "transition plan", "service transition", "stabilization", "stabilisation"))
+    add_stage(
+        "operate_support",
+        (
+            "managed service", "operate", "operations support", "service management",
+            "maintenance", "application maintenance", "ams support",
+            "warranty and support", "live-service support", "production support",
+        ),
+    )
+    add_stage("optimize_transform", ("continuous improvement", "optimization", "optimisation", "maturity improvement", "transformation"))
+
+    delivery_mode = "unknown"
+    if top_type == "managed_service_operations":
+        delivery_mode = "managed_service"
+    elif top_type == "advisory_assessment":
+        delivery_mode = "advisory"
+    elif top_type == "hybrid" or (secondaries and top_score and score_map[secondaries[0]][0] >= top_score * 0.80):
+        delivery_mode = "hybrid"
+    elif technical_primary:
+        delivery_mode = "project_delivery"
+
+    mandatory_topics: List[str] = []
+    topic_signals = (
+        ("staffing model", ("staffing model", "resource model", "proposed roles")),
+        ("governance model", ("governance", "raci", "service review")),
+        ("service levels and measures", ("service level", "sla", "kpi", "success measures")),
+        ("implementation or transition approach", ("implementation approach", "transition plan", "mobilization plan", "mobilisation plan")),
+        ("commercial proposal", ("commercial proposal", "pricing", "rate card")),
+        ("references and relevant experience", ("client references", "references", "relevant experience")),
+    )
+    for label, terms in topic_signals:
+        if any(term in corpus for term in terms):
+            mandatory_topics.append(label)
+
+    optional_topics: List[str] = []
+    for marker in ("optional", "phase 2", "future expansion", "expansion opportunity"):
+        if marker in corpus:
+            optional_topics.append(marker)
+
+    confidence = max(0.35, min(0.85, top_score if top_type != "other" else 0.35))
+    return EngagementProfile(
+        primary_type=top_type,
+        secondary_types=secondaries,
+        type_assessments=assessments,
+        delivery_mode=delivery_mode,
+        lifecycle_stages=stages,
+        mandatory_response_topics=mandatory_topics,
+        optional_response_topics=optional_topics,
+        phase_labels=[marker for marker in ("Phase 1", "Phase 2") if marker.lower() in corpus],
+        classification_rationale=(
+            f"Classified as {top_type.replace('_', ' ')} from the strongest scope and requirement signals."
+        ),
+        confidence=confidence,
+    )
+
+
+def _effective_engagement_profile(understanding: RFPUnderstanding | None) -> EngagementProfile:
+    if understanding is None:
+        return _infer_engagement_profile(None)
+    profile = getattr(understanding, "engagement_profile", None)
+    if profile is None or profile.primary_type == "other" or profile.confidence < 0.35:
+        return _infer_engagement_profile(understanding)
+    return profile
+
+
+def _profile_type_score(profile: EngagementProfile, engagement_type: str) -> float:
+    if profile.primary_type == engagement_type:
+        primary = max(0.65, profile.confidence)
+    else:
+        primary = 0.0
+    scored = max(
+        (
+            assessment.score
+            for assessment in profile.type_assessments
+            if assessment.engagement_type == engagement_type
+        ),
+        default=0.0,
+    )
+    # A declared secondary type is strong enough to select its own evidence-
+    # backed sections in a hybrid engagement; lifecycle-stage gates still
+    # prevent a secondary label from importing an entire template.
+    secondary = 0.55 if engagement_type in profile.secondary_types else 0.0
+    return max(primary, scored, secondary)
+
+
+def _profile_has_stage(
+    profile: EngagementProfile,
+    stage: str,
+    *,
+    include_optional: bool = False,
+) -> bool:
+    return any(
+        item.stage == stage
+        and item.in_scope
+        and (include_optional or not item.optional)
+        for item in profile.lifecycle_stages
+    )
+
+
+def _profile_is_technical_delivery(profile: EngagementProfile) -> bool:
+    technical_type = any(
+        _profile_type_score(profile, engagement_type) >= 0.50
+        for engagement_type in _TECHNICAL_ENGAGEMENT_TYPES
+    )
+    technical_stage = any(
+        _profile_has_stage(profile, stage)
+        for stage in ("configure_build", "integrate_migrate", "test_validate", "deploy_release")
+    )
+    return technical_type and technical_stage
+
+
+def _profile_is_managed_operations(profile: EngagementProfile) -> bool:
+    return (
+        _profile_type_score(profile, "managed_service_operations") >= 0.50
+        or profile.delivery_mode == "managed_service"
+        or (
+            _profile_type_score(profile, "business_process_transformation") >= 0.50
+            and _profile_has_stage(profile, "operate_support")
+        )
+    )
+
+
+def _profile_topic_contains(items: List[str], *terms: str) -> bool:
+    text = " ".join(items or []).lower()
+    return any(term in text for term in terms)
+
+
+def _profile_explicitly_excludes(profile: EngagementProfile, *terms: str) -> bool:
+    return _profile_topic_contains(profile.explicitly_unsupported_topics, *terms)
+
+
 def _cloud_signal(corpus: str) -> str:
     """Return the dominant target cloud ('azure' | 'aws' | 'gcp' | '')."""
     c = (corpus or "").lower()
@@ -5520,17 +6417,24 @@ def _response_priorities(
     narrative: "ExecutiveNarrative | None" = None,
 ) -> List[str]:
     """Three short 'how we respond' points, derived from the RFP, never hardcoded."""
+    # These often read as "label: elaboration" (the label itself eats into the
+    # budget), and a comma inside an enumerated list ("Incident, Problem,
+    # Change...") is not a safe clause boundary to cut at — _truncate_on_word
+    # will still take it if forced to, leaving a dangling fragment. The
+    # rendered comparison column comfortably holds full sentences well past
+    # 150 characters, so the cap here is sized to rarely trigger at all
+    # rather than to fit a specific box height.
     if narrative is not None:
         for attr in ("solution_themes", "strategic_outcomes"):
             vals = [v.strip() for v in (getattr(narrative, attr, []) or []) if (v or "").strip()]
             if len(vals) >= 2:
-                return [_clip(v, 90) for v in vals[:3]]
+                return [_clip(v, 170) for v in vals[:3]]
     scope = [s.strip() for s in (getattr(understanding, "in_scope_work", []) or []) if (s or "").strip()]
     if len(scope) >= 2:
-        return [_clip(s, 90) for s in scope[:3]]
+        return [_clip(s, 170) for s in scope[:3]]
     vp = (getattr(narrative, "value_proposition", "") or "").strip() if narrative else ""
     if vp:
-        return [_clip(vp, 110)]
+        return [_clip(vp, 170)]
     return [
         "Meet the stated requirements with a proven, low-risk delivery approach",
         "Preserve continuity through phased delivery, validation, and cutover controls",
@@ -5539,104 +6443,361 @@ def _response_priorities(
 
 
 def _proposal_section_skeleton(understanding: RFPUnderstanding | None) -> List[Dict[str, Any]]:
-    """Adaptive proposal-completeness skeleton used for chunked planning.
+    """Create an evidence-backed, engagement-specific set of slide candidates.
 
-    Titles and section gating are engagement-agnostic: no customer name, legacy
-    system, or data-platform framing is assumed. Optional sections are added
-    only on genuine signals so a non-data engagement (e.g. a cloud migration)
-    does not inherit data-hub/reporting slides.
+    This is a planning policy, not a fixed deck template. Common executive
+    bookends remain stable, while architecture, testing, deployment, operating
+    model, staffing, technology and other lifecycle sections are selected from
+    the classified engagement profile and explicit RFP signals.
     """
     text = _understanding_text(understanding)
+    scope_text = _scope_text(understanding)
     customer = _customer_label(understanding)
-    is_data = _is_data_platform_engagement(understanding)
-    has_integration = _contains_any(text, ("api", "interface", "integration", "sftp", "mq", "message queue", "event", "webhook", "connector"))
-    has_migration = _contains_any(text, ("migration", "migrate", "legacy", "cutover", "re-platform", "replatform", "modernization", "modernisation", "lift and shift"))
-    has_support = _contains_any(text, ("ams", "maintenance", "support", "warranty", "hypercare", "operate", "run"))
-    has_security = _contains_any(text, ("security", "mfa", "audit", "siem", "access control", "encryption", "compliance", "log"))
-    needs_technical_architecture = _contains_any(
-        text,
-        (
-            "system", "application", "platform", "software", "digital", "technology",
-            "architecture", "develop", "development", "build", "implement", "cloud",
-            "data", "database", "catalogue", "catalog", "api", "integration", "interface",
-        ),
-    )
+    profile = _effective_engagement_profile(understanding)
+    if understanding is not None:
+        understanding.engagement_profile = profile
 
-    # Neutral outcomes title; only name the customer when it is a real name.
+    managed = _profile_is_managed_operations(profile)
+    technical_delivery = _profile_is_technical_delivery(profile)
+    is_data = _profile_type_score(profile, "data_analytics") >= 0.50
+    advisory = _profile_type_score(profile, "advisory_assessment") >= 0.50
+    process_transformation = _profile_type_score(profile, "business_process_transformation") >= 0.50
+    training = _profile_type_score(profile, "training_change_enablement") >= 0.50
+
+    has_integration = technical_delivery and _contains_any(
+        scope_text,
+        ("api integration", "system integration", "interface", "sftp", "message queue", "webhook", "connector"),
+    )
+    has_migration = (
+        _profile_type_score(profile, "migration_modernization") >= 0.50
+        or (
+            technical_delivery
+            and _contains_any(scope_text, ("migration", "migrate", "cutover", "re-platform", "replatform"))
+        )
+    )
+    has_support = managed or _profile_has_stage(profile, "operate_support")
+    has_security = _contains_any(
+        text,
+        ("security", "mfa", "audit", "siem", "access control", "encryption", "compliance", "logging"),
+    )
+    needs_architecture = technical_delivery and not _profile_explicitly_excludes(
+        profile, "solution architecture", "technical architecture",
+        "target architecture", "solution design"
+    ) and any(
+        _profile_type_score(profile, engagement_type) >= 0.50
+        for engagement_type in _TECHNICAL_ENGAGEMENT_TYPES
+    )
+    needs_technical_architecture = needs_architecture and any(
+        _profile_type_score(profile, engagement_type) >= 0.50
+        for engagement_type in (
+            "application_development", "platform_implementation", "data_analytics", "infrastructure_cloud"
+        )
+    )
+    needs_deployment = technical_delivery and not _profile_explicitly_excludes(
+        profile, "deployment", "release architecture", "runtime architecture"
+    ) and (
+        _profile_has_stage(profile, "deploy_release")
+        or _contains_any(scope_text, ("production deployment", "application deployment", "go-live", "ci/cd"))
+    )
+    needs_testing = technical_delivery and not _profile_explicitly_excludes(
+        profile, "testing", "test strategy", "quality engineering"
+    ) and (
+        _profile_has_stage(profile, "test_validate")
+        or _profile_has_stage(profile, "configure_build")
+        or _profile_has_stage(profile, "integrate_migrate")
+    )
+    needs_technology_stack = (
+        needs_technical_architecture
+        and not managed
+        and not _profile_explicitly_excludes(
+            profile, "technology stack", "solution stack", "bill of materials"
+        )
+    )
+    needs_roadmap = bool(profile.lifecycle_stages) or technical_delivery or managed or advisory
+    has_governance = managed or _contains_any(text, ("governance", "raci", "steering", "service review", "decision rights"))
+    has_metrics = managed or _contains_any(text, ("service level", "sla", "kpi", "dashboard", "success measure", "performance reporting"))
+    has_staffing = managed or _profile_topic_contains(
+        profile.mandatory_response_topics, "staff", "resource", "role", "team"
+    )
+    has_optional_expansion = bool(profile.optional_response_topics or profile.phase_labels) and _contains_any(
+        text, ("phase 2", "optional", "future expansion", "expansion opportunity")
+    )
+    wants_references = _profile_topic_contains(
+        profile.mandatory_response_topics, "reference", "experience", "case stud"
+    ) or _contains_any(text, ("client references", "comparable engagements", "case studies"))
+    wants_commercials = _profile_topic_contains(
+        profile.mandatory_response_topics, "commercial", "pricing", "rate card"
+    ) or _contains_any(text, ("commercial proposal", "pricing", "rate card"))
+
     outcomes_title = (
         f"Target outcomes align to {customer}'s priorities"
         if customer != "the customer"
         else "Target outcomes and measurable commitments"
     )
+    sections: List[Dict[str, Any]] = []
 
-    sections: List[Dict[str, Any]] = [
-        {"slide_id": "sk_title", "title": "Proposal title", "archetype": "Title", "purpose": "Customer-facing cover"},
-        {"slide_id": "sk_agenda", "title": "Agenda", "archetype": "Agenda", "purpose": "Summarize the deck flow"},
-        {"slide_id": "sk_exec", "title": "Executive Summary", "archetype": "Solution Overview", "purpose": "Win thesis, situation, response, outcomes"},
-        {"slide_id": "sk_context", "title": "Current challenges define the solution priorities", "archetype": "Customer Context", "purpose": "Show understanding of current context, pain, and constraints"},
-        {"slide_id": "sk_outcomes", "title": outcomes_title, "archetype": "Value & Differentiators", "purpose": "Business and technical outcomes the proposal commits to"},
-        {"slide_id": "sk_scope", "title": "Scope and boundaries are explicit", "archetype": "Requirements", "purpose": "In scope, out of scope, open decisions"},
-        {"slide_id": "sk_solution", "title": "Proposed solution at a glance", "archetype": "Solution Overview", "purpose": "Solution pillars and how they fit together"},
-        {"slide_id": "sk_flow", "title": "End-to-end solution flow", "archetype": "Solution Overview", "purpose": "Visual flow from inputs through the solution to outputs", "diagram_kind": "process"},
-        {"slide_id": "sk_arch", "title": "Concrete solution architecture", "archetype": "Architecture", "purpose": "Specific build architecture and major components", "diagram_kind": "architecture"},
-    ]
+    def add(
+        slide_id: str,
+        title: str,
+        archetype: str,
+        purpose: str,
+        *,
+        diagram_kind: str | None = None,
+        inclusion_reason: str = "",
+        phase: str = "required scope",
+    ) -> None:
+        section: Dict[str, Any] = {
+            "slide_id": slide_id,
+            "title": title,
+            "archetype": archetype,
+            "purpose": purpose,
+            "inclusion_reason": inclusion_reason or "Supports the RFP response and proposal narrative.",
+            "phase": phase,
+            "engagement_type": profile.primary_type,
+        }
+        if diagram_kind:
+            section["diagram_kind"] = diagram_kind
+        sections.append(section)
+
+    add("sk_title", "Proposal title", "Title", "Customer-facing cover")
+    add("sk_agenda", "Agenda", "Agenda", "Summarize the selected deck flow")
+    add("sk_exec", "Executive Summary", "Solution Overview", "Win thesis, situation, response and outcomes")
+    add(
+        "sk_context", "Current challenges define the response priorities", "Customer Context",
+        "Show understanding of current context, pain, constraints and why action is needed",
+    )
+    add(
+        "sk_outcomes", outcomes_title, "Value & Differentiators",
+        "Business, service and technical outcomes supported by the RFP",
+    )
+    add(
+        "sk_scope", "Scope and boundaries are explicit", "Requirements",
+        "Separate required, optional, out-of-scope and open-decision items",
+        inclusion_reason="Prevents optional or later-phase scope from becoming a delivery commitment.",
+    )
+    add(
+        "sk_solution", "Proposed response at a glance", "Solution Overview",
+        "Summarize the engagement-appropriate response pillars without forcing a technical architecture",
+    )
+
+    if managed or process_transformation:
+        add(
+            "sk_operating_model", "The operating model connects accountability, process and evidence",
+            "Solution Overview",
+            "Show service ownership, operational roles, core practices, governance, reporting and improvement",
+            diagram_kind="process",
+            inclusion_reason="Managed-service and operating-model scope requires an accountable service view.",
+        )
+        add(
+            "sk_service_lifecycle", "Integrated service practices turn operational signals into improvement",
+            "Content",
+            "Show how the named operational practices interact, including escalation, learning, governance and closure",
+            diagram_kind="process",
+            inclusion_reason="Explains the RFP's service processes as one operating system rather than isolated documents.",
+        )
+    elif advisory:
+        add(
+            "sk_approach", "The advisory approach moves from evidence to executable decisions", "Delivery Plan",
+            "Assessment lenses, stakeholder alignment, recommendations, roadmap and decision gates",
+            diagram_kind="process",
+            inclusion_reason="Advisory scope needs a method and decision path, not build architecture.",
+        )
+        add(
+            "sk_deliverables", "Each advisory deliverable supports a defined decision", "Content",
+            "Map analyses and deliverables to customer decisions, owners and outcomes",
+        )
+    elif training:
+        add(
+            "sk_enablement_model", "The enablement model connects learning, practice and adoption", "Solution Overview",
+            "Audience segmentation, learning journeys, delivery channels, reinforcement and adoption measurement",
+            diagram_kind="process",
+        )
+
+    if technical_delivery:
+        add(
+            "sk_flow", "End-to-end solution flow", "Solution Overview",
+            "Visual flow from named inputs through solution controls to outcomes",
+            diagram_kind="process",
+            inclusion_reason="Technical delivery scope benefits from one end-to-end flow before detailed design.",
+        )
+    if needs_architecture:
+        add(
+            "sk_arch", "Concrete solution architecture", "Architecture",
+            "Specific build, configuration or migration architecture and major components",
+            diagram_kind="architecture",
+        )
     if needs_technical_architecture:
-        sections.append({
-            "slide_id": "sk_technical_arch",
-            "title": "Layered technical architecture connects systems, products and custom services",
-            "archetype": "Architecture",
-            "purpose": (
-                "External systems and their data, COTS/build/integrate decisions, technical layers, "
-                "selected platform services and cross-cutting controls"
-            ),
-            "diagram_kind": "technical_architecture",
-        })
+        add(
+            "sk_technical_arch", "Layered technical architecture connects systems, products and custom services",
+            "Architecture",
+            "External systems, COTS/build/integrate decisions, technical layers and cross-cutting controls",
+            diagram_kind="technical_architecture",
+        )
     if has_integration:
-        sections.append({"slide_id": "sk_integration", "title": "Integration architecture connects source and consumer systems", "archetype": "Architecture", "purpose": "APIs, files, messaging, system dependencies, error handling", "diagram_kind": "architecture"})
-    if is_data:
-        sections.extend([
-            {"slide_id": "sk_data_model", "title": "Core data domains and ownership", "archetype": "Content", "purpose": "Core data entities/domains, relationships, ownership and stewardship", "diagram_kind": "data_model"},
-            {
-                "slide_id": "sk_reporting",
-                "title": "One governed semantic layer serves decision-ready reporting",
-                "archetype": "Content",
-                "purpose": "A simple trusted-data-to-decisions story for operational, commercial, compliance and executive audiences; avoid a dense report matrix",
-                "diagram_kind": "process",
-            },
-        ])
-    if _ai_ml_is_applicable(understanding):
-        sections.append({
-            "slide_id": "sk_ai_opportunities",
-            "title": "AI-assisted capabilities target high-value use cases",
-            "archetype": "Value & Differentiators",
-            "purpose": "Prioritised AI/ML use cases with value, data-readiness, human-control, infrastructure, cost, and approval gates",
-        })
+        add(
+            "sk_integration", "Integration architecture connects source and consumer systems", "Architecture",
+            "Named interfaces, protocols, dependencies, validation and error handling",
+            diagram_kind="architecture",
+        )
+    if is_data and technical_delivery:
+        add(
+            "sk_data_model", "Core data domains and ownership", "Content",
+            "Core data entities, relationships, ownership and stewardship",
+            diagram_kind="data_model",
+        )
+        add(
+            "sk_reporting", "One governed semantic layer serves decision-ready reporting", "Content",
+            "Trusted data, governed measures and decision audiences",
+            diagram_kind="process",
+        )
+    if _ai_ml_is_applicable(understanding) and not _profile_explicitly_excludes(
+        profile, "artificial intelligence", "ai/ml", "machine learning"
+    ):
+        add(
+            "sk_ai_opportunities", "AI-assisted capabilities target evidenced use cases", "Value & Differentiators",
+            "Prioritize explicit or analytically grounded use cases with value, readiness, human control and cost gates",
+            inclusion_reason="Included only because the classified technical scope contains credible AI/analytical signals.",
+        )
     if has_security:
-        sections.append({"slide_id": "sk_security", "title": "Security and observability are built into the platform", "archetype": "Content", "purpose": "Access control, audit, logs, monitoring, resilience"})
-    sections.append({"slide_id": "sk_deployment", "title": "Deployment and resilience protect operations", "archetype": "Deployment Architecture", "purpose": "Runtime environments, release path, DR/backup, monitoring", "diagram_kind": "deployment"})
+        security_title = (
+            "Security, auditability and operational controls are embedded in the service"
+            if managed and not technical_delivery
+            else "Security and observability are built into the solution"
+        )
+        add(
+            "sk_security", security_title, "Content",
+            "RFP-grounded access, audit, monitoring, compliance and resilience controls",
+        )
+    if needs_deployment:
+        add(
+            "sk_deployment", "Deployment and resilience protect operations", "Deployment Architecture",
+            "Runtime environments, release path, recovery, monitoring and support boundaries",
+            diagram_kind="deployment",
+        )
+    if technical_delivery and _has_explicit_hadr_need(understanding):
+        add(
+            "sk_hadr", "Availability and recovery controls protect service continuity", "High Availability & DR",
+            "Redundancy, backup, recovery, failover responsibilities and RTO/RPO decision points",
+            diagram_kind="hadr",
+        )
     if has_migration:
-        sections.append({"slide_id": "sk_migration", "title": "Migration and cutover protect continuity", "archetype": "Delivery Plan", "purpose": "Data/workload migration, rehearsals, cutover controls"})
-    sections.extend([
-        {"slide_id": "sk_testing", "title": "Acceptance evidence proves the solution is ready", "archetype": "Delivery Plan", "purpose": "Requirement-led evidence streams for named interfaces, functional parity, reconciliation, controls, customer UAT, and cutover readiness", "diagram_kind": "testing"},
-        {"slide_id": "sk_roadmap", "title": "Agile roadmap releases value through increments", "archetype": "Timeline", "purpose": "Incremental delivery, gates, feedback, readiness", "diagram_kind": "timeline"},
-        {
-            "slide_id": "sk_roadmap_detail",
-            "title": "Each roadmap increment has a clear outcome and exit gate",
-            "archetype": "Content",
-            "purpose": "Follow the roadmap with a concise explanation of increment outcomes, customer decisions, evidence and exit gates",
-        },
-    ])
-    if has_support:
-        sections.append({"slide_id": "sk_ams", "title": "Warranty and AMS support model", "archetype": "Delivery Plan", "purpose": "Service coverage, monitoring, interface ownership, runbooks, warranty transition, and improvement"})
-    sections.extend([
-        {"slide_id": "sk_governance", "title": "Governance resolves decisions without slowing delivery", "archetype": "Team", "purpose": "Decision rights, product ownership, squads, forums", "diagram_kind": "org"},
-        {"slide_id": "sk_value", "title": "Proposal value and differentiators", "archetype": "Value & Differentiators", "purpose": "Why this approach is credible, useful, and lower risk for the customer"},
-        {"slide_id": "sk_tech", "title": "Proposed solution stack maps services to architecture layers", "archetype": "Software Bill of Materials", "purpose": "Concrete implementation services by architecture layer, with mandated/referenced/proposed status"},
-        {"slide_id": "sk_risks", "title": "Key risks and mitigations are actively managed", "archetype": "Risks", "purpose": "Risk, implication, mitigation, owner/control"},
-        {"slide_id": "sk_assumptions", "title": "Assumptions and dependencies need early closure", "archetype": "Assumptions & Dependencies", "purpose": "Hosting, access, interfaces, migration, approvals"},
-        {"slide_id": "sk_commercials", "title": "Commercials align build, warranty and support", "archetype": "Commercials", "purpose": "Commercial scope, sensitivities, boundaries"},
-        {"slide_id": "sk_next", "title": "Next Steps", "archetype": "Next Steps", "purpose": "Recommended customer actions"},
-    ])
+        add(
+            "sk_migration", "Migration and cutover protect continuity", "Delivery Plan",
+            "Migration preparation, rehearsal, reconciliation, cutover and stabilization controls",
+        )
+    if needs_testing:
+        add(
+            "sk_testing", "Acceptance evidence proves the solution is ready", "Delivery Plan",
+            "Requirement-led functional, integration, data, security, UAT and release-readiness evidence",
+            diagram_kind="testing",
+        )
+
+    if needs_roadmap:
+        if managed:
+            roadmap_title = "Mobilization, transition and stabilization establish the live service"
+            roadmap_purpose = "Mobilization, knowledge transfer, process validation, service readiness, stabilization and improvement"
+        elif advisory:
+            roadmap_title = "The advisory roadmap turns findings into prioritized action"
+            roadmap_purpose = "Assessment, alignment, recommendations, roadmap decisions and enablement"
+        elif has_migration:
+            roadmap_title = "The migration roadmap controls preparation, cutover and stabilization"
+            roadmap_purpose = "Discovery, preparation, rehearsals, migration waves, cutover and stabilization"
+        else:
+            roadmap_title = "Incremental delivery releases value through controlled outcomes"
+            roadmap_purpose = "Outcome increments, feedback, assurance and readiness gates"
+        add(
+            "sk_roadmap", roadmap_title, "Timeline", roadmap_purpose,
+            diagram_kind="timeline",
+        )
+        if technical_delivery:
+            add(
+                "sk_roadmap_detail", "Each roadmap increment has a clear outcome and exit gate", "Content",
+                "Explain increment outcomes, customer decisions, evidence and exit gates",
+            )
+
+    if managed and has_metrics:
+        add(
+            "sk_service_measures", "Service measures connect operational performance to outcomes", "Content",
+            "KPIs, SLAs, dashboards, service reviews, trends and accountable improvement actions",
+            inclusion_reason="Service measures and reporting are core managed-service decision evidence.",
+        )
+        add(
+            "sk_improvement", "Continuous improvement converts service evidence into measurable action", "Content",
+            "Improvement backlog, prioritization, ownership, benefits and governance closure",
+        )
+    elif has_support:
+        add(
+            "sk_ams", "Live-service support protects the complete solution boundary", "Delivery Plan",
+            "Service coverage, monitoring, ownership, runbooks, transition and improvement",
+        )
+
+    if has_governance or managed or technical_delivery:
+        governance_title = (
+            "Governance and service leadership make accountability explicit"
+            if managed
+            else "Governance resolves decisions without slowing delivery"
+        )
+        governance_purpose = (
+            "Service leadership, process ownership, RACI, escalation paths and review forums"
+            if managed
+            else "Decision rights, customer ownership, delivery teams, enabling roles and forums"
+        )
+        add(
+            "sk_governance", governance_title, "Team", governance_purpose,
+            diagram_kind="org",
+        )
+    if has_staffing:
+        add(
+            "sk_staffing", "The staffing model aligns accountability, capacity and coverage", "Team",
+            "Named roles, responsibilities, coverage assumptions, scaling logic and customer/vendor boundaries",
+            inclusion_reason="The RFP explicitly asks for staffing, roles or resource accountability.",
+            diagram_kind="org",
+        )
+    if has_optional_expansion:
+        add(
+            "sk_expansion", "Optional expansion is sequenced by evidence and customer choice", "Timeline",
+            "Separate required scope from optional services, dependencies, benefits, staffing and commercial triggers",
+            inclusion_reason="The RFP identifies optional or later-phase scope that must remain separately electable.",
+            phase="optional/later phase",
+            diagram_kind="timeline",
+        )
+
+    add(
+        "sk_value", "Proposal value and differentiators", "Value & Differentiators",
+        "Why the engagement-appropriate approach is credible, useful and lower risk",
+    )
+    if needs_technology_stack:
+        add(
+            "sk_tech", "Proposed solution stack maps services to architecture layers", "Software Bill of Materials",
+            "Concrete implementation services with mandated, referenced, recommended and decision-required status",
+        )
+    if understanding is None or getattr(understanding, "risks", None) or technical_delivery or managed:
+        add(
+            "sk_risks", "Key risks and mitigations are actively managed", "Risks",
+            "Proposal-specific risk, implication, mitigation and owner/control",
+        )
+    if understanding is None or _visible_assumptions(understanding) or technical_delivery or managed:
+        add(
+            "sk_assumptions", "Assumptions and dependencies need early closure", "Assumptions & Dependencies",
+            "Only engagement-relevant scope, access, people, process, technology and approval dependencies",
+        )
+    if wants_references:
+        add(
+            "sk_references", "Relevant experience demonstrates delivery credibility", "Case Studies",
+            "Comparable engagements, outcomes, relevance and reference availability",
+            inclusion_reason="The RFP explicitly requests references or comparable experience.",
+        )
+    if wants_commercials:
+        commercial_title = (
+            "Commercials separate transition, run service and optional expansion"
+            if managed
+            else "Commercials align scope, delivery and support"
+        )
+        add(
+            "sk_commercials", commercial_title, "Commercials",
+            "RFP-required pricing structure, assumptions, exclusions, options and change controls",
+        )
+    add("sk_next", "Next Steps", "Next Steps", "Recommended customer actions")
     return sections
 
 

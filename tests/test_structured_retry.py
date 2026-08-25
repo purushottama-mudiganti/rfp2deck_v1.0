@@ -68,7 +68,8 @@ class StructuredRetryTests(unittest.TestCase):
             rfp_text="",
             template_info={},
             understanding=RFPUnderstanding(
-                summary="Build a catalogue platform with integrations and governed data."
+                summary="Design and build a web application catalogue platform.",
+                project_scope="Application development includes API integration and production deployment.",
             ),
             customer_technology_context={"platform": "Microsoft Azure"},
         )

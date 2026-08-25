@@ -79,6 +79,26 @@ CRITICAL INSTRUCTIONS:
 - Prefer **verbatim phrases** from the RFP for critical items such as:
   - scope, objectives, evaluation criteria, timelines, SLAs, and must-have requirements.
 - Capture **client priorities and tone** (e.g., cost focus vs. innovation vs. speed).
+- Classify the engagement before downstream deck planning:
+  - Populate `engagement_profile.primary_type` using the dominant requested
+    outcome, not incidental keywords or the customer's department name.
+  - Use `secondary_types` and scored `type_assessments` for genuinely hybrid
+    engagements instead of forcing one category to explain all scope.
+  - Mark lifecycle stages as in-scope only when the RFP asks the vendor to
+    perform them. Distinguish software/platform deployment from service
+    mobilisation and transition. Distinguish solution testing from operating-
+    process validation and readiness.
+  - Preserve explicitly optional or later-phase capabilities under
+    `optional_response_topics`; do not let them define the required Phase 1
+    solution or imply a technology selection.
+  - Populate `mandatory_response_topics` from required proposal content and
+    evaluation criteria, including staffing, governance, commercials,
+    references, service levels, or implementation approach where stated.
+  - Put clearly unsupported lifecycle topics in
+    `explicitly_unsupported_topics`; absence alone is not an exclusion.
+  - Include concise evidence phrases and a classification rationale. Never
+    classify a managed service as an application build merely because the RFP
+    uses broad words such as technology, system, platform, implement, or support.
 
 ANALYSIS LENSES (reflect these in the JSON fields of the schema):
 - Client context: industry, geography, business drivers, transformation theme.
@@ -247,7 +267,8 @@ NARRATIVE STRUCTURE (reflect through fields in the JSON schema):
   - How we frame the problem.
   - Our core thesis on what “good” looks like.
 - Proposed Solution at a Glance:
-  - High-level architecture / approach (non-technical executive view).
+  - High-level operating model, service approach, transformation model, or
+    solution architecture appropriate to `engagement_profile`.
   - Key workstreams or phases.
   - Where the scope provides suitable data and repeatable decisions, identify
     optional AI-assisted opportunities while keeping the operational core deterministic.
@@ -270,6 +291,9 @@ GUARDRAILS:
 - Do not use `procurement_or_submission_tools`, `submission_instructions`, or
   `non_solution_references` as solution themes, differentiators, architecture
   components, or executive-summary points.
+- Respect `engagement_profile` throughout the narrative. Do not introduce a
+  software-build, deployment, testing, Agile-squad, or technology-stack story
+  when those lifecycle stages are not in scope.
 - AI/ML is an optional proposal enhancement, not an invented RFP requirement.
   Mention it only where the scope provides credible data and a measurable use
   case. Qualify it by data readiness, accuracy, human oversight, security,
@@ -303,18 +327,27 @@ CUSTOMER PRE-READ STANDARD:
 - The customer must understand the argument without opening speaker notes or
   hearing a presenter. Speaker notes may add delivery coaching but must never
   contain essential rationale that is absent from the visible slide.
-- Preserve the successful proposal pattern demonstrated by winning HCLTech
-  decks: executive summary in complete prose; explicit scope and out-of-scope;
-  requirements and evaluation criteria; solution considerations and tenets;
-  requirement-to-architecture mapping; detailed architecture and operating
-  model; incremental Agile delivery with dependencies and release gates; assumptions,
-  risks, governance, credentials/evidence, commercials, and appendix backup.
-- Use this storyline order unless the RFP explicitly demands another sequence:
-  Executive Summary -> current-state challenges -> business outcomes/success
-  measures -> proposed solution -> end-to-end operational flow -> concrete
-  solution architecture -> integration/data/reporting design -> security and
-  resilience -> scope/assumptions -> delivery roadmap -> risks -> commercials
-  -> next steps. Do not introduce current-state challenges after solution slides.
+- Use `engagement_profile` as the planning policy. Start from the RFP's required
+  response topics and evaluation priorities, then add only the engagement and
+  lifecycle sections needed to make a complete, persuasive response.
+- A managed service, advisory engagement, application build, platform
+  implementation, migration, data programme, and hybrid transformation require
+  different storylines. Do not apply a software-development lifecycle spine to
+  every proposal.
+- Maintain a cumulative narrative: Executive Summary -> client need and outcomes
+  -> scope and boundaries -> engagement-appropriate response -> mobilisation or
+  delivery approach -> governance/accountability -> evidence and value ->
+  commercials/next steps as required. Do not introduce current-state challenges
+  after solution slides.
+- Preserve explicit phase boundaries. Optional or later-phase services may have
+  a roadmap, but must not create required-scope architecture, staffing,
+  technology, testing, or commercial commitments. "Optional" describes the
+  customer's decision, not the slide's content: a slide about optional/later
+  phase scope still needs its own visible bullets or detailed_points — the
+  sequencing, trigger conditions (what evidence/decision activates it), and
+  dependencies for that phase — same as any other slide. Never leave a
+  section's body empty because its subject is optional; that pushes the
+  argument into speaker notes, which violates the visible-slide rule below.
 - Use concise prose, not slogan fragments. A normal narrative slide should
   usually contain 80-160 visible words across its title, takeaway, and proof
   object. Architecture-only and transition slides may contain less; detailed
@@ -334,7 +367,8 @@ RULES:
 - Never use `procurement_or_submission_tools`, `submission_instructions`, or
   `non_solution_references` as target architecture components, solution pillars,
   diagram labels, or executive-summary themes.
-- Prefer **visuals over text**, especially for:
+- Prefer **visuals over text only when a selected, evidence-backed slide materially
+  benefits from a diagram**, especially for:
   - Architecture
   - Deployment architecture
   - High availability / disaster recovery
@@ -343,7 +377,9 @@ RULES:
   - Canonical data model
   - Operating model / governance
 - If reusable context contains mandatory sections or standards, you MUST incorporate them into the slide plan unless they conflict with the RFP.
-- For technical, data, integration, analytics, or platform proposals, include:
+- When `engagement_profile` contains required technical build, configuration,
+  integration, migration, data-platform, infrastructure, or release stages,
+  include only the corresponding technical proof sections:
   - A Target / Solution Architecture slide that shows the concrete build
     pattern, not generic boxes. For a data hub, this must show source systems,
     ingestion/extraction, validation/business rules, central operational data
@@ -357,20 +393,25 @@ RULES:
     services, the selected hosting platform, and cross-cutting security and
     operations. Do not relabel the logical or solution architecture as the
     technical architecture.
-  - An AI/ML opportunity assessment when the scope contains suitable data,
-    recurring exceptions, forecasting needs, analytics, or support workflows.
+  - An AI/ML opportunity assessment only when the RFP explicitly requests AI/ML
+    or a classified technical/data engagement contains a concrete analytical
+    use case such as forecasting, anomaly detection, optimisation, or document
+    extraction. Routine reporting or support work alone is insufficient.
     Prioritise 2-4 use cases by business value, data readiness, implementation
     effort, infrastructure, and ongoing cost.
   - Keep critical transactions and operational decisions deterministic. Use
     rules/statistical baselines first, managed consumption or small models only
     where justified, confidence thresholds, human review, no autonomous
     write-back, and a deterministic fallback. Do not assume dedicated GPUs.
-  - One Deployment / Resilience Architecture slide showing runtime environments,
+  - When `deploy_release` is a required lifecycle stage, one Deployment /
+    Resilience Architecture slide showing runtime environments,
     hosting assumption, network/security boundaries, release path, HA/DR,
     backup/restore, monitoring, and support touchpoints. If the RFP does not
     mandate a model, mark the hosting choice as an assumption and avoid tutorial
     detail.
-- A proposed solution technology stack slide/table covering concrete ingestion,
+- When the engagement profile includes a technical build, configuration,
+  integration, migration, infrastructure, data-platform, or deployment scope,
+  add a proposed solution technology stack slide/table covering concrete ingestion,
     orchestration, validation/transformation, application, integration, data,
     analytics, identity/secrets, observability/security-operations, DevSecOps,
     and applicable AI services. Name implementable products/services rather than
@@ -399,7 +440,8 @@ RULES:
     Never include procurement, tender, clarification, pricing-upload, or
     proposal-submission tools such as Ariba unless they are explicitly part of
     the operational target solution in an authoritative requirement.
-- Deployment model guidance:
+- Deployment model guidance (only when `deploy_release`, migration/cutover, or
+  explicit hosting/environment scope is selected):
   - Choose an appropriate deployment/release pattern based on the RFP risk and
     operational profile: blue-green, canary, rolling, phased migration, pilot by
     site/business unit, or scheduled cutover.
@@ -426,10 +468,15 @@ AI/ML VALUE AND COST DISCIPLINE:
   accepted accuracy/explainability thresholds, unit-cost and model monitoring,
   and an explicit scale/stop decision before production expansion.
 
-AGILE DELIVERY MODEL (DEFAULT):
-- Unless the RFP explicitly mandates another method, propose an Agile,
-  product/value-stream-oriented delivery model. Do not create a sequential
-  analysis -> design -> build -> test -> deploy plan and relabel it Agile.
+DELIVERY MODEL (ENGAGEMENT-APPROPRIATE):
+- Use an Agile, product/value-stream-oriented delivery model only for engagements
+  that include software/platform build or iterative configuration. For managed
+  services, use mobilisation -> transition -> stabilisation -> operate/improve.
+  For advisory work, use assess -> align -> recommend -> enable. For migrations,
+  use discover -> prepare -> rehearse -> migrate -> stabilise. Respect any method
+  mandated by the RFP.
+- For applicable iterative delivery, do not create a sequential analysis ->
+  design -> build -> test -> deploy plan and relabel it Agile.
 - Organize work into one or more persistent, cross-functional squads aligned to
   customer outcomes or coherent workstreams. Each squad should combine the
   relevant business analysis, architecture, engineering, data/integration,
@@ -565,6 +612,10 @@ ROADMAP / TIMELINE (CRITICAL):
   realization.
 
 TESTING AND ACCEPTANCE (PROPOSAL-SPECIFIC):
+- Include a dedicated testing strategy only when `engagement_profile` places
+  solution build, configuration, integration, migration, or deployment in
+  scope. For managed services, use process validation, service readiness and
+  transition acceptance instead of a software-testing tutorial.
 - Build the testing story around this solution's named interfaces, data flows,
   functional-replacement outcomes, reconciliation controls, security and
   non-functional requirements, customer UAT ownership, and cutover evidence.
@@ -756,6 +807,14 @@ RULES:
 - Put unresolved choices in diagram.open_assumptions for the dedicated
   Assumptions and Dependencies slide. Never instruct the image to print
   unresolved-status placeholders or customer-confirmation qualifiers.
+- For a "Case Studies" archetype section with no grounded reference
+  engagements in INPUT_JSON, phrase the gap as a normal proposal-control
+  action, e.g. "Reference engagements to be finalized with the account team
+  ahead of submission" — never narrate the gap as a description of what is or
+  isn't present in the input ("no evidence is present in the supplied
+  input", "cannot be inferred from the RFP"); that reads as the model
+  describing its own limits rather than a business statement in a
+  customer-facing proposal.
 - Preserve the slide_id and archetype supplied in SECTIONS.
 
 SECTIONS TO EXPAND:
@@ -802,11 +861,10 @@ Rules:
   generic Agile ceremony loops, generic L1/L2/L3 pyramids, or invented tools.
 - If the RFP lacks enough evidence for a diagram, omit the brief.
 - For every proposal_skeleton section that contains `diagram_kind`, return a
-  brief using that section's exact slide_id. Also return exact briefs for
-  `sk_solution`, `sk_technical_arch`, `sk_integration`, `sk_data_model`, `sk_deployment`,
-  `sk_roadmap`, and `sk_governance` when those sections are present. These are required proposal
-  visuals: use grounded proposal recommendations and label assumptions rather
-  than omitting them merely because the RFP does not prescribe the design.
+  brief using that section's exact slide_id. Do not return briefs for lifecycle
+  or architecture sections that are absent from the proposal skeleton. The
+  engagement profile and selected skeleton determine visual eligibility; a
+  familiar proposal pattern does not.
 - Never create a diagram for the Executive Summary. Reserve diagrams for a
   slide whose specific architecture, flow, topology, evidence model, roadmap,
   or operating boundary materially needs a visual.

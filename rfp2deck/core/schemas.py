@@ -17,6 +17,77 @@ DocumentType = Literal[
 SourceAuthority = Literal["binding", "authoritative", "contextual", "non_authoritative"]
 EvidenceStatus = Literal["active", "clarified", "superseded", "unresolved"]
 
+EngagementType = Literal[
+    "managed_service_operations",
+    "application_development",
+    "platform_implementation",
+    "migration_modernization",
+    "data_analytics",
+    "infrastructure_cloud",
+    "advisory_assessment",
+    "business_process_transformation",
+    "training_change_enablement",
+    "hybrid",
+    "other",
+]
+
+DeliveryMode = Literal[
+    "project_delivery",
+    "managed_service",
+    "staff_augmentation",
+    "advisory",
+    "hybrid",
+    "unknown",
+]
+
+LifecycleStage = Literal[
+    "discover_assess",
+    "design",
+    "configure_build",
+    "integrate_migrate",
+    "test_validate",
+    "deploy_release",
+    "mobilize_transition",
+    "operate_support",
+    "optimize_transform",
+]
+
+
+class EngagementTypeAssessment(BaseModel):
+    engagement_type: EngagementType
+    score: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence: List[str] = Field(default_factory=list)
+
+
+class LifecycleStageAssessment(BaseModel):
+    stage: LifecycleStage
+    in_scope: bool = False
+    optional: bool = False
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence: List[str] = Field(default_factory=list)
+
+
+class EngagementProfile(BaseModel):
+    """RFP-grounded classification that drives deck planning.
+
+    The profile is deliberately multi-dimensional. A primary engagement type
+    provides a useful default lens, while secondary types and lifecycle stages
+    preserve hybrid opportunities without forcing them into one template.
+    """
+
+    primary_type: EngagementType = "other"
+    secondary_types: List[EngagementType] = Field(default_factory=list)
+    type_assessments: List[EngagementTypeAssessment] = Field(default_factory=list)
+    delivery_mode: DeliveryMode = "unknown"
+    lifecycle_stages: List[LifecycleStageAssessment] = Field(default_factory=list)
+    mandatory_response_topics: List[str] = Field(default_factory=list)
+    optional_response_topics: List[str] = Field(default_factory=list)
+    explicitly_unsupported_topics: List[str] = Field(default_factory=list)
+    evaluation_priorities: List[str] = Field(default_factory=list)
+    phase_labels: List[str] = Field(default_factory=list)
+    classification_rationale: str = ""
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
 
 class SourceDocument(BaseModel):
     document_id: str
@@ -135,6 +206,11 @@ class RFPUnderstanding(BaseModel):
     # while diagrams stay grounded in solution components only.
     solution_technologies: List[str] = Field(default_factory=list)
     software_bill_of_materials: List[SBOMItem] = Field(default_factory=list)
+    # Engagement and lifecycle classification is produced during RFP
+    # understanding and becomes the policy input for deck planning. Optional
+    # keeps older cached/test payloads compatible; the planner derives a
+    # conservative evidence-based fallback when it is absent.
+    engagement_profile: Optional[EngagementProfile] = None
 
 
 SlideArchetype = Literal[
@@ -158,6 +234,8 @@ SlideArchetype = Literal[
     "Commercials",
     "Next Steps",
     "Content",
+    "Divider",
+    "Win Theme",
 ]
 
 

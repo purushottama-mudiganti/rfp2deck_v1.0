@@ -81,10 +81,10 @@ flowchart LR
 |------|---------|-----------------|
 | `reconcile_sources` | Prepare source precedence, clarification evidence, and unresolved question references. | `source_reconciliation` |
 | `extract_source_evidence` | For large packages, extract structured evidence from bounded fast-model chunks, merge duplicates, and use indexed requirement/source-reference encoding when ordinary JSON exceeds the final budget. Small packages bypass this step. | `source_evidence`, `evidence_text` |
-| `understand_rfp` | Extract a structured, non-speculative understanding of the RFP (summary, requirements, risks, assumptions, **named technologies**). | `understanding` |
+| `understand_rfp` | Extract a structured, non-speculative understanding of the RFP, including an evidence-backed **engagement profile**, lifecycle stages, required response topics, scope, requirements, risks, assumptions, and named technologies. | `understanding` |
 | `derive_sections` | Classify the RFP into a section taxonomy to guide narrative flow. | `section_map` |
 | `build_narrative` | Build the **executive narrative spine** (value proposition, strategic outcomes, solution themes). | `narrative` |
-| `plan_deck` | Ask the model for a `DeckPlan`, then **deterministically post-process** it (see below). | `deck_plan` |
+| `plan_deck` | Build engagement-specific slide candidates, ask the model for a `DeckPlan`, then validate it against the profile and evidence (see below). | `deck_plan` |
 | `compress_bullets` | Editorial pass: tighten bullets to executive-grade language. Best-effort; never fails the run. | `deck_plan` (bullets) |
 | `generate_notes` | Write per-slide speaker notes (fast model), with deterministic fallback. | `deck_plan` (notes) |
 | `qa_and_report` | Build the requirement→slide traceability report. | `report` |
@@ -92,17 +92,19 @@ flowchart LR
 `plan_deck` is where most of the "consulting judgement" lives. After the LLM returns a `DeckPlan`, it is
 refined by a series of pure functions in [rfp2deck/agent/nodes.py](rfp2deck/agent/nodes.py):
 
-1. **`ensure_required_slides`** — guarantees the consulting spine exists (Title, Agenda, Executive
-   Summary, Customer Context, Requirements, Architecture, Delivery, Timeline, Risks, Team, Commercials,
-   Next Steps). Uses **fuzzy archetype matching** so it doesn't add near-duplicates of slides the model
-   already produced.
-2. **`order_deck`** — sorts slides into a narrative order (Title → Agenda → Exec Summary → … → Next Steps).
-3. **`enrich_slide_detail`** — upgrades thin context/requirements slides with **grounded sub-points**
+1. **Engagement profiling and candidate selection** — classifies the RFP (for example managed
+   operations, application development, platform implementation, migration, advisory, or hybrid),
+   identifies required lifecycle stages and response topics, and creates a right-sized slide candidate set.
+2. **`prune_profile_misaligned_slides` / `ensure_required_slides`** — removes lifecycle artifacts that
+   conflict with the profile and fills only selected required sections. Architecture, deployment, testing,
+   technology stack, Agile delivery, staffing, service measures, references, and commercials are conditional.
+3. **`order_deck`** — sorts the selected slides into a coherent narrative order.
+4. **`enrich_slide_detail`** — upgrades thin context/requirements slides with **grounded sub-points**
    drawn from the RFP, and **sanitizes the Next Steps slide** to supplier-driven calls to action (never
    bid logistics).
-4. **`polish_deck_text`** — light normalization (trim, de-dupe spacing, cap bullet counts).
-5. **`ensure_diagrams_for_key_slides`** — attaches **RFP-grounded diagram prompts** to visual slides
-   (unapproved by default).
+5. **`polish_deck_text`** — light normalization (trim, de-dupe spacing, cap bullet counts).
+6. **`ensure_diagrams_for_key_slides`** — attaches **RFP-grounded diagram prompts** only to visual
+   sections selected by the engagement-specific plan (unapproved by default).
 
 > **Slide count is agent-decided.** There is no hard min/max; the planner is instructed to right-size the
 > deck to the proposal and avoid padding or near-duplicate slides.
@@ -212,7 +214,7 @@ All configuration is via environment variables (loaded from `.env`). See
 | `OPENAI_NOTES_BATCH_SIZE` | `6` | Slides per speaker-notes request; smaller batches allow richer, slide-specific presenter narrative. |
 | `OPENAI_NOTES_WORKERS` | `3` | Parallel speaker-notes batches, bounded to the number of batches. |
 | `RFP2DECK_PIPELINE_CACHE` | `true` | Reuse plan and diagram outputs for identical inputs. |
-| `RFP2DECK_PIPELINE_CACHE_VERSION` | `v3-proposal-derived-architecture` | Cache namespace; change it when prompt or plan semantics change so stale plans are not reused. |
+| `RFP2DECK_PIPELINE_CACHE_VERSION` | `v4-engagement-profile-planning` | Cache namespace; change it when prompt or plan semantics change so stale plans are not reused. |
 | `APP_DATA_DIR` | `.data` | Base directory for indexes/outputs/reports. |
 | `HCLTECH_TEMPLATE_PATH` | `templates/hcltech_expanded_v5.potx` | Corporate template path. Defaults to the bundled, repo-relative HCLTech `.potx` (resolved against the project root, so it works on any host). Override with an absolute path or another `.pptx`/`.potx` if needed. |
 | `TEMPLATE_CACHE_DIR` | `.data/templates` | Cache directory for PPTX files generated from POTX templates. |

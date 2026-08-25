@@ -130,7 +130,7 @@ class Settings:
     notes_batch_size: int = int(os.getenv("OPENAI_NOTES_BATCH_SIZE", "6"))
     notes_workers: int = int(os.getenv("OPENAI_NOTES_WORKERS", "3"))
     pipeline_cache: bool = _env_bool("RFP2DECK_PIPELINE_CACHE", True)
-    pipeline_cache_version: str = os.getenv("RFP2DECK_PIPELINE_CACHE_VERSION", "v3-proposal-derived-architecture")
+    pipeline_cache_version: str = os.getenv("RFP2DECK_PIPELINE_CACHE_VERSION", "v4-engagement-profile-planning")
     sp_tenant_id: str = os.getenv("SP_TENANT_ID", "")
     sp_client_id: str = os.getenv("SP_CLIENT_ID", "")
     sp_scopes: str = os.getenv("SP_SCOPES", "Files.Read.All,Sites.Read.All")

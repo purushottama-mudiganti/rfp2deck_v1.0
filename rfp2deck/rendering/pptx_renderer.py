@@ -4,7 +4,7 @@ import math
 import re
 from io import BytesIO
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from pptx import Presentation
 from pptx.dml.color import RGBColor
@@ -872,6 +872,94 @@ def _layout_item_count(layout) -> Optional[int]:
     return None
 
 
+# ------------------------------------------------------------------
+# Layout variety rotation.
+#
+# The template ships many stylistically-different layouts that hold the same
+# number of boxes (numbered / gradient-top / boxes-numbered / dark variants).
+# Picking the first token match every time collapses a whole deck onto a
+# handful of layouts (one real render put 73% of its content slides on a
+# single "Two key points" skin). These families list only siblings verified
+# (by inspecting their placeholder shapes) to hold the same box count with
+# the same generic Number/Text-placeholder pattern the fill helpers already
+# handle, so rotating between them is a pure style swap with no content risk.
+# ------------------------------------------------------------------
+_TWO_KEY_POINT_LAYOUTS = [
+    "Two key points – Numbered, Boxes",
+]
+# "Two key points – Numbered sidebars" was in this pool briefly. Its accent
+# color lives in decorative "Sidebar 1"/"Sidebar 2" shapes stacked vertically
+# on the right edge of the slide, while the two content boxes it holds sit
+# side by side on the left — there is no visual correspondence between which
+# sidebar/number goes with which column, so a real two-column card/point
+# slide renders as text on the left with two unrelated-looking colored blocks
+# on the right. Confirmed on a real generated deck (title "Service measures
+# connect operational performance to outcomes" and others) — the "Numbered,
+# Boxes" variant keeps color and text in the same box and reads clearly, so
+# it's the only variant in rotation for now. Re-add "Two key points – Numbered
+# sidebars" only alongside a fill that actually places two side-by-side
+# sidebars beside their matching column, not this one.
+_THREE_KEY_POINT_LAYOUTS = [
+    "Three key points – Gradient Top (Light)",
+    "Three key points – Numbered boxes",
+    "Three key points – Boxes, numbered",
+    "Three key points – Gradient Top (Dark)",
+    "Three key points – Boxes (Dark)",
+    "Three key points – Gradient, boxes (Dark)",
+]
+_FOUR_KEY_POINT_LAYOUTS = [
+    "Four key points – Gradient Top (Light)",
+    "Four key points – Numbered boxes",
+    "Four key points – Boxes, numbered",
+    "Four key points – Numbered, Gradient, boxes (Light)",
+    "Four key points – Gradient Top (Dark)",
+    "Four key points – Boxes (Dark)",
+    "Four key points – Gradient, boxes (Dark)",
+]
+# Diagram pages that carry a short caption (a key_message riding beside the
+# picture, not the full companion explanation) get a native split layout
+# instead of floating the caption over a full-bleed image. Both hold exactly
+# one extra text box beside Title/Subtitle, mirrored left/right, so a single
+# caption line always has a designed home. An *uncaptioned* image page (the
+# common two-slide diagram pattern) is deliberately excluded from this list —
+# see ``_find_safe_diagram_layout``.
+_DIAGRAM_CAPTIONED_LAYOUTS = [
+    "Diagram (space right, flexible) – Title, Subtitle",
+    "Wide margins – Diagram (space left) – Title, Subtitle, Text",
+]
+# Alternated so a long paginated table doesn't run as one unbroken wall of
+# identical-looking slides.
+_TABLE_LAYOUTS = [
+    "Table – Title",
+    "Table w/t Sidebar",
+]
+# A 2-point slide that also carries numeric outcome highlights (kpis) gets a
+# stat-forward layout instead of another plain two-box grid. Its own "Subhead
+# N" / "Text Placeholder N" pair is filled by the existing generic card path
+# unchanged; only the extra "Data N" / "Data description N" slots are new.
+_INFOGRAPHIC_TWO_STAT_LAYOUT = "Wide margins – Infographics – Numbers (2), List, Two key points"
+
+
+def _pick_varied_layout(prs: Presentation, usage: Optional[dict], names: list[str]):
+    """Return the least-used layout among ``names`` that exists in ``prs``.
+
+    ``usage`` is a per-render ``{layout_name: use_count}`` dict shared across
+    one ``render_deck_from_template`` call. Ties fall back to ``names`` order,
+    so with no usage history yet this reproduces the old "first match" pick.
+    Pass ``usage=None`` (e.g. from a caller that doesn't track rotation) to
+    always get the first available candidate.
+    """
+    by_name = {layout.name: layout for layout in prs.slide_layouts}
+    candidates = [by_name[name] for name in names if name in by_name]
+    if not candidates:
+        return None
+    if usage is None:
+        return candidates[0]
+    choice = min(candidates, key=lambda layout: (usage.get(layout.name, 0), names.index(layout.name)))
+    usage[choice.name] = usage.get(choice.name, 0) + 1
+    return choice
+
+
 def _has_approved_diagram(slide_spec) -> bool:
     diagram = getattr(slide_spec, "diagram", None)
     return bool(diagram and getattr(diagram, "approved", False))
@@ -964,6 +1052,13 @@ def _hint_is_compatible(layout, slide_spec) -> bool:
         return False
     if _is_visual_focused_slide(slide_spec):
         return "diagram" in name and "space right, flexible" in name
+    if "infographics" in name and "two key points" in name and len(_stat_shaped_kpis(slide_spec)) < 2:
+        # Continuation-page hint propagation (_lock_continuation_layouts)
+        # stamps whatever layout the first page of a split chose onto every
+        # sibling page — a later page can easily have fewer/no kpis (they're
+        # cleared for page_idx > 0) and would otherwise force this stats
+        # layout with one or both number boxes never filled.
+        return False
     if cards:
         declared = _layout_item_count(layout)
         if declared is not None and declared != len(cards):
@@ -975,6 +1070,44 @@ def _hint_is_compatible(layout, slide_spec) -> bool:
     return True
 
 
+def _clean_kpis(slide_spec) -> list[str]:
+    return [k for k in (getattr(slide_spec, "kpis", None) or []) if (k or "").strip()]
+
+
+_STAT_TOKEN_RE = re.compile(
+    r"\$?\d[\d,.]*\s?(?:%|percent|x\b|days?|weeks?|months?|hours?|hrs?)?",
+    re.IGNORECASE,
+)
+
+
+def _stat_shaped_kpi_list(kpis) -> list[str]:
+    """kpis that actually look like a short numeric stat chip.
+
+    The ``kpis`` field is sometimes authored by the model as a full
+    qualitative sentence (e.g. "Catalogue completeness measures to be
+    agreed") rather than a stat ("40% faster onboarding") — routing those to
+    a big-number box would either overflow a box sized for 2-3 characters or
+    show an empty number with no content. Only route/fill when the text is
+    short and actually contains a digit-led token.
+    """
+    return [
+        kpi for kpi in (kpis or [])
+        if (kpi or "").strip() and len(kpi) <= 60 and _STAT_TOKEN_RE.search(kpi)
+    ]
+
+
+def _stat_shaped_kpis(slide_spec) -> list[str]:
+    """Callers routing to the 2-stat infographic layout require
+    ``len(...) >= 2`` on this, not just a truthy check: a single incidental
+    digit-led string (e.g. "24x7 visibility" among otherwise qualitative
+    kpis like "MTTA"/"RCA closure") used to be enough to pass, leaving the
+    layout's second number box permanently unfilled and stripped by
+    _remove_unused_placeholders — a visibly blank third of the slide for
+    content that was never real 2-stat material to begin with.
+    """
+    return _stat_shaped_kpi_list(getattr(slide_spec, "kpis", None))
+
+
 def _has_explanatory_body(slide_spec) -> bool:
     return bool(
         getattr(slide_spec, "bullets", None)
@@ -984,11 +1117,21 @@ def _has_explanatory_body(slide_spec) -> bool:
     )
 
 
-def _find_safe_diagram_layout(prs: Presentation, slide_spec=None):
-    """Use the full slide body for generated visuals; explanation paginates separately."""
-    # Image-only page: a clean split layout with no baked-in sample photo.
-    # ("Diagram (space center) – Full image" carries a decorative portrait in
-    # its master, so it is deliberately not used here.)
+def _find_safe_diagram_layout(prs: Presentation, slide_spec=None, usage: Optional[dict] = None):
+    """Use the full slide body for generated visuals; explanation paginates separately.
+
+    A slide that carries a short caption/key-message beside the picture gets a
+    native split layout (image on one side, caption in a designed column). An
+    uncaptioned image page — the common two-slide diagram pattern, where the
+    explanation lives on a separate companion slide — stays full-width so a
+    split layout never leaves half the slide visibly empty. ("Diagram (space
+    center) – Full image" carries a decorative portrait in its master, so it
+    is deliberately not used here.)
+    """
+    if slide_spec is not None and _has_explanatory_body(slide_spec):
+        picked = _pick_varied_layout(prs, usage, _DIAGRAM_CAPTIONED_LAYOUTS)
+        if picked is not None:
+            return picked
     return (
         _find_layout_by_name(prs, "Title Only")
         or _find_blank_layout(prs)
@@ -1035,7 +1178,7 @@ def _find_single_statement_layout(prs: Presentation):
     )
 
 
-def _choose_hcltech_layout(prs: Presentation, slide_spec):
+def _choose_hcltech_layout(prs: Presentation, slide_spec, usage: Optional[dict] = None):
     """Map generated deck archetypes to usable HCLTech POTX layouts."""
     # PlainText was an internal overflow escape hatch that rebuilt slides on
     # top of Title Only. HCLTech decks must remain on native content layouts.
@@ -1054,9 +1197,31 @@ def _choose_hcltech_layout(prs: Presentation, slide_spec):
     has_table = _table_has_content(getattr(slide_spec, "table", None))
     has_diagram = _has_approved_diagram(slide_spec)
 
-    if _is_visual_focused_slide(slide_spec):
-        return _find_safe_diagram_layout(prs, slide_spec)
+    if archetype == "team" and not has_diagram and (cards or detailed_points):
+        # Route to the org-chart grid layout (populated by
+        # _fill_org_chart_slide) ahead of the generic cards/detailed_points
+        # branches below, which would otherwise always claim this slide for
+        # an unrelated key-points family first — the archetype-specific
+        # "team" branch further down is only ever reached once cards and
+        # detailed_points are both empty, so it can't be the thing that
+        # picks this layout when there's real role content to show.
+        org_chart = _find_layout_with_tokens(prs, "org chart", "light bg") or _find_layout_with_tokens(
+            prs, "org chart"
+        )
+        if org_chart is not None:
+            return org_chart
 
+    if _is_visual_focused_slide(slide_spec):
+        return _find_safe_diagram_layout(prs, slide_spec, usage)
+
+    if archetype == "divider":
+        return _pick_varied_layout(prs, usage, ["Divider Beam – Light", "Divider Beam – Dark"])
+    if archetype == "win theme":
+        return (
+            _find_layout_with_tokens(prs, "quote", "gradient", "light")
+            or _find_layout_with_tokens(prs, "quote", "big image", "light")
+            or _find_layout_with_tokens(prs, "quote")
+        )
     if archetype == "title":
         return (
             _find_layout_with_tokens(prs, "cover", "the beam 3", "woman with device")
@@ -1093,8 +1258,21 @@ def _choose_hcltech_layout(prs: Presentation, slide_spec):
     if cards and not plain_text:
         # The Executive Summary stays on one slide, so give it the largest boxes
         # (numbered-boxes variant) — its cards then render at 14pt rather than
-        # shrinking to fit the smaller gradient-top boxes.
+        # shrinking to fit the smaller gradient-top boxes. That's the right
+        # shape for the common 2-4 roughly-even-card case, but it isn't the
+        # only shape a win thesis can take — a single strong statement or a
+        # 2-card stat-forward summary reads better on the same layouts the
+        # generic cards path below already uses for those shapes, so check
+        # those first rather than always forcing a fixed box count.
         if _is_exec_summary_spec(slide_spec):
+            if len(cards) == 1:
+                layout = _find_single_statement_layout(prs)
+                if layout is not None:
+                    return layout
+            elif len(cards) == 2 and len(_stat_shaped_kpis(slide_spec)) >= 2:
+                infographic = _find_layout_by_name(prs, _INFOGRAPHIC_TWO_STAT_LAYOUT)
+                if infographic is not None:
+                    return infographic
             count = min(4, max(2, len(cards)))
             word = next((w for w, v in _COUNT_WORDS.items() if v == count), "three")
             layout = (
@@ -1105,17 +1283,24 @@ def _choose_hcltech_layout(prs: Presentation, slide_spec):
                 return layout
         if len(cards) >= 4:
             return (
-                _find_layout_with_tokens(prs, "four key points", "gradient top", "light")
+                _pick_varied_layout(prs, usage, _FOUR_KEY_POINT_LAYOUTS)
+                or _find_layout_with_tokens(prs, "four key points", "gradient top", "light")
                 or _find_layout_with_tokens(prs, "four key points", "numbered boxes")
             )
         if len(cards) == 3:
             return (
-                _find_layout_with_tokens(prs, "three key points", "gradient top", "light")
+                _pick_varied_layout(prs, usage, _THREE_KEY_POINT_LAYOUTS)
+                or _find_layout_with_tokens(prs, "three key points", "gradient top", "light")
                 or _find_layout_with_tokens(prs, "three key points", "numbered boxes")
             )
         if len(cards) == 2:
+            if len(_stat_shaped_kpis(slide_spec)) >= 2:
+                infographic = _find_layout_by_name(prs, _INFOGRAPHIC_TWO_STAT_LAYOUT)
+                if infographic is not None:
+                    return infographic
             return (
-                _find_text_layout_with_tokens(prs, "two key points", "numbered", "boxes")
+                _pick_varied_layout(prs, usage, _TWO_KEY_POINT_LAYOUTS)
+                or _find_text_layout_with_tokens(prs, "two key points", "numbered", "boxes")
                 or _find_text_layout_with_tokens(prs, "two key points")
                 or _find_layout_with_tokens(prs, "two key points")
             )
@@ -1126,6 +1311,15 @@ def _choose_hcltech_layout(prs: Presentation, slide_spec):
             return _find_single_statement_layout(prs)
         count = min(5, len(detailed_points))
         word = next((word for word, value in _COUNT_WORDS.items() if value == count), "three")
+        if count == 2 and len(_stat_shaped_kpis(slide_spec)) >= 2:
+            infographic = _find_layout_by_name(prs, _INFOGRAPHIC_TWO_STAT_LAYOUT)
+            if infographic is not None:
+                return infographic
+        family = {2: _TWO_KEY_POINT_LAYOUTS, 3: _THREE_KEY_POINT_LAYOUTS, 4: _FOUR_KEY_POINT_LAYOUTS}.get(count)
+        if family:
+            layout = _pick_varied_layout(prs, usage, family)
+            if layout is not None:
+                return layout
         if count in {3, 4}:
             layout = _find_layout_with_tokens(prs, word, "key points", "gradient top", "light")
             if layout is not None:
@@ -1145,6 +1339,11 @@ def _choose_hcltech_layout(prs: Presentation, slide_spec):
             return _find_single_statement_layout(prs)
         count = min(5, len(flat_items))
         word = next((word for word, value in _COUNT_WORDS.items() if value == count), "three")
+        family = {2: _TWO_KEY_POINT_LAYOUTS, 3: _THREE_KEY_POINT_LAYOUTS, 4: _FOUR_KEY_POINT_LAYOUTS}.get(count)
+        if family:
+            layout = _pick_varied_layout(prs, usage, family)
+            if layout is not None:
+                return layout
         return (
             _find_text_layout_with_tokens(
                 prs, word, "key points", "numbered", "gradient", "boxes", "light"
@@ -1153,31 +1352,39 @@ def _choose_hcltech_layout(prs: Presentation, slide_spec):
             or _find_text_layout_with_tokens(prs, word, "key points", "numbered")
             or _find_text_layout_with_tokens(prs, word, "key points")
         )
-    if archetype in {"timeline", "delivery plan"}:
-        return (
-            (_find_safe_diagram_layout(prs, slide_spec) if has_diagram else None)
-            or _find_layout_with_tokens(prs, "four key points", "numbered boxes")
-        )
+    if archetype in {"timeline", "delivery plan"} and has_diagram:
+        return _find_safe_diagram_layout(prs, slide_spec, usage)
+    # A timeline/delivery-plan slide reaching here with no diagram already has
+    # no cards/detailed_points/bullets either — those are checked generically
+    # above this point and would have returned already if populated — so
+    # forcing "four key points – numbered boxes" here (an earlier version of
+    # this branch did) always produced boxes with nothing to put in them
+    # (see slide-22-class content-loss cases). Falling through to the
+    # generic catch-all below (same path architecture/solution overview use
+    # without a diagram) beats forcing a layout guaranteed to render near-empty.
     if archetype == "deployment architecture" and has_diagram:
-        return _find_safe_diagram_layout(prs, slide_spec)
+        return _find_safe_diagram_layout(prs, slide_spec, usage)
     if archetype == "high availability & dr":
         return (
-            (_find_safe_diagram_layout(prs, slide_spec) if has_diagram else None)
+            (_find_safe_diagram_layout(prs, slide_spec, usage) if has_diagram else None)
             or _find_layout_with_tokens(prs, "three key points", "numbered boxes")
         )
     if archetype == "software bill of materials":
         return _find_layout_with_tokens(prs, "table", "title") or _find_layout_with_tokens(prs, "table")
-    if archetype == "team":
-        return _find_safe_diagram_layout(prs, slide_spec) if has_diagram else (
-            _find_layout_with_tokens(prs, "org chart", "light bg")
-            or _find_layout_with_tokens(prs, "org chart")
-        )
+    if archetype == "team" and has_diagram:
+        return _find_safe_diagram_layout(prs, slide_spec, usage)
+    # A "team" slide with no diagram AND no cards/detailed_points (the
+    # remaining case here — see the early org-chart check above for when
+    # role content exists) has nothing to put on the org-chart grid; falling
+    # through to the generic catch-all below (same path architecture/solution
+    # overview use without a diagram) beats forcing a layout guaranteed to
+    # render near-empty.
     if archetype == "case studies":
         return _find_layout_with_tokens(prs, "case studies", "intro") or _find_layout_with_tokens(prs, "case studies")
     if archetype in {"risks", "commercials"}:
         return _find_layout_with_tokens(prs, "table", "sidebar") or _find_layout_with_tokens(prs, "table")
     if archetype in {"architecture", "solution overview"} and has_diagram:
-        return _find_safe_diagram_layout(prs, slide_spec)
+        return _find_safe_diagram_layout(prs, slide_spec, usage)
     if archetype == "content" or plain_text:
         return (
             _find_layout_with_tokens(prs, "wide margins", "text")
@@ -1672,6 +1879,131 @@ def _fill_detailed_point_placeholders(
     return len(pairs)
 
 
+def _is_org_chart_layout(slide) -> bool:
+    return "org chart" in _layout_name(slide.slide_layout).lower()
+
+
+def _org_chart_role_boxes(slide) -> tuple[Optional[Any], list]:
+    """Return (lead_box, grid_boxes) for the org-chart layout's role placeholders.
+
+    Detected purely from geometry (the topmost box, if it sits alone above
+    everything else, is the lead/coordinator slot; the rest form the grid)
+    rather than hardcoded placeholder indices, so this keeps working if the
+    template's box count or arrangement ever changes.
+    """
+    boxes = []
+    for shape in _body_placeholders(slide):
+        name = _semantic_placeholder_name(slide, shape)
+        if "text placeholder" not in name:
+            continue
+        boxes.append((round(float(shape.top) / EMU_PER_INCH, 1), float(shape.left), shape))
+    if not boxes:
+        return None, []
+    boxes.sort(key=lambda b: (b[0], b[1]))
+    top_row = boxes[0][0]
+    lead_candidates = [b for b in boxes if b[0] == top_row]
+    rest = [b for b in boxes if b[0] != top_row]
+    if len(lead_candidates) == 1 and rest:
+        return lead_candidates[0][2], [b[2] for b in rest]
+    return None, [b[2] for b in boxes]
+
+
+def _set_org_box_text(shape, lines: list[str], font_pt: Optional[int] = None) -> None:
+    """Fill an org-chart role box's outline levels (0/1/2) with ``lines`` in
+    order, leaving any unused trailing level blank. Proposals rarely have
+    named individuals to place pre-award, so level 0 (the box's bold headline
+    slot, prompted "Full name" in the template) carries the role title, not a
+    fabricated person's name.
+
+    A freshly added slide placeholder starts with a single empty paragraph —
+    the layout's own 3-line "Full name / Role / Short description" preview
+    text is a layout-authoring aid, not something ``add_slide`` copies onto
+    the new instance — so paragraphs beyond the first have to be created
+    here, at the matching outline level, for their list-style formatting
+    (size/weight per level) to resolve the same way the layout's preview did.
+    ``font_pt`` lets the caller apply one uniform size across every box on
+    the slide (see ``_fill_org_chart_slide``) instead of each box fitting
+    independently, which the rest of this renderer avoids for the same
+    "distracting mixed sizes on one slide" reason (see ``_uniform_card_font``).
+    """
+    tf = shape.text_frame
+    lines = [(line or "").strip() for line in lines]
+    if font_pt is None:
+        font_pt = _card_fit_pt(shape, "\n".join(line for line in lines if line))
+    for level, text in enumerate(lines):
+        paragraph = tf.paragraphs[level] if level < len(tf.paragraphs) else tf.add_paragraph()
+        paragraph.level = level
+        for run in list(paragraph.runs)[1:]:
+            run._r.getparent().remove(run._r)  # pylint: disable=protected-access
+        if paragraph.runs:
+            paragraph.runs[0].text = text
+        elif text:
+            paragraph.add_run().text = text
+        for run in paragraph.runs:
+            run.font.size = Pt(font_pt)
+            run.font.bold = level == 0
+            _set_run_font(run, FONT_NAME_HEAVY if level == 0 else FONT_NAME)
+
+
+def _org_box_description_cap(text: str, max_len: int = 65) -> str:
+    """A role description short enough to read as a finished thought in its
+    box, or nothing at all.
+
+    The org-chart grid can't paginate the way key-point layouts do (it's a
+    fixed set of boxes, not a list the renderer can split across more
+    slides), and this box is genuinely small — its own template prompt calls
+    it a "Short description". Cutting an arbitrary sentence down to size
+    reliably risks a dangling fragment ("...minimises", "...and continuous")
+    even with word/clause-boundary cuts, which reads worse than showing no
+    description at all — so a description that doesn't already fit is
+    dropped rather than truncated; the role title alone still carries the box.
+    """
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    return text if len(text) <= max_len else ""
+
+
+def _org_chart_role_lines(source) -> tuple[str, str]:
+    """(role title, short description) from a card or a detailed_point."""
+    heading = (getattr(source, "heading", "") or getattr(source, "text", "") or "").strip()
+    body = (getattr(source, "body", "") or "").strip()
+    if not body:
+        sub_points = getattr(source, "sub_points", None) or []
+        body = next((s.strip() for s in sub_points if (s or "").strip()), "")
+    if not body:
+        bullets = getattr(source, "bullets", None) or []
+        body = next((b.strip() for b in bullets if (b or "").strip()), "")
+    return heading, _org_box_description_cap(body)
+
+
+def _fill_org_chart_slide(slide, cards, detailed_points) -> int:
+    """Populate the native org-chart layout's role grid from whatever generic
+    role content the slide already carries (cards or detailed_points) — no
+    fabricated names, no engagement-specific assumptions. Returns the number
+    of boxes filled so the caller can fall back when there's nothing to show.
+    """
+    roles = list(cards) if cards else list(detailed_points)
+    if not roles:
+        return 0
+    lead_box, grid_boxes = _org_chart_role_boxes(slide)
+    remaining = list(roles)
+    assignments = []
+    if lead_box is not None and remaining:
+        title, desc = _org_chart_role_lines(remaining.pop(0))
+        assignments.append((lead_box, [title, "", desc]))
+    for shape, role in zip(grid_boxes, remaining):
+        title, desc = _org_chart_role_lines(role)
+        assignments.append((shape, [title, desc]))
+    if not assignments:
+        return 0
+    font_pt = min(
+        _card_fit_pt(shape, "\n".join(line for line in lines if line))
+        for shape, lines in assignments
+    )
+    for shape, lines in assignments:
+        _set_org_box_text(shape, lines, font_pt=font_pt)
+    return len(assignments)
+
+
 def _fill_flat_point_placeholders(
     slide,
     items: list[str],
@@ -1929,11 +2261,27 @@ def _placeholder_has_inserted_content(shape) -> bool:
     return False
 
 
+# Placeholder name fragments that mark a shape as pure decoration — it carries
+# a layout's color/border identity but is never meant to hold text (the fill
+# helpers already skip these by the same name check; see _card_placeholders).
+# _remove_unused_placeholders must never treat "empty" here as "unused", or it
+# strips a layout's entire visual identity (e.g. "Two key points – Numbered
+# sidebars" loses its color panels because "Sidebar 1"/"Sidebar 2" hold no text).
+_DECORATIVE_PLACEHOLDER_TOKENS = ("sidebar",)
+
+
+def _is_decorative_placeholder(slide, shape) -> bool:
+    name = _semantic_placeholder_name(slide, shape)
+    return any(token in name for token in _DECORATIVE_PLACEHOLDER_TOKENS)
+
+
 def _remove_unused_placeholders(slide) -> int:
     """Delete empty placeholder objects so they do not appear in edit mode."""
     removed = 0
     for shape in list(slide.placeholders):
         if _placeholder_has_inserted_content(shape):
+            continue
+        if _is_decorative_placeholder(slide, shape):
             continue
         element = shape._element  # pylint: disable=protected-access
         parent = element.getparent()
@@ -1987,20 +2335,34 @@ def _remove_presentation_sections(prs: Presentation) -> int:
 
 
 def _clear_orphan_number_placeholders(slide) -> int:
-    """Remove visible number markers that have no corresponding visible point."""
-    filled_points = [
-        shape for shape in _card_placeholders(slide)
-        if (getattr(shape, "text", "") or "").strip()
-    ]
+    """Remove visible number markers that have no corresponding visible point.
+
+    Numbers are assigned by rank at fill time (``zip(number_shapes,
+    placeholders)`` in ``_fill_detailed_point_placeholders`` etc., both sorted
+    by the same ``(top, left)`` key) — so a number is legitimately "orphaned"
+    only when its rank falls beyond how many content boxes actually got
+    filled, e.g. a 4-box layout used for a 2-point slide. Checking absolute
+    vertical position instead (an earlier version of this function) assumes a
+    number sits above/beside its own content at increasing top values, which
+    holds for stacked numbered-boxes layouts but not for layouts like "Two
+    key points – Numbered sidebars", where two numbers stack in their own
+    column (top ~2.3in and ~4.7in) beside content that both sit at one shared
+    top (~3.7in) — that mismatch made the second, legitimately-filled number
+    look orphaned and blank it.
+    """
+    numbers = _number_placeholders(slide)
+    placeholders = _card_placeholders(slide)
+    filled_count = sum(
+        1 for shape in placeholders if (getattr(shape, "text", "") or "").strip()
+    )
     removed = 0
-    for shape in _number_placeholders(slide):
+    for rank, shape in enumerate(numbers):
         if not (getattr(shape, "text", "") or "").strip():
             continue
-        if any(_overlap_ratio(shape, point) >= 0.02 for point in filled_points):
+        if rank < filled_count:
             continue
-        if len([p for p in filled_points if int(p.top) >= int(shape.top) - Inches(0.2)]) == 0:
-            _set_text(shape, "")
-            removed += 1
+        _set_text(shape, "")
+        removed += 1
     return removed
 
 
@@ -2142,6 +2504,142 @@ def _validate_rendered_native_slide(slide, slide_spec) -> None:
             _set_text(shape, "")
 
 
+def _fill_divider_slide(
+    slide, title: str, subtitle: str, prs: Presentation, page_no: Optional[int] = None
+) -> None:
+    """Section-break slide: big title, one-line subtitle, no boxes to fill.
+
+    The "Divider Beam" layouts hide all master-inherited shapes
+    (``showMasterSp="0"`` in the template), which is also where the
+    copyright/confidentiality footer line lives on every other slide — so a
+    divider is the one archetype where the footer has to be drawn explicitly
+    rather than relying on inheritance. (Toggling ``showMasterSp`` back on was
+    tried and made no visible difference, likely because PowerPoint composes
+    a slide's master-shape inheritance independently of an automated export
+    pass — drawing it directly is unambiguous either way.)
+    """
+    _set_native_title(slide, title, "divider")
+    for shape in _body_placeholders(slide):
+        name = _semantic_placeholder_name(slide, shape)
+        if "subtitle" in name:
+            _set_text(shape, subtitle, font_pt=16)
+    dark = "dark" in _layout_name(slide.slide_layout).lower()
+    _draw_footer(slide, prs, page_no, dark=dark)
+
+
+def _fill_quote_slide(slide, quote: str, attribution: str) -> None:
+    """A full-bleed statement slide (win theme / positioning), not a fabricated
+    customer testimonial — the attribution names HCLTech, never the customer."""
+    for shape in _title_placeholders(slide):
+        _set_text(shape, "")
+    for shape in _body_placeholders(slide):
+        name = _semantic_placeholder_name(slide, shape)
+        if "quote" in name:
+            box_w = max(0.5, float(shape.width) / EMU_PER_INCH)
+            box_h = max(0.5, float(shape.height) / EMU_PER_INCH)
+            font_pt = _fit_font_for_box([(0, quote)], box_w, box_h, min_pt=16, start_pt=28)
+            _set_text(shape, quote, font_pt=font_pt, bold=True)
+        elif "name" in name:
+            _set_text(shape, attribution, font_pt=12)
+
+
+def _split_kpi_stat(kpi: str) -> tuple[str, str]:
+    """Pull the numeric token out of a stat-shaped kpi string for the big
+    number box, leaving the rest as the description. The token can appear
+    anywhere in the string, not only at the start ("Save 40% on cycle time")."""
+    text = (kpi or "").strip()
+    match = _STAT_TOKEN_RE.search(text)
+    if not match:
+        return "", text
+    stat = match.group(0).strip()
+    rest = (text[: match.start()] + " " + text[match.end() :]).strip(" -–—:.")
+    return stat, rest or text
+
+
+def _is_two_stat_infographic_layout(slide) -> bool:
+    name = _layout_name(slide.slide_layout).lower()
+    return "infographics" in name and "two key points" in name
+
+
+def _fill_infographic_two_key_point_slots(slide, items: list[str], key_message: Optional[str] = None) -> int:
+    """Fill the 'Subhead N' + 'Text Placeholder N' pairs on the Infographics
+    (2)/List/Two-key-points layout.
+
+    Its label boxes are short (~0.8in tall) — below the generic
+    ``_card_placeholders`` height floor used for every other key-point family,
+    which exists so a stray small placeholder never gets mistaken for a card
+    slot elsewhere. That floor makes this layout's own boxes invisible to the
+    generic path, so it needs direct filling instead.
+    """
+    if key_message:
+        key_ph = _key_message_placeholder(slide)
+        if key_ph is not None:
+            _set_text(key_ph, key_message, font_pt=11, bold=True)
+
+    slots: dict = {}
+    for shape in _body_placeholders(slide):
+        name = _semantic_placeholder_name(slide, shape)
+        if name.startswith("data"):
+            continue
+        match = re.match(r"subhead\s*(\d+)$", name)
+        if match:
+            slots.setdefault(int(match.group(1)), {})["heading"] = shape
+            continue
+        match = re.match(r"text placeholder\s*(\d+)$", name)
+        if match:
+            slots.setdefault(int(match.group(1)), {})["body"] = shape
+
+    filled = 0
+    for idx, text in enumerate(items[:2], start=1):
+        slot = slots.get(idx)
+        if not slot or not (text or "").strip():
+            continue
+        heading, _, rest = (text or "").partition("\n")
+        body_text = rest.replace("\n", " ").strip() or heading
+        if "heading" in slot:
+            _set_text(slot["heading"], heading, font_pt=13, bold=True)
+        if "body" in slot:
+            # This box is short (~0.8in) — a flattened heading+body+bullets
+            # string at a fixed 11pt with no fit sizing overflowed straight
+            # into the next row's Subhead/Text-Placeholder pair on a real
+            # generated slide. Fit it the same way _fill_card_placeholders does.
+            _set_text(slot["body"], body_text, font_pt=_card_fit_pt(slot["body"], body_text))
+        filled += 1
+    return filled
+
+
+def _fill_infographic_stats(slide, kpis: list[str]) -> int:
+    """Fill the extra 'Data N' / 'Data description N' slots an infographic
+    layout adds beside its regular key-point boxes (which the normal card /
+    detailed-point fill already handles unchanged)."""
+    stats = [k for k in (kpis or []) if (k or "").strip()][:2]
+    if not stats:
+        return 0
+    slots: dict = {}
+    for shape in _body_placeholders(slide):
+        name = _semantic_placeholder_name(slide, shape)
+        match = re.match(r"data(?:\s+(description))?\s*(\d+)$", name)
+        if not match:
+            continue
+        n = int(match.group(2))
+        slots.setdefault(n, {})["description" if match.group(1) else "value"] = shape
+    filled = 0
+    for idx, kpi in enumerate(stats, start=1):
+        box = slots.get(idx)
+        if not box:
+            continue
+        stat, rest = _split_kpi_stat(kpi)
+        # A missing stat token (kpis is a coarse, model-authored field) leaves
+        # the number box empty — never dump the full sentence into a box
+        # sized for a handful of characters.
+        if stat and "value" in box:
+            _set_text(box["value"], stat, font_pt=28, bold=True)
+        if "description" in box:
+            _set_text(box["description"], rest, font_pt=12)
+        filled += 1
+    return filled
+
+
 def _render_hcltech_native_slide(
     slide,
     prs: Presentation,
@@ -2186,6 +2684,15 @@ def _render_hcltech_native_slide(
     _fill_footer_placeholders(slide, page_no)
 
     cards = [c for c in (cards or []) if getattr(c, "heading", "").strip()]
+
+    if archetype_l == "team" and _is_org_chart_layout(slide):
+        role_points = [
+            point for point in (detailed_points or [])
+            if (getattr(point, "text", "") or "").strip()
+        ]
+        if _fill_org_chart_slide(slide, cards, role_points):
+            return
+
     visual_archetypes = {
         "architecture",
         "deployment architecture",
@@ -2197,7 +2704,14 @@ def _render_hcltech_native_slide(
     }
 
     if archetype_l == "title":
-        subtitle = next((b.strip() for b in (bullets or []) if (b or "").strip()), "")
+        # Prefer the slide's key_message (the deck's win-thesis statement,
+        # written as one complete sentence) over the first bullet — the cover
+        # slide's bullets are often a list of terse noun-phrase candidates
+        # ("Professional Assessments applications and platforms.") that read
+        # as an unfinished fragment, not a tagline a reader should see first.
+        subtitle = (key_message or "").strip() or next(
+            (b.strip() for b in (bullets or []) if (b or "").strip()), ""
+        )
         # The cover subtitle is a tagline, not a paragraph. A long value
         # proposition overflows the cover, so keep the first sentence within a
         # readable cap (cut at a word boundary).
@@ -2221,6 +2735,18 @@ def _render_hcltech_native_slide(
             filled = len(items)
         if not filled:
             _fill_native_body(slide, prs, [f"- {item}" for item in items])
+        return
+
+    if archetype_l == "divider":
+        subtitle = next((b.strip() for b in (bullets or []) if (b or "").strip()), "")
+        _fill_divider_slide(slide, title, subtitle, prs, page_no)
+        return
+
+    if archetype_l == "win theme":
+        quote = (key_message or "").strip() or next(
+            (b.strip() for b in (bullets or []) if (b or "").strip()), ""
+        )
+        _fill_quote_slide(slide, quote, "HCLTech")
         return
 
     if table:
@@ -2280,6 +2806,14 @@ def _render_hcltech_native_slide(
         return
 
     if cards:
+        stat_kpis = _stat_shaped_kpi_list(kpis)
+        if stat_kpis and _is_two_stat_infographic_layout(slide):
+            filled = _fill_infographic_two_key_point_slots(
+                slide, [_format_card_text(c) for c in cards], key_message=key_message,
+            )
+            if filled:
+                _fill_infographic_stats(slide, stat_kpis)
+                return
         filled = _fill_card_placeholders(slide, cards, key_message=key_message)
         if filled:
             return
@@ -2296,6 +2830,14 @@ def _render_hcltech_native_slide(
         if (getattr(point, "text", "") or "").strip()
     ]
     if detailed_points and not has_visual_diagram:
+        stat_kpis = _stat_shaped_kpi_list(kpis)
+        if stat_kpis and _is_two_stat_infographic_layout(slide):
+            filled = _fill_infographic_two_key_point_slots(
+                slide, [_format_detailed_point(p) for p in detailed_points], key_message=key_message,
+            )
+            if filled:
+                _fill_infographic_stats(slide, stat_kpis)
+                return
         filled = _fill_detailed_point_placeholders(
             slide,
             detailed_points,
@@ -3283,7 +3825,12 @@ def _render_pages_for_slide(
             point for point in (getattr(slide_spec, "detailed_points", None) or [])
             if (getattr(point, "text", "") or "").strip()
         ]
-        companion_points = [] if len(authored_points) >= 2 else _diagram_companion_bullets(slide_spec, bullets)
+        # Only authored explanation earns a companion slide. Earlier versions
+        # synthesized explanation from the diagram prompt itself, which doubled
+        # visual sections and turned a focused plan into a deterministic long
+        # deck. Prompt text remains available in notes/fallback handling, but it
+        # no longer creates an extra audience-facing page by itself.
+        companion_points = [] if len(authored_points) >= 2 else list(bullets)
 
         # A separate "How X works" companion earns its own slide only when there
         # is enough explanatory content to fill it. Otherwise a lone-sentence
@@ -3344,7 +3891,14 @@ def _render_pages_for_slide(
         if native:
             # Keep the Executive Summary on one slide; otherwise split dense card
             # sets so every card renders at 14pt (more slides, no trimming).
-            page_groups = [cards] if _is_exec_summary_spec(slide_spec) else _split_items_to_fit_14pt(cards)
+            # A "team" slide with no diagram is the org-chart-grid case
+            # (_fill_org_chart_slide) — splitting its roster across pages
+            # produces two sparse, disconnected half-charts instead of one
+            # coherent org chart, so it stays on one slide too.
+            page_groups = (
+                [cards] if _is_exec_summary_spec(slide_spec) or archetype == "team"
+                else _split_items_to_fit_14pt(cards)
+            )
         else:
             w_in, h_in = _content_capacity_for_plan()
             if adjusted_key_message:
@@ -3355,7 +3909,7 @@ def _render_pages_for_slide(
     elif not has_diagram and detailed_points:
         if native:
             page_groups = (
-                [detailed_points] if _is_exec_summary_spec(slide_spec)
+                [detailed_points] if _is_exec_summary_spec(slide_spec) or archetype == "team"
                 else _split_items_to_fit_14pt(detailed_points)
             )
         else:
@@ -3413,6 +3967,14 @@ def _render_pages_for_slide(
         page.title = f"{slide_spec.title} ({page_idx + 1} of {page_count})"
         if collection == "table":
             page.table["rows"] = page_values
+            # A long table pages onto many consecutive slides that would
+            # otherwise look identical. Alternating in the sidebar variant
+            # every other page breaks up the run, and a short "part N of M"
+            # note fills the sidebar when the slide has no caption of its own.
+            if page_count > 1 and page_idx % 2 == 1:
+                page.layout_hint = _TABLE_LAYOUTS[1]
+                if not (page.key_message or "").strip():
+                    page.key_message = f"Continued — part {page_idx + 1} of {page_count}"
         else:
             setattr(page, collection, page_values)
             # Split pages should use a broad body layout, not tiny numbered
@@ -3428,6 +3990,11 @@ def _render_pages_for_slide(
             page.layout_hint = None
             if collection in {"cards", "detailed_points"} and page_idx > 0:
                 page.key_message = None
+            if page_idx > 0:
+                # kpis are a headline stat for the slide as a whole; without
+                # this every continuation page would repeat the same stat
+                # callout (and could itself re-trigger the infographic layout).
+                page.kpis = []
         pages.append(page)
     return pages
 
@@ -3491,6 +4058,63 @@ def _add_customer_logo(slide, prs: Presentation, logo_bytes: bytes | None) -> No
     picture.name = "Customer Logo"
 
 
+_CONTINUATION_PAGE_SUFFIX_RE = re.compile(r"_page_\d+$")
+
+
+def _continuation_group_key(slide_id: str) -> str:
+    """The pre-pagination slide_id shared by every page split off one slide.
+
+    ``_render_pages_for_slide`` names split pages ``f"{slide_id}_page_{n}"``
+    (and recurses for a diagram companion's own split under
+    ``f"{slide_id}_interpretation_page_{n}"``) — stripping that suffix groups
+    a "(1 of N)"/"(2 of N)" run back together without conflating an unrelated
+    diagram image page with its text companion (those already have distinct
+    base ids and are correctly treated as separate slides).
+    """
+    return _CONTINUATION_PAGE_SUFFIX_RE.sub("", slide_id or "")
+
+
+def _lock_continuation_layouts(prs: Presentation, render_slides: list) -> dict:
+    """Choose one native layout per original slide and stamp it onto every
+    page pagination split off from it, via ``layout_hint``.
+
+    Without this, each split page independently calls ``_choose_hcltech_layout``
+    and the shared layout-variety usage counter (see ``_pick_varied_layout``)
+    makes page 2 avoid whatever sibling layout page 1 just picked — guaranteed
+    alternation within a 2-member family, and (when a later page also lost its
+    ``kpis``/other fields during splitting) sometimes a completely different
+    layout family. Locking the choice to the page carrying the fullest content
+    (page 1) and propagating it via the existing ``layout_hint`` fast-path
+    (``_choose_hcltech_layout`` line ~1160) keeps continuation pages visually
+    identical while leaving variety rotation between *distinct* slides intact.
+    ``_hint_is_compatible`` still guards each page, so a page whose own content
+    genuinely doesn't fit the locked layout falls back to normal selection
+    instead of forcing a bad fit.
+
+    Table pagination is deliberately excluded: ``_render_pages_for_slide``
+    already alternates a long table's odd pages onto ``_TABLE_LAYOUTS[1]`` on
+    purpose, so a run of many consecutive table slides doesn't look identical
+    (see the "Alternating in the sidebar variant" comment there). Locking
+    those pages to one layout here would undo that intentional design.
+    """
+    groups: dict[str, list] = {}
+    for slide_spec in render_slides:
+        key = _continuation_group_key(getattr(slide_spec, "slide_id", ""))
+        groups.setdefault(key, []).append(slide_spec)
+
+    usage: dict = {}
+    for pages in groups.values():
+        if any(_table_has_content(getattr(page, "table", None)) for page in pages):
+            continue
+        primary = pages[0]
+        layout = _choose_hcltech_layout(prs, primary, usage)
+        if layout is None:
+            continue
+        for page in pages:
+            page.layout_hint = layout.name
+    return usage
+
+
 def render_deck_from_template(
     deck_plan: DeckPlan,
     template_pptx: Union[Path, bytes],
@@ -3539,9 +4163,12 @@ def render_deck_from_template(
         prs.part.drop_rel(rId)
         del prs.slides._sldIdLst[0]  # pylint: disable=protected-access
 
+    layout_usage: dict = (
+        _lock_continuation_layouts(prs, render_slides) if use_hcltech_native_layouts else {}
+    )
     for idx, slide_spec in enumerate(render_slides):
         layout = (
-            _choose_hcltech_layout(prs, slide_spec)
+            _choose_hcltech_layout(prs, slide_spec, layout_usage)
             if use_hcltech_native_layouts
             else blank_layout
         )

@@ -43,6 +43,7 @@ from rfp2deck.agent.nodes import (
     enrich_slide_detail,
     ensure_required_slides,
     consulting_grade_proposal_polish,
+    prune_profile_misaligned_slides,
     prune_redundant_storyline_slides,
     plan_deck,
     derive_technology_recommendations,
@@ -61,6 +62,8 @@ from rfp2deck.core.schemas import (
     DeckNotes,
     DiagramSpec,
     DiagramBrief,
+    EngagementProfile,
+    LifecycleStageAssessment,
     RFPUnderstanding,
     Requirement,
     SlideSpec,
@@ -258,7 +261,7 @@ class SourcePackageTests(unittest.TestCase):
 
         self.assertIn("Customer Context", archetypes)
         self.assertIn("Architecture", archetypes)
-        self.assertIn("Deployment Architecture", archetypes)
+        self.assertNotIn("Deployment Architecture", archetypes)
         self.assertIn("Next Steps", archetypes)
 
     def test_adaptive_skeleton_adds_data_integration_and_support_sections(self) -> None:
@@ -288,6 +291,134 @@ class SourcePackageTests(unittest.TestCase):
         )
         self.assertEqual(technical_section["diagram_kind"], "technical_architecture")
         self.assertGreaterEqual(len(sections), 24)
+
+    def test_managed_operations_skeleton_excludes_unsupported_sdlc_sections(self) -> None:
+        understanding = RFPUnderstanding(
+            customer_name="Pearson",
+            opportunity_title="Technology Operations Support",
+            summary=(
+                "Provide a managed technology operations service for the existing "
+                "production application and infrastructure estate."
+            ),
+            project_scope=(
+                "Deliver ITIL-aligned incident, problem and change management, monitoring, "
+                "service levels, governance, staffing, transition, service reporting and "
+                "continuous improvement. Include client references and a commercial proposal. "
+                "Phase 2 expansion is optional."
+            ),
+            in_scope_work=[
+                "Service transition and knowledge transfer",
+                "Incident, problem and change management",
+                "Operational monitoring and service reporting",
+            ],
+            out_of_scope_work=[
+                "Application development",
+                "Solution architecture",
+                "Production deployment",
+            ],
+        )
+
+        ids = {section["slide_id"] for section in _proposal_section_skeleton(understanding)}
+
+        self.assertEqual(understanding.engagement_profile.primary_type, "managed_service_operations")
+        self.assertTrue({
+            "sk_operating_model", "sk_service_lifecycle", "sk_roadmap",
+            "sk_service_measures", "sk_improvement", "sk_governance", "sk_staffing",
+            "sk_expansion", "sk_references", "sk_commercials",
+        }.issubset(ids))
+        self.assertTrue({
+            "sk_arch", "sk_technical_arch", "sk_integration", "sk_deployment",
+            "sk_testing", "sk_tech", "sk_ai_opportunities",
+        }.isdisjoint(ids))
+
+    def test_application_development_skeleton_selects_technical_lifecycle_sections(self) -> None:
+        understanding = RFPUnderstanding(
+            customer_name="Customer",
+            opportunity_title="Digital Service Development",
+            summary="Design and build a secure web application and API-based digital service.",
+            project_scope=(
+                "Software development includes UX and solution design, API integration, "
+                "automated system testing, user acceptance testing, CI/CD and production deployment."
+            ),
+            in_scope_work=["Application development", "API integration", "Production deployment"],
+        )
+
+        ids = {section["slide_id"] for section in _proposal_section_skeleton(understanding)}
+
+        self.assertEqual(understanding.engagement_profile.primary_type, "application_development")
+        self.assertTrue({
+            "sk_flow", "sk_arch", "sk_technical_arch", "sk_integration",
+            "sk_deployment", "sk_testing", "sk_roadmap", "sk_tech",
+        }.issubset(ids))
+        self.assertTrue({"sk_operating_model", "sk_service_lifecycle", "sk_service_measures"}.isdisjoint(ids))
+
+    def test_hybrid_profile_selects_only_the_declared_lifecycle_sections(self) -> None:
+        understanding = RFPUnderstanding(
+            summary="Operate the existing service and build a bounded customer application enhancement.",
+            engagement_profile=EngagementProfile(
+                primary_type="hybrid",
+                secondary_types=["managed_service_operations", "application_development"],
+                delivery_mode="hybrid",
+                lifecycle_stages=[
+                    LifecycleStageAssessment(stage="configure_build", in_scope=True, confidence=0.9),
+                    LifecycleStageAssessment(stage="test_validate", in_scope=True, confidence=0.9),
+                    LifecycleStageAssessment(stage="mobilize_transition", in_scope=True, confidence=0.9),
+                    LifecycleStageAssessment(stage="operate_support", in_scope=True, confidence=0.9),
+                ],
+                confidence=0.9,
+            ),
+        )
+
+        ids = {section["slide_id"] for section in _proposal_section_skeleton(understanding)}
+
+        self.assertTrue({"sk_operating_model", "sk_service_lifecycle", "sk_arch", "sk_testing"}.issubset(ids))
+        self.assertNotIn("sk_deployment", ids)
+
+    def test_explicitly_unsupported_topics_override_classified_stages(self) -> None:
+        understanding = RFPUnderstanding(
+            summary="Design and build a web application.",
+            engagement_profile=EngagementProfile(
+                primary_type="application_development",
+                delivery_mode="project_delivery",
+                lifecycle_stages=[
+                    LifecycleStageAssessment(stage="configure_build", in_scope=True, confidence=0.9),
+                    LifecycleStageAssessment(stage="test_validate", in_scope=True, confidence=0.9),
+                    LifecycleStageAssessment(stage="deploy_release", in_scope=True, confidence=0.9),
+                ],
+                explicitly_unsupported_topics=["testing strategy", "deployment architecture"],
+                confidence=0.9,
+            ),
+        )
+
+        ids = {section["slide_id"] for section in _proposal_section_skeleton(understanding)}
+
+        self.assertIn("sk_arch", ids)
+        self.assertNotIn("sk_testing", ids)
+        self.assertNotIn("sk_deployment", ids)
+
+    def test_profile_pruning_removes_sdlc_slides_from_managed_operations_plan(self) -> None:
+        understanding = RFPUnderstanding(
+            summary="Managed technology operations and service management for existing systems.",
+            project_scope=(
+                "Transition and operate the live service using incident, problem and change management, "
+                "service levels, governance, operational reporting and continuous improvement."
+            ),
+        )
+        deck = DeckPlan(
+            deck_title="Operations proposal",
+            slides=[
+                SlideSpec(slide_id="sk_operating_model", title="Operating model", archetype="Solution Overview"),
+                SlideSpec(slide_id="generated_arch", title="Solution architecture", archetype="Architecture"),
+                SlideSpec(slide_id="generated_deploy", title="Deployment architecture", archetype="Deployment Architecture"),
+                SlideSpec(slide_id="generated_test", title="Testing strategy", archetype="Delivery Plan"),
+                SlideSpec(slide_id="generated_stack", title="Technology stack", archetype="Software Bill of Materials"),
+            ],
+        )
+
+        pruned = prune_profile_misaligned_slides(deck, understanding)
+        remaining = {slide.slide_id for slide in pruned.slides}
+
+        self.assertEqual(remaining, {"sk_operating_model"})
 
     def test_ai_opportunities_are_grounded_in_data_hub_scope(self) -> None:
         understanding = RFPUnderstanding(
@@ -512,7 +643,16 @@ class SourcePackageTests(unittest.TestCase):
             DiagramBrief(slide_id="sk_testing", visual_type="testing", entities=["API tests", "Data reconciliation", "UAT", "Evidence"], flows=["Tests -> Evidence", "Evidence -> UAT"]),
             DiagramBrief(slide_id="sk_ams", visual_type="ams", entities=["Telemetry", "Alert", "Runbook", "Resolver"], flows=["Telemetry -> Alert", "Alert -> Resolver"]),
         ]
-        deck = ensure_diagrams_for_key_slides(DeckPlan(deck_title="Test", slides=slides), RFPUnderstanding(summary="Test"), briefs)
+        understanding = RFPUnderstanding(
+            summary="Design and build a governed data platform application with warranty and AMS support.",
+            project_scope=(
+                "Application development includes API integration, system testing, production deployment, "
+                "backup and disaster recovery, governance, reporting and live-service support."
+            ),
+        )
+        deck = ensure_diagrams_for_key_slides(
+            DeckPlan(deck_title="Test", slides=slides), understanding, briefs
+        )
         by_id = {slide.slide_id: slide for slide in deck.slides}
         self.assertIsNone(by_id["sk_exec"].diagram)
         self.assertEqual(by_id["sk_technical_arch"].diagram.kind, "technical_architecture")
@@ -520,13 +660,15 @@ class SourcePackageTests(unittest.TestCase):
         self.assertEqual(by_id["sk_deployment"].diagram.kind, "deployment")
         self.assertEqual(by_id["auto_hr_dr"].diagram.kind, "hadr")
         self.assertEqual(by_id["sk_testing"].diagram.kind, "testing")
-        self.assertEqual(by_id["sk_ams"].diagram.kind, "ams")
-        self.assertNotEqual(by_id["sk_testing"].diagram.prompt, by_id["sk_ams"].diagram.prompt)
+        self.assertIsNone(by_id["sk_ams"].diagram)
 
     def test_required_visual_sections_receive_grounded_supplemental_briefs(self) -> None:
         understanding = RFPUnderstanding(
-            summary="Governed catalogue platform",
-            project_scope="Integrate source catalogues and APIs, govern data, deploy and support the service.",
+            summary="Design and build a governed catalogue application and data platform.",
+            project_scope=(
+                "Application development includes source API integration, system testing, production deployment, "
+                "governance, backup, disaster recovery and live-service support."
+            ),
             in_scope_work=["Catalogue consolidation", "API integration", "Search and approved publishing"],
             requirements=[
                 Requirement(id="R-1", text="Integrate source APIs and files with validation and audit."),
@@ -549,7 +691,6 @@ class SourcePackageTests(unittest.TestCase):
             _fallback_visual_briefs(understanding),
         )
         expected = {
-            "sk_solution": "generic",
             "sk_technical_arch": "technical_architecture",
             "sk_integration": "architecture",
             "sk_data_model": "data_model",
@@ -559,6 +700,9 @@ class SourcePackageTests(unittest.TestCase):
             "sk_governance": "org",
         }
         for slide in planned.slides:
+            if slide.slide_id == "sk_solution":
+                self.assertIsNone(slide.diagram)
+                continue
             self.assertIsNotNone(slide.diagram)
             self.assertEqual(slide.diagram.kind, expected[slide.slide_id])
             self.assertGreaterEqual(slide.diagram.grounding_score, 0.45)
@@ -885,8 +1029,11 @@ class SourcePackageTests(unittest.TestCase):
             rfp_text="",
             template_info={},
             understanding=RFPUnderstanding(
-                summary="Build a customer portal with APIs, search and governed catalogue data.",
-                project_scope="Deliver web, application, integration, data, testing and deployment capabilities.",
+                summary="Software development will build a customer web portal with APIs, search and governed catalogue data.",
+                project_scope=(
+                    "Design and build the web application, including API integration, data, "
+                    "system testing and production deployment capabilities."
+                ),
             ),
             customer_technology_context={"platform": "Customer Cloud", "status": "Customer-mandated"},
         )
@@ -1101,7 +1248,10 @@ class SourcePackageTests(unittest.TestCase):
         deck = DeckPlan(deck_title="Test", slides=[
             SlideSpec(slide_id="deploy", title="Deployment architecture", archetype="Deployment Architecture")
         ])
-        understanding = RFPUnderstanding(summary="Deploy a secure digital catalogue.")
+        understanding = RFPUnderstanding(
+            summary="Design and build a secure digital catalogue application.",
+            project_scope="Application development includes production deployment and release automation.",
+        )
 
         enrich_slide_detail(deck, understanding, recommendations)
         ensure_diagrams_for_key_slides(
@@ -1146,7 +1296,11 @@ class SourcePackageTests(unittest.TestCase):
 
         ensure_diagrams_for_key_slides(
             deck,
-            RFPUnderstanding(customer_name="SATS", summary="Secure digital catalogue"),
+            RFPUnderstanding(
+                customer_name="SATS",
+                summary="Design and build a secure digital catalogue application.",
+                project_scope="Application development includes production deployment and release automation.",
+            ),
             visual_briefs=None,
             technology_recommendations=recommendations,
         )
@@ -1164,7 +1318,10 @@ class SourcePackageTests(unittest.TestCase):
         understanding = RFPUnderstanding(
             customer_name="SATS",
             summary="Data hub for flight, ELP, SLA, reporting and support data.",
-            project_scope="Ingest files, validate operational data, report exceptions, and forecast uplift demand.",
+            project_scope=(
+                "Design and build the data hub, ingest files, validate operational data, "
+                "report exceptions, forecast uplift demand and deploy to production."
+            ),
         )
         deck = DeckPlan(
             deck_title="Test",
@@ -1579,6 +1736,26 @@ class SourcePackageTests(unittest.TestCase):
             pages[1].bullets,
             ["Explain source to target flow", "Explain controls and operations"],
         )
+
+    def test_renderer_does_not_create_companion_from_diagram_prompt_alone(self) -> None:
+        slide = SlideSpec(
+            slide_id="operating_model",
+            title="Operating model",
+            archetype="Solution Overview",
+            diagram=DiagramSpec(
+                kind="process",
+                prompt="Show service ownership, incident flow, governance and improvement.",
+                approved=True,
+            ),
+        )
+
+        pages = _render_pages_for_slide(
+            slide,
+            diagram_images={"operating_model": b"png"},
+        )
+
+        self.assertEqual(len(pages), 1)
+        self.assertIsNotNone(pages[0].diagram)
 
     def test_hcltech_diagram_uses_full_width_title_only_layout(self) -> None:
         from pptx import Presentation
