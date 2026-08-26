@@ -216,7 +216,7 @@ All configuration is via environment variables (loaded from `.env`). See
 | `RFP2DECK_PIPELINE_CACHE` | `true` | Reuse plan and diagram outputs for identical inputs. |
 | `RFP2DECK_PIPELINE_CACHE_VERSION` | `v4-engagement-profile-planning` | Cache namespace; change it when prompt or plan semantics change so stale plans are not reused. |
 | `APP_DATA_DIR` | `.data` | Base directory for indexes/outputs/reports. |
-| `HCLTECH_TEMPLATE_PATH` | `templates/hcltech_expanded_v5.potx` | Corporate template path. Defaults to the bundled, repo-relative HCLTech `.potx` (resolved against the project root, so it works on any host). Override with an absolute path or another `.pptx`/`.potx` if needed. |
+| `HCLTECH_TEMPLATE_PATH` | `templates/hcltech_expanded_v5.potx` | Initial corporate-template selection. Defaults to the bundled HCLTech `.potx`; users can choose another approved `.pptx`/`.potx` from the UI. An absolute path remains available as an administrator-configured option. |
 | `TEMPLATE_CACHE_DIR` | `.data/templates` | Cache directory for PPTX files generated from POTX templates. |
 | `APP_PASSWORD` | *(empty)* | If set, the UI requires this password before use. |
 | `SP_TENANT_ID` / `SP_CLIENT_ID` | *(empty)* | Azure AD app for SharePoint device-code auth. |
@@ -231,16 +231,22 @@ All configuration is via environment variables (loaded from `.env`). See
 
 ## Using the app (3-step wizard)
 
-The corporate template is configured with `HCLTECH_TEMPLATE_PATH`. It **defaults to the bundled
-`templates/hcltech_expanded_v5.potx`**, a repo-relative path that is resolved against the project root,
-so the app renders with the official HCLTech Expanded Version template out of the box — locally, in WSL,
-and on deployment platforms — without any host-specific configuration. When a `.potx` is configured, the
-app creates a cached PPTX-compatible copy under `TEMPLATE_CACHE_DIR` and renders from that cache. You do
-**not** upload a template in the UI; you only provide the RFP and, optionally, reusable content.
+The Template selector in the sidebar lists every `.pptx` and `.potx` file placed directly under the
+repository's `templates/` folder. It **defaults to the bundled
+`templates/hcltech_expanded_v5.potx`**, so the app renders with the official HCLTech Expanded Version
+template out of the box. The selection is stored per browser session; colleagues using a shared server
+can choose templates independently without changing environment variables or restarting the app. Changing
+the template clears an existing deck plan and returns the session to Step 1 because template layouts are
+part of planning. Template upload and arbitrary filesystem-path entry are intentionally not exposed in the
+public UI.
 
-To override the default, point `HCLTECH_TEMPLATE_PATH` at another `.pptx`/`.potx`. Relative paths are
-resolved against the project root; absolute paths are used as-is (Windows drive-letter paths are
-auto-mapped to `/mnt/<drive>/...` under WSL). Quote values that contain spaces:
+When a `.potx` is selected, the app creates a cached PPTX-compatible copy under `TEMPLATE_CACHE_DIR` and
+renders from that cache.
+
+To set an administrator-controlled initial selection, point `HCLTECH_TEMPLATE_PATH` at another
+`.pptx`/`.potx`. Relative paths are resolved against the project root; absolute paths are used as-is
+(Windows drive-letter paths are auto-mapped to `/mnt/<drive>/...` under WSL). An external configured
+template is added to the selector alongside the templates in `templates/`. Quote values that contain spaces:
 
 ```env
 # Bundled default (portable — recommended):
@@ -367,7 +373,7 @@ rfp2deck_v1.0/
 │  └─ rendering/
 │     └─ pptx_renderer.py        # Deterministic PPTX rendering (theme, layout, fit, notes)
 ├─ templates/
-│  └─ *.pptx                       # Optional local PPTX templates
+│  └─ *.pptx / *.potx              # Server-approved templates shown in the UI
 ├─ requirements.txt
 ├─ pyproject.toml
 ├─ .env.example

@@ -37,7 +37,11 @@ try:
     from rfp2deck.diagrams.generator import generate_diagram_png
     from rfp2deck.ingestion.deck_analyzer import analyze_pptx_template
     from rfp2deck.ingestion.source_package import parse_source_document, render_source_package
-    from rfp2deck.ingestion.template_resolver import resolve_pptx_template
+    from rfp2deck.ingestion.template_resolver import (
+        SUPPORTED_TEMPLATE_SUFFIXES,
+        discover_presentation_templates,
+        resolve_pptx_template,
+    )
     from rfp2deck.rag.indexer import build_faiss_index, chunk_text, load_index
     from rfp2deck.rag.retriever import retrieve
     from rfp2deck.rendering.pptx_renderer import render_deck_from_template, rendered_slide_count
@@ -72,7 +76,11 @@ except ModuleNotFoundError:
     from rfp2deck.diagrams.generator import generate_diagram_png
     from rfp2deck.ingestion.deck_analyzer import analyze_pptx_template
     from rfp2deck.ingestion.source_package import parse_source_document, render_source_package
-    from rfp2deck.ingestion.template_resolver import resolve_pptx_template
+    from rfp2deck.ingestion.template_resolver import (
+        SUPPORTED_TEMPLATE_SUFFIXES,
+        discover_presentation_templates,
+        resolve_pptx_template,
+    )
     from rfp2deck.rag.indexer import build_faiss_index, chunk_text, load_index
     from rfp2deck.rag.retriever import retrieve
     from rfp2deck.rendering.pptx_renderer import render_deck_from_template, rendered_slide_count
@@ -116,7 +124,7 @@ log = logging.getLogger("rfp2deck.app")
 st.set_page_config(page_title="RFP → Proposal Deck Agent", layout="wide")
 
 
-st.title("RFP → Proposal Deck Generator (Standard Template)")
+st.title("RFP → Proposal Deck Generator")
 
 # ----------------------------
 # Session state defaults
@@ -135,15 +143,17 @@ st.session_state.setdefault("rag_index", None)
 st.session_state.setdefault("customer_logo_bytes", None)
 st.session_state.setdefault("customer_logo_name", None)
 
-# Corporate template path (no UI upload required). Configure this with
-# HCLTECH_TEMPLATE_PATH in .env. It may point to either the official HCLTech
-# POTX or a PPTX derived from that POTX.
+# The environment setting remains an administrator-controlled initial choice,
+# while each browser session can select any approved template in templates/.
+# Without an override this resolves to templates/hcltech_expanded_v5.potx.
 _configured_template = settings.proposal_template_path
-STANDARD_TEMPLATE = (
+CONFIGURED_TEMPLATE = (
     _configured_template
     if _configured_template.is_absolute()
     else PROJECT_ROOT / _configured_template
 )
+TEMPLATE_DIR = PROJECT_ROOT / "templates"
+DEFAULT_TEMPLATE = TEMPLATE_DIR / "hcltech_expanded_v5.potx"
 _configured_template_cache = settings.template_cache_dir
 STANDARD_TEMPLATE_CACHE_DIR = (
     _configured_template_cache
@@ -154,8 +164,41 @@ STANDARD_TEMPLATE_CACHE_DIR = (
 
 @st.cache_resource(show_spinner=False)
 def resolve_standard_template(template_path: str, cache_dir: str) -> Path:
-    """Resolve the configured template to a PPTX path python-pptx can read."""
+    """Resolve a selected template to a PPTX path python-pptx can read."""
     return resolve_pptx_template(Path(template_path), Path(cache_dir))
+
+
+def _selectable_template_paths() -> list[Path]:
+    """Build the server-approved template catalog shown in the UI."""
+    paths = discover_presentation_templates(TEMPLATE_DIR)
+    if (
+        CONFIGURED_TEMPLATE.is_file()
+        and CONFIGURED_TEMPLATE.suffix.lower() in SUPPORTED_TEMPLATE_SUFFIXES
+        and CONFIGURED_TEMPLATE not in paths
+    ):
+        # Preserve support for an administrator-configured template outside the
+        # repository while keeping arbitrary path entry out of the public UI.
+        paths.append(CONFIGURED_TEMPLATE)
+    return paths
+
+
+def _clear_template_dependent_state() -> None:
+    """Invalidate plan/render state after the active template changes."""
+    st.session_state.update(
+        {
+            "wizard_step": 1,
+            "deck_plan": None,
+            "report": None,
+            "tpl_bytes": None,
+            "template_info": None,
+            "retrieved_context": None,
+            "diagrams_generated": False,
+            "diagram_images": {},
+            "diagram_failures": [],
+            "render_complete": False,
+            "template_changed": True,
+        }
+    )
 
 
 @st.cache_resource(show_spinner=False)
@@ -192,9 +235,68 @@ def load_persistent_index(index_dir: str):
 # ----------------------------
 # Sidebar
 # ----------------------------
+selectable_templates = _selectable_template_paths()
+template_option_values = [str(path) for path in selectable_templates]
+if CONFIGURED_TEMPLATE in selectable_templates:
+    preferred_template = CONFIGURED_TEMPLATE
+elif DEFAULT_TEMPLATE in selectable_templates:
+    preferred_template = DEFAULT_TEMPLATE
+elif selectable_templates:
+    preferred_template = selectable_templates[0]
+else:
+    preferred_template = DEFAULT_TEMPLATE
+previous_template_value = st.session_state.get("selected_template_path")
+if previous_template_value not in template_option_values:
+    st.session_state.selected_template_path = str(preferred_template)
+    if previous_template_value is not None:
+        _clear_template_dependent_state()
+
+# This variable is reassigned from the selector below and then used throughout
+# Step 1. Keeping one path per rerun ensures analysis and rendering agree.
+STANDARD_TEMPLATE = Path(st.session_state.selected_template_path)
+
+
+def _template_option_label(value: str) -> str:
+    path = Path(value)
+    try:
+        return path.relative_to(TEMPLATE_DIR).as_posix()
+    except ValueError:
+        return f"{path.name} (configured)"
+
+
 with st.sidebar:
     st.header("Settings")
 
+    st.subheader("Proposal Template")
+    if template_option_values:
+        selected_template_value = st.selectbox(
+            "Template",
+            options=template_option_values,
+            key="selected_template_path",
+            format_func=_template_option_label,
+            on_change=_clear_template_dependent_state,
+            help="Templates are loaded from the server's templates folder. Changing the "
+            "template clears an existing deck plan so its layouts can be analyzed again.",
+        )
+        STANDARD_TEMPLATE = Path(selected_template_value)
+        if st.session_state.pop("template_changed", False):
+            st.info("Template changed. Generate a new plan using the selected template.")
+        try:
+            resolved_template = resolve_standard_template(
+                str(STANDARD_TEMPLATE), str(STANDARD_TEMPLATE_CACHE_DIR)
+            )
+            st.success(f"Using template: {STANDARD_TEMPLATE.name}")
+            if STANDARD_TEMPLATE.suffix.lower() == ".potx":
+                st.caption(f"Cached PPTX: {resolved_template.name}")
+        except Exception as exc:
+            st.error("The selected template is unavailable or invalid.")
+            st.caption(str(exc))
+    else:
+        st.error(
+            "No templates are available. Add a .pptx or .potx file to the templates folder."
+        )
+
+    st.divider()
     st.subheader("Deck Mode")
     deck_mode = st.radio(
         "Select Output Mode",
@@ -272,24 +374,6 @@ with st.sidebar:
             f"Persistent index available ({len(persistent_index.chunks)} chunks). "
             "An uploaded reference index takes priority when both are present."
         )
-
-    st.divider()
-    st.caption("Template")
-    try:
-        resolved_template = resolve_standard_template(
-            str(STANDARD_TEMPLATE), str(STANDARD_TEMPLATE_CACHE_DIR)
-        )
-        if STANDARD_TEMPLATE.suffix.lower() == ".potx":
-            st.success(f"Using HCLTech POTX: {STANDARD_TEMPLATE.name}")
-            st.caption(f"Cached PPTX: {resolved_template.name}")
-        else:
-            st.success(f"Using HCLTech template: {resolved_template.name}")
-    except Exception as exc:
-        st.error(
-            "Corporate template is unavailable. Set HCLTECH_TEMPLATE_PATH in .env "
-            "to the official HCLTech .potx or a converted .pptx."
-        )
-        st.caption(str(exc))
 
     if st.button("Reset wizard", use_container_width=True):
         keys = [
@@ -637,7 +721,8 @@ if st.session_state.wizard_step == 1:
         "Optional customer logo",
         type=["png", "jpg", "jpeg"],
         key="customer_logo_step1",
-        help="Upload an approved PNG or JPEG logo. It will be added to every generated slide without changing the HCLTech template or master.",
+        help="Upload an approved PNG or JPEG logo. It will be added to every generated "
+        "slide without changing the selected template or master.",
     )
     if customer_logo is not None:
         logo_bytes = customer_logo.getvalue()

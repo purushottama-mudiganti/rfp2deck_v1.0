@@ -1728,6 +1728,21 @@ def _key_message_placeholder(slide):
     return candidates[0] if candidates else None
 
 
+def _fill_key_message_placeholder(slide, key_message: Optional[str]) -> bool:
+    """Populate the native subtitle slot without clipping longer sentences."""
+    text = (key_message or "").strip()
+    if not text:
+        return False
+    placeholder = _key_message_placeholder(slide)
+    if placeholder is None:
+        return False
+    box_w = max(0.5, float(placeholder.width) / EMU_PER_INCH)
+    box_h = max(0.25, float(placeholder.height) / EMU_PER_INCH)
+    font_pt = _fit_font_for_box([(0, text)], box_w, box_h, min_pt=9, start_pt=11)
+    _set_text(placeholder, text, font_pt=font_pt, bold=True)
+    return True
+
+
 def _semantic_placeholder_name(slide, shape) -> str:
     try:
         idx = shape.placeholder_format.idx
@@ -1827,10 +1842,7 @@ def _uniform_card_font(pairs: list[tuple]) -> Optional[int]:
 
 
 def _fill_card_placeholders(slide, cards, key_message: Optional[str] = None) -> int:
-    if key_message:
-        key_ph = _key_message_placeholder(slide)
-        if key_ph is not None:
-            _set_text(key_ph, key_message, font_pt=11, bold=True)
+    _fill_key_message_placeholder(slide, key_message)
 
     placeholders = _card_placeholders(slide)
     _clear_point_placeholders(slide, placeholders)
@@ -1854,10 +1866,7 @@ def _fill_detailed_point_placeholders(
     detailed_points,
     key_message: Optional[str] = None,
 ) -> int:
-    if key_message:
-        key_ph = _key_message_placeholder(slide)
-        if key_ph is not None:
-            _set_text(key_ph, key_message, font_pt=11, bold=True)
+    _fill_key_message_placeholder(slide, key_message)
 
     placeholders = _card_placeholders(slide)
     _clear_point_placeholders(slide, placeholders)
@@ -2017,10 +2026,7 @@ def _fill_flat_point_placeholders(
     if not clean_items:
         return 0
 
-    if key_message:
-        key_ph = _key_message_placeholder(slide)
-        if key_ph is not None:
-            _set_text(key_ph, key_message, font_pt=11, bold=True)
+    _fill_key_message_placeholder(slide, key_message)
 
     _clear_point_placeholders(slide, placeholders)
     number_shapes = _number_placeholders(slide)
@@ -2571,10 +2577,7 @@ def _fill_infographic_two_key_point_slots(slide, items: list[str], key_message: 
     slot elsewhere. That floor makes this layout's own boxes invisible to the
     generic path, so it needs direct filling instead.
     """
-    if key_message:
-        key_ph = _key_message_placeholder(slide)
-        if key_ph is not None:
-            _set_text(key_ph, key_message, font_pt=11, bold=True)
+    _fill_key_message_placeholder(slide, key_message)
 
     slots: dict = {}
     for shape in _body_placeholders(slide):
@@ -3404,12 +3407,79 @@ def _word_count(text: str | None) -> int:
     return len(re.sub(r"\s+", " ", text or "").strip().split())
 
 
-def _body_bullets_with_key_message(slide_spec, bullets: list[str]) -> tuple[list[str], Optional[str]]:
-    key_message = (getattr(slide_spec, "key_message", None) or "").strip()
+_KEY_MESSAGE_TARGET_WORDS = 28
+_KEY_MESSAGE_SOFT_WORDS = 36
+_KEY_MESSAGE_FRAGMENT_STARTS = (
+    "and ",
+    "but ",
+    "by ",
+    "combining ",
+    "including ",
+    "or ",
+    "that ",
+    "through ",
+    "to ",
+    "which ",
+    "while ",
+    "with ",
+)
+
+
+def _complete_key_message_sentence(text: str) -> str:
+    sentence = re.sub(r"\s+", " ", (text or "").strip()).strip(" ;")
+    if sentence and sentence[-1] not in ".?!":
+        sentence += "."
+    return sentence
+
+
+def _concise_key_message(text: str | None) -> Optional[str]:
+    """Return one complete subtitle sentence without a word-boundary cut.
+
+    The planner normally supplies a 15-28 word key message, but occasionally
+    returns two good sentences in the same field. Prefer its complete lead
+    sentence. For an unusually long single sentence, use a complete clause only
+    when punctuation provides a safe semantic boundary; otherwise preserve the
+    sentence and let the native subtitle box fit the font rather than emitting
+    a visibly truncated fragment.
+    """
+    clean = re.sub(r"\s+", " ", (text or "").strip())
+    if not clean:
+        return None
+
+    sentences = [
+        part.strip()
+        for part in re.split(r"(?<=[.!?])\s+(?=[\"'“‘A-Z0-9])", clean)
+        if part.strip()
+    ]
+    lead = sentences[0] if sentences else clean
+    if _word_count(lead) <= _KEY_MESSAGE_SOFT_WORDS:
+        return _complete_key_message_sentence(lead)
+
+    # If the lead is exceptionally long, another authored sentence can be a
+    # better self-contained summary than shrinking the entire paragraph.
+    for sentence in sentences[1:]:
+        if _word_count(sentence) <= _KEY_MESSAGE_TARGET_WORDS:
+            return _complete_key_message_sentence(sentence)
+
+    # Semicolons, em dashes, and colons may separate a complete proposition
+    # from explanatory detail. Never use a dependent trailing fragment.
+    clauses = [part.strip() for part in re.split(r"\s*[;—–]\s*|:\s+", lead) if part.strip()]
+    for clause in clauses:
+        words = _word_count(clause)
+        if not 6 <= words <= _KEY_MESSAGE_TARGET_WORDS:
+            continue
+        if clause.lower().startswith(_KEY_MESSAGE_FRAGMENT_STARTS):
+            continue
+        return _complete_key_message_sentence(clause)
+
+    return _complete_key_message_sentence(lead)
+
+
+def _body_bullets_with_key_message(
+    slide_spec, bullets: list[str]
+) -> tuple[list[str], Optional[str]]:
     clean_bullets = [b for b in bullets if (b or "").strip()]
-    if key_message and _word_count(key_message) > 26:
-        return [key_message] + clean_bullets, None
-    return clean_bullets, key_message or getattr(slide_spec, "key_message", None)
+    return clean_bullets, _concise_key_message(getattr(slide_spec, "key_message", None))
 
 
 def _diagram_prompt_fallback_bullets(slide_spec, bullets: list[str]) -> list[str]:
@@ -3965,6 +4035,9 @@ def _render_pages_for_slide(
         page = slide_spec.model_copy(deep=True)
         page.slide_id = f"{slide_spec.slide_id}_page_{page_idx + 1}"
         page.title = f"{slide_spec.title} ({page_idx + 1} of {page_count})"
+        # Native HCLTech layouts reserve a subtitle band on every continuation
+        # page. Repeat the same complete sentence; never split it between pages.
+        page.key_message = adjusted_key_message if native or page_idx == 0 else None
         if collection == "table":
             page.table["rows"] = page_values
             # A long table pages onto many consecutive slides that would
@@ -3982,14 +4055,10 @@ def _render_pages_for_slide(
             # through the plain content path.
             if collection == "detailed_points":
                 page.bullets = []
-            elif collection == "bullets":
-                page.key_message = adjusted_key_message if page_idx == 0 else None
             if collection != "cards":
                 page.cards = []
             page.comparison = None
             page.layout_hint = None
-            if collection in {"cards", "detailed_points"} and page_idx > 0:
-                page.key_message = None
             if page_idx > 0:
                 # kpis are a headline stat for the slide as a whole; without
                 # this every continuation page would repeat the same stat

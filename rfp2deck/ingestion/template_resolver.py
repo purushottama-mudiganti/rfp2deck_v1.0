@@ -15,6 +15,27 @@ POTX_PRESENTATION_CONTENT_TYPE = (
 PPTX_PRESENTATION_CONTENT_TYPE = (
     b"application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"
 )
+SUPPORTED_TEMPLATE_SUFFIXES = frozenset({".pptx", ".potx"})
+
+
+def discover_presentation_templates(template_dir: Path) -> list[Path]:
+    """Return selectable PPTX/POTX files directly under ``template_dir``.
+
+    Discovery is intentionally non-recursive: the public UI exposes only the
+    templates that a deployment administrator placed in the approved template
+    directory, rather than accepting an arbitrary user-supplied filesystem path.
+    """
+    template_dir = template_dir.expanduser()
+    if not template_dir.is_dir():
+        return []
+    return sorted(
+        (
+            path
+            for path in template_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in SUPPORTED_TEMPLATE_SUFFIXES
+        ),
+        key=lambda path: path.name.casefold(),
+    )
 
 
 def _safe_stem(path: Path) -> str:

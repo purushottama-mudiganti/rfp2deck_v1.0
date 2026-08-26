@@ -4810,6 +4810,10 @@ def consulting_grade_proposal_polish(
                 )
                 slide.bullets = []
 
+    for slide in deck_plan.slides:
+        # Store one authored sentence in the DeckPlan itself. The renderer
+        # repeats this same sentence when native layouts require continuation.
+        slide.key_message = _complete_sentences(slide.key_message, 1) or None
     return deck_plan
 
 
@@ -5888,7 +5892,10 @@ def _sanitize_customer_visible_source_notes(deck_plan: DeckPlan) -> DeckPlan:
         return value
 
     for slide in deck_plan.slides:
-        slide.key_message = sentence(slide.key_message) or None
+        # A key message owns one subtitle band. Preserve a complete authored
+        # sentence instead of allowing a paragraph to be split or clipped by
+        # template-specific rendering.
+        slide.key_message = sentence(_complete_sentences(slide.key_message, 1)) or None
         slide.bullets = [value for item in slide.bullets if (value := sentence(item))]
         slide.kpis = [value for item in slide.kpis if (value := clean(item))]
         points: List[BulletPoint] = []

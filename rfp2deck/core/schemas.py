@@ -485,7 +485,7 @@ class SlideSpec(BaseModel):
     # of `bullets` so headline points carry concrete supporting detail.
     detailed_points: List[BulletPoint] = Field(default_factory=list)
     # --- Modern card-based layout (preferred when present) ---
-    # A short emphasised "so what" line shown in a banner under the title.
+    # One concise, complete "so what" sentence shown under the title.
     key_message: Optional[str] = None
     # Titled cards rendered as a responsive grid (2-up / 2x2). When non-empty
     # the renderer uses a cards layout instead of plain bullets.

@@ -85,6 +85,7 @@ from rfp2deck.ingestion.source_package import (
 from rfp2deck.llm.structured import _dereference, _is_proxy_block_error, _make_strict
 from rfp2deck.qa.coverage import build_traceability_report
 from rfp2deck.rendering.pptx_renderer import (
+    _concise_key_message,
     _dedupe_render_slides,
     _normalize_singleton_continuation_titles,
     _remove_overlapping_generated_pictures,
@@ -1545,6 +1546,29 @@ class SourcePackageTests(unittest.TestCase):
         self.assertIsNotNone(slide.comparison)
         self.assertEqual(slide.bullets, [])
 
+    def test_consulting_polish_keeps_one_complete_key_message_sentence(self) -> None:
+        deck = DeckPlan(
+            deck_title="Test",
+            slides=[
+                SlideSpec(
+                    slide_id="summary",
+                    title="Executive Summary",
+                    archetype="Solution Overview",
+                    key_message=(
+                        "Establish one accountable command center for Technology Operations. "
+                        "Scale services and automation only when operational evidence supports it."
+                    ),
+                )
+            ],
+        )
+
+        polished = consulting_grade_proposal_polish(deck)
+
+        self.assertEqual(
+            polished.slides[0].key_message,
+            "Establish one accountable command center for Technology Operations.",
+        )
+
     def test_consulting_polish_turns_security_nfr_into_cards(self) -> None:
         deck = DeckPlan(
             deck_title="Test",
@@ -1702,6 +1726,82 @@ class SourcePackageTests(unittest.TestCase):
 
         self.assertGreater(len(pages), 1)
         self.assertEqual(sum(len(page.cards) for page in pages), 3)
+
+    def test_renderer_concises_multisentence_key_message_as_complete_sentence(self) -> None:
+        from rfp2deck.core.schemas import Card
+
+        lead = (
+            "Establish and operate a single, accountable Technology Operations function for "
+            "Pearson Professional Assessments—combining follow-the-sun 24x7 monitoring, "
+            "primarily L3 command-center ownership, disciplined ITIL-aligned processes, and "
+            "measurable governance."
+        )
+        key_message = (
+            lead
+            + " The immediate priority is operational control and stabilization; expansion, "
+            "automation, and AI-assisted capabilities follow only when data and process "
+            "maturity support a credible business case."
+        )
+        slide = SlideSpec(
+            slide_id="exec",
+            title="Executive Summary",
+            archetype="Solution Overview",
+            key_message=key_message,
+            cards=[
+                Card(heading=f"Theme {idx}", body="A complete executive summary point.")
+                for idx in range(3)
+            ],
+        )
+
+        pages = _render_pages_for_slide(slide, native=True)
+
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(pages[0].key_message, lead)
+        self.assertEqual(pages[0].bullets, [])
+        self.assertNotIn("AI-assisted capabilities", pages[0].key_message)
+
+    def test_native_continuations_repeat_one_complete_key_message(self) -> None:
+        from rfp2deck.core.schemas import Card
+
+        key_message = (
+            "Disciplined service controls connect operational evidence to accountable "
+            "decisions and measurable improvement."
+        )
+        slide = SlideSpec(
+            slide_id="controls",
+            title="Service controls",
+            archetype="Content",
+            key_message=key_message,
+            cards=[
+                Card(
+                    heading=f"Control {idx}",
+                    body=" ".join(
+                        ["Grounded control detail with ownership and customer implications"] * 30
+                    ),
+                )
+                for idx in range(4)
+            ],
+        )
+
+        pages = _render_pages_for_slide(slide, native=True)
+
+        self.assertGreater(len(pages), 1)
+        self.assertTrue(all(page.key_message == key_message for page in pages))
+        self.assertTrue(all(page.key_message.endswith(".") for page in pages))
+
+    def test_concise_key_message_uses_complete_clause_instead_of_word_cut(self) -> None:
+        key_message = (
+            "Accountable operations establish measurable control across the service; "
+            + " ".join(["supporting evidence remains available for governance decisions"] * 8)
+            + "."
+        )
+
+        concise = _concise_key_message(key_message)
+
+        self.assertEqual(
+            concise,
+            "Accountable operations establish measurable control across the service.",
+        )
 
     def test_renderer_preserves_native_layout_selection_for_regular_text_slides(self) -> None:
         slide = SlideSpec(

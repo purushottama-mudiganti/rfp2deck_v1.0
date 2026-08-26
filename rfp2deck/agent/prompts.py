@@ -551,8 +551,10 @@ The renderer styles these natively in the HCLTech brand look — prefer them ove
 plain bullet lists wherever they fit. A slide may combine `key_message` (top) +
 ONE body structure (cards OR comparison OR detailed_points OR bullets) + `kpis`
 (bottom).
-- `key_message`: one complete, emphasised "so what" sentence shown under the
-  title (normally 15-28 words). Use it to state the customer implication.
+- `key_message`: exactly one complete, emphasised "so what" sentence shown under
+  the title (15-28 words). Rewrite a longer thesis concisely; never truncate it
+  or split one message across multiple sentences. Use it to state the customer
+  implication.
 - `cards`: 2–4 titled cards rendered as a grid. Use for capability overviews,
   executive-summary quadrants, pillars, or any "headline + supporting detail"
   set. Each card = {{heading (up to 8 words), body (1-2 complete explanatory
